@@ -25,11 +25,17 @@ enum DarkArchiveFormat {
 }
 
 /// Extract behavior flags.
+///
+/// By default, extraction preserves permissions and timestamps, rejects
+/// path traversal, and skips symlinks. Symlink extraction must be
+/// explicitly enabled — even then, absolute targets are always rejected
+/// and traversal targets are rejected under `securePaths`.
 enum DarkExtractFlags {
     none        = 0,
-    perm        = 1,
-    time        = 2,
-    securePaths = 4,
+    perm        = 1,     /// Preserve file permissions
+    time        = 2,     /// Preserve modification times
+    securePaths = 4,     /// Reject ".." path components and absolute paths
+    symlinks    = 8,     /// Extract symlinks (off by default — symlinks are skipped)
     defaults    = perm | time | securePaths,
 }
 
@@ -173,6 +179,25 @@ struct DarkArchiveReader {
     }
 
     /// Extract entire archive to directory.
+    ///
+    /// Security defaults:
+    /// - Paths with `..` components and absolute paths are rejected (`securePaths`)
+    /// - Symlink entries are **skipped** by default. Enable with `DarkExtractFlags.symlinks`.
+    ///   Even when enabled, symlinks are validated:
+    ///     - Absolute targets (e.g., `/etc/passwd`) are always rejected unconditionally
+    ///     - Targets with `..` components are rejected when `securePaths` is set
+    ///     - The resolved real path is verified to stay within the extraction directory
+    ///       (defends against two-step symlink+file attacks, CVE-2021-20206 pattern)
+    ///
+    /// Example:
+    /// ---
+    /// // Safe defaults (symlinks skipped):
+    /// reader.extractTo(Path("/tmp/output"));
+    ///
+    /// // Enable symlinks (still validates targets):
+    /// reader.extractTo(Path("/tmp/output"),
+    ///     DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+    /// ---
     void extractTo(in Path destination,
                     DarkExtractFlags flags = DarkExtractFlags.defaults) {
         import std.file : mkdirRecurse, write, symlink, exists;
@@ -206,6 +231,13 @@ struct DarkArchiveReader {
                 mkdirRecurse(fullPath.toString());
                 skipData();
             } else if (entry.isSymlink) {
+                // Symlink extraction requires explicit opt-in via symlinks flag.
+                // When disabled (the default), symlink entries are silently skipped.
+                if (!(flags & DarkExtractFlags.symlinks)) {
+                    skipData();
+                    continue;
+                }
+
                 auto target = entry.symlinkTarget;
 
                 // Absolute symlink targets are ALWAYS rejected — there is no
@@ -812,12 +844,11 @@ version(unittest) {
         caught.shouldBeTrue;
     }
 
-    /// Symlink escape: symlink pointing to absolute path must be rejected
-    @("security: extractTo rejects symlink with absolute target")
+    /// Symlink with absolute target: skipped by default (no symlinks flag)
+    @("security: extractTo skips symlink with absolute target by default")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
-        import darkarchive.gzip : gunzip;
 
         auto tw = TarWriter.create();
         tw.addSymlink("evil-link", "/etc/passwd");
@@ -826,18 +857,39 @@ version(unittest) {
         auto extractDir = Path(testDataDir, "sec-symlink-abs-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
 
+        // With defaults (no symlinks flag), symlink is silently skipped
+        auto reader = DarkArchiveReader(tarData);
+        reader.extractTo(extractDir);
+        assert(!exists((extractDir ~ "evil-link").toString),
+            "symlink must not be created without symlinks flag");
+    }
+
+    /// Symlink with absolute target: rejected when symlinks flag IS set
+    @("security: extractTo rejects absolute symlink when symlinks enabled")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addSymlink("evil-link", "/etc/passwd");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-symlink-abs-enabled-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
         auto reader = DarkArchiveReader(tarData);
         bool caught;
         try {
-            reader.extractTo(extractDir);
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
         } catch (DarkArchiveException e) {
             caught = true;
         }
         caught.shouldBeTrue;
     }
 
-    /// Symlink escape: symlink pointing outside via "../../../" must be rejected
-    @("security: extractTo rejects symlink with traversal target")
+    /// Symlink with traversal target: skipped by default
+    @("security: extractTo skips symlink with traversal target by default")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -850,9 +902,29 @@ version(unittest) {
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
 
         auto reader = DarkArchiveReader(tarData);
+        reader.extractTo(extractDir);
+        assert(!exists((extractDir ~ "escape-link").toString),
+            "symlink must not be created without symlinks flag");
+    }
+
+    /// Symlink with traversal target: rejected when symlinks flag IS set
+    @("security: extractTo rejects traversal symlink when symlinks enabled")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addSymlink("escape-link", "../../../../etc/shadow");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-symlink-trav-enabled-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tarData);
         bool caught;
         try {
-            reader.extractTo(extractDir);
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
         } catch (DarkArchiveException e) {
             caught = true;
         }
@@ -886,12 +958,10 @@ version(unittest) {
     // -------------------------------------------------------------------
 
     /// CVE-2021-20206 pattern: Two-step symlink+file extraction escape.
-    /// Entry 1: symlink "mydir" -> "/tmp"
-    /// Entry 2: file "mydir/pwned.txt"
-    /// Without defense, file is written to /tmp/pwned.txt via the symlink.
-    @("CVE: two-step symlink+file extraction escape")
+    /// With defaults (no symlinks flag), symlinks are skipped — attack is moot.
+    @("CVE: two-step symlink+file — safe by default (symlinks skipped)")
     unittest {
-        import std.file : exists, rmdirRecurse, isSymlink;
+        import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
 
         auto tw = TarWriter.create();
@@ -902,24 +972,42 @@ version(unittest) {
         auto extractDir = Path(testDataDir, "sec-twostep-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
 
+        // With defaults, symlink is skipped, "escape-dir/pwned.txt" written
+        // as a regular file under extractDir (no symlink to follow)
+        auto reader = DarkArchiveReader(tarData);
+        reader.extractTo(extractDir);
+        assert(!exists("/tmp/pwned.txt"),
+            "file must not be written to /tmp/pwned.txt");
+    }
+
+    /// CVE-2021-20206: With symlinks enabled, absolute target is still rejected
+    @("CVE: two-step symlink+file — absolute target rejected with symlinks enabled")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addSymlink("escape-dir", "/tmp");
+        tw.addBuffer("escape-dir/pwned.txt", cast(const(ubyte)[]) "pwned!");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-twostep-enabled-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
         auto reader = DarkArchiveReader(tarData);
         bool caught;
         try {
-            reader.extractTo(extractDir);
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
         } catch (DarkArchiveException e) {
             caught = true;
         }
-        // Either the symlink was rejected (absolute target), or the file write
-        // through the symlink was rejected. The file must NOT exist at /tmp/pwned.txt.
-        assert(!exists("/tmp/pwned.txt"),
-            "two-step symlink attack: file must not be written to /tmp/pwned.txt");
         caught.shouldBeTrue;
+        assert(!exists("/tmp/pwned.txt"));
     }
 
-    /// CVE-2021-20206 variant: relative symlink escape.
-    /// Entry 1: symlink "linkdir" -> "../../"
-    /// Entry 2: file "linkdir/escape.txt"
-    @("CVE: two-step relative symlink+file escape")
+    /// CVE-2021-20206 variant: relative symlink escape — safe by default
+    @("CVE: two-step relative symlink — safe by default (symlinks skipped)")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -933,15 +1021,33 @@ version(unittest) {
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
 
         auto reader = DarkArchiveReader(tarData);
+        reader.extractTo(extractDir);
+        assert(!exists(Path(testDataDir, "escape.txt").toString),
+            "file must not be created outside extract dir");
+    }
+
+    /// CVE-2021-20206 relative: with symlinks enabled, traversal target rejected
+    @("CVE: two-step relative symlink — rejected with symlinks enabled")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addSymlink("linkdir", "../../");
+        tw.addBuffer("linkdir/escape.txt", cast(const(ubyte)[]) "escaped!");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-twostep-rel-en-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tarData);
         bool caught;
         try {
-            reader.extractTo(extractDir);
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
         } catch (DarkArchiveException e) {
             caught = true;
         }
-        // Must not create escape.txt outside extraction directory
-        assert(!exists(Path(testDataDir, "escape.txt").toString),
-            "relative symlink escape: file must not be created outside extract dir");
         caught.shouldBeTrue;
     }
 
@@ -991,9 +1097,8 @@ version(unittest) {
         caught.shouldBeTrue;
     }
 
-    /// Absolute symlink targets must be rejected UNCONDITIONALLY,
-    /// even when securePaths is disabled.
-    @("security: absolute symlink rejected even with DarkExtractFlags.none")
+    /// Without symlinks flag, symlinks are skipped regardless of target
+    @("security: absolute symlink skipped with DarkExtractFlags.none")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -1005,14 +1110,351 @@ version(unittest) {
         auto extractDir = Path(testDataDir, "sec-abs-sym-unconditional");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
 
+        // Without symlinks flag, symlink is silently skipped — no error, no symlink
+        auto reader = DarkArchiveReader(tarData);
+        reader.extractTo(extractDir, DarkExtractFlags.none);
+        assert(!exists((extractDir ~ "danger").toString),
+            "symlink must not be created without symlinks flag");
+    }
+
+    /// With symlinks flag but no securePaths, absolute symlink is still rejected
+    @("security: absolute symlink rejected unconditionally with symlinks flag")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addSymlink("danger", "/etc/passwd");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-abs-sym-flag-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
         auto reader = DarkArchiveReader(tarData);
         bool caught;
         try {
-            // Explicitly pass none — no securePaths flag
-            reader.extractTo(extractDir, DarkExtractFlags.none);
+            // symlinks enabled, but no securePaths — absolute still rejected
+            reader.extractTo(extractDir, DarkExtractFlags.symlinks);
         } catch (DarkArchiveException e) {
             caught = true;
         }
         caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Symlink opt-in tests
+    // -------------------------------------------------------------------
+
+    /// By default (no symlinks flag), symlink entries are skipped during extraction
+    @("security: symlinks skipped by default during extraction")
+    unittest {
+        import std.file : exists, rmdirRecurse, isSymlink;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("real-file.txt", cast(const(ubyte)[]) "I exist");
+        tw.addSymlink("safe-link", "real-file.txt");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-sym-skip-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tarData);
+        reader.extractTo(extractDir); // defaults — no symlinks flag
+
+        // The regular file must exist
+        assert(exists((extractDir ~ "real-file.txt").toString),
+            "real-file.txt must be extracted");
+        // The symlink must NOT exist — skipped
+        assert(!exists((extractDir ~ "safe-link").toString),
+            "symlink must be skipped when symlinks flag is not set");
+    }
+
+    /// With symlinks flag, safe relative symlinks are created
+    @("security: symlinks created when flag is set")
+    unittest {
+        import std.file : exists, rmdirRecurse, isSymlink, readText;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("target.txt", cast(const(ubyte)[]) "target content");
+        tw.addSymlink("link.txt", "target.txt");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-sym-create-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tarData);
+        reader.extractTo(extractDir,
+            DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+
+        // Both must exist
+        assert(exists((extractDir ~ "target.txt").toString));
+        assert(exists((extractDir ~ "link.txt").toString));
+        // The symlink must actually be a symlink
+        assert(isSymlink((extractDir ~ "link.txt").toString));
+        // Reading through the symlink must give target content
+        readText((extractDir ~ "link.txt").toString).shouldEqual("target content");
+    }
+
+    /// With symlinks flag, absolute targets are still rejected
+    @("security: absolute symlink still rejected even with symlinks flag")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addSymlink("evil", "/etc/passwd");
+        auto tarData = tw.data;
+
+        auto extractDir = Path(testDataDir, "sec-sym-abs-flag-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tarData);
+        bool caught;
+        try {
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Creative attack vector tests
+    // -------------------------------------------------------------------
+
+    /// Null byte in filename — OS truncates at null, writing to wrong path.
+    /// "innocent.txt\x00../../etc/passwd" → OS sees "innocent.txt"
+    /// But the entry claims a different name. Must not cause confusion.
+    @("attack: null byte in filename")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("safe.txt\x00hidden", cast(const(ubyte)[]) "trick");
+        auto data = writer.writtenData();
+
+        auto extractDir = Path(testDataDir, "sec-null-byte-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(data);
+        reader.extractTo(extractDir);
+
+        // The file should be created, but with the FULL name (D strings
+        // include bytes after null). However, the filesystem may truncate.
+        // The key assertion: no file created at unexpected location.
+        assert(!exists((extractDir ~ "hidden").toString),
+            "null byte must not create file at truncated-suffix path");
+    }
+
+    /// Filename "." (current directory) — must not overwrite extraction root
+    @("attack: filename is just '.'")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer(".", cast(const(ubyte)[]) "overwrite root?");
+        auto data = writer.writtenData();
+
+        auto extractDir = Path(testDataDir, "sec-dot-name-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // Should not crash or overwrite the extraction directory itself
+        auto reader = DarkArchiveReader(data);
+        // May throw or skip — either is acceptable
+        try {
+            reader.extractTo(extractDir);
+        } catch (Exception) {}
+    }
+
+    /// Duplicate filenames — second entry overwrites first. Library should
+    /// not crash. Both entries should be readable during iteration.
+    @("attack: duplicate filenames in archive")
+    unittest {
+        import std.file : exists, rmdirRecurse, readText;
+
+        // Create ZIP with duplicate names (Python-generated test data exists)
+        auto reader = DarkArchiveReader(
+            Path(testDataDir, "test-duplicate-names.zip"));
+
+        auto extractDir = Path(testDataDir, "sec-dupe-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // Should not crash during extraction
+        reader.extractTo(extractDir);
+
+        // File should exist (second entry wins)
+        assert(exists((extractDir ~ "dupe.txt").toString));
+        auto content = readText((extractDir ~ "dupe.txt").toString);
+        // Content should be from one of the entries (second overwrites first)
+        assert(content == "first version\n" || content == "second version\n",
+            "dupe.txt should contain content from one of the entries");
+    }
+
+    /// Very long pathname (>1000 chars) — must not crash on extraction
+    @("attack: very long pathname")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import std.array : replicate;
+
+        // 50-char segments * 20 levels = 1000+ char path
+        auto segments = "abcdefghijklmnopqrstuvwxyz01234567890123456789abcd/";
+        auto longPath = segments.replicate(20) ~ "file.txt";
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer(longPath, cast(const(ubyte)[]) "deep");
+        auto data = writer.writtenData();
+
+        auto extractDir = Path(testDataDir, "sec-longpath-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // Should not crash. May fail on filesystem limits — that's OK.
+        auto reader = DarkArchiveReader(data);
+        try {
+            reader.extractTo(extractDir);
+        } catch (Exception) {
+            // Filesystem may reject very long paths — acceptable
+        }
+    }
+
+    /// Control characters in filename (newlines, tabs)
+    @("attack: control characters in filename")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("line1\nline2.txt", cast(const(ubyte)[]) "newline name");
+        writer.addBuffer("tab\there.txt", cast(const(ubyte)[]) "tab name");
+        auto data = writer.writtenData();
+
+        auto extractDir = Path(testDataDir, "sec-control-char-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // Should not crash. Filesystem may accept or reject these names.
+        auto reader = DarkArchiveReader(data);
+        try {
+            reader.extractTo(extractDir);
+        } catch (Exception) {
+            // Some filesystems reject control chars — acceptable
+        }
+
+        // Entry iteration must work regardless
+        auto reader2 = DarkArchiveReader(data);
+        int count;
+        foreach (entry; reader2.entries) {
+            count++;
+            assert(entry.pathname.length > 0);
+        }
+        count.shouldEqual(2);
+    }
+
+    /// Right-to-Left Override (U+202E) in filename — visual spoofing attack.
+    /// "readme\u202Etxt.exe" displays as "readmeexe.txt" in some terminals.
+    /// Library should not crash; ideally entries are still iterable.
+    @("attack: RTL override in filename")
+    unittest {
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("readme\xE2\x80\xAEtxt.exe",
+            cast(const(ubyte)[]) "spoofed extension");
+        auto data = writer.writtenData();
+
+        // Must not crash during reading
+        auto reader = DarkArchiveReader(data);
+        int count;
+        foreach (entry; reader.entries) {
+            count++;
+            assert(entry.pathname.length > 0);
+        }
+        count.shouldEqual(1);
+    }
+
+    /// Zip bomb: high compression ratio — small compressed, huge decompressed.
+    /// Library must not allocate unbounded memory.
+    @("attack: deflate bomb (high compression ratio)")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import darkarchive.formats.zip.reader : ZipReader;
+
+        // Create data that compresses extremely well: 1MB of zeros
+        auto zeros = new ubyte[](1024 * 1024);
+
+        auto writer = ZipWriter.create();
+        writer.addBuffer("bomb.bin", zeros);
+        auto zipData = writer.data;
+
+        // The compressed size should be tiny compared to uncompressed
+        auto reader = ZipReader(zipData);
+        assert(reader.length == 1);
+
+        // Reading should work — 1MB is reasonable
+        auto content = reader.readData(0);
+        content.length.shouldEqual(1024 * 1024);
+
+        // Verify it's all zeros
+        foreach (b; content)
+            assert(b == 0);
+    }
+
+    /// Overlapping entries: two central dir entries pointing to same local
+    /// header — amplification attack. Reading both should not crash.
+    @("attack: overlapping central directory entries")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import darkarchive.formats.zip.reader : ZipReader;
+
+        // We can't easily craft overlapping entries with ZipWriter.
+        // But we can verify that reading duplicate-named entries from
+        // test-duplicate-names.zip doesn't cause issues.
+        auto reader = ZipReader(testDataDir ~ "/test-duplicate-names.zip");
+        assert(reader.length >= 2);
+
+        // Read all entries — must not crash
+        foreach (i; 0 .. reader.length) {
+            auto data = reader.readData(i);
+            assert(data !is null);
+        }
+    }
+
+    /// File and directory with same name — what happens?
+    @("attack: file and directory with same name")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        // Write a directory, then a file with same name (without trailing /)
+        writer.addDirectory("conflict");
+        writer.addBuffer("conflict", cast(const(ubyte)[]) "file wins?");
+        auto data = writer.writtenData();
+
+        auto extractDir = Path(testDataDir, "sec-conflict-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // Should not crash. Result is implementation-defined.
+        auto reader = DarkArchiveReader(data);
+        try {
+            reader.extractTo(extractDir);
+        } catch (Exception) {
+            // May fail — that's acceptable
+        }
+    }
+
+    /// Windows-style path with colon — NTFS alternate data stream attack.
+    /// "file.txt:hidden" on Windows writes to ADS. On Linux it's a valid filename.
+    @("attack: colon in filename (NTFS ADS)")
+    unittest {
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("file.txt:hidden", cast(const(ubyte)[]) "ADS data");
+        auto data = writer.writtenData();
+
+        // Must not crash during reading
+        auto reader = DarkArchiveReader(data);
+        int count;
+        foreach (entry; reader.entries) {
+            count++;
+            assert(entry.pathname == "file.txt:hidden");
+        }
+        count.shouldEqual(1);
     }
 }
