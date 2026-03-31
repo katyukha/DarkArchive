@@ -12,6 +12,7 @@ import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip : ZipReader, ZipWriter;
 import darkarchive.formats.tar : TarReader, TarWriter, gzipCompress;
 import darkarchive.gzip : gunzip, isGzip;
+import darkarchive.datasource : GzipSequentialReader;
 
 import thepath : Path;
 
@@ -68,7 +69,7 @@ struct DarkArchiveReader {
         // Format-specific state (only one is active)
         ZipReader* _zip;
         TarReader* _tar;
-        const(ubyte)[] _rawData; // keep reference for lifetime
+        const(ubyte)[] _rawData; // keep reference for lifetime (memory-backed)
 
         DarkArchiveFormat _format;
         // For zip: iteration index
@@ -78,37 +79,70 @@ struct DarkArchiveReader {
     @disable this();
 
     /// Open archive from file path (auto-detect format).
+    /// For ZIP: uses file-backed I/O (does not load full file into memory).
+    /// For TAR/TAR.GZ: currently loads into memory (streaming TAR planned).
     this(in Path path) {
         this(path.toString());
     }
 
     /// ditto
     this(string path) {
-        import std.file : read;
-        _rawData = cast(const(ubyte)[]) read(path);
-        detectAndOpen();
+        // Read just the first 264 bytes for format detection (enough for
+        // ZIP magic at 0, GZIP magic at 0, and TAR ustar magic at 257)
+        import std.file : read, getSize;
+        auto fileSize = getSize(path);
+        if (fileSize < 4)
+            throw new DarkArchiveException("Archive file too small to detect format");
+
+        auto headerLen = fileSize > 264 ? 264 : cast(size_t) fileSize;
+        auto header = cast(const(ubyte)[]) read(path, headerLen);
+
+        // ZIP: file-backed (no full load)
+        if (header[0] == 'P' && header[1] == 'K' &&
+            (header[2] == 3 || header[2] == 5)) {
+            _zip = new ZipReader(path);
+            _format = DarkArchiveFormat.zip;
+            return;
+        }
+
+        // GZIP: streaming decompression — no temp files, constant memory
+        if (header.length >= 2 && header[0] == 0x1f && header[1] == 0x8b) {
+            auto gzStream = new GzipSequentialReader(path);
+            _tar = new TarReader(gzStream);
+            _format = DarkArchiveFormat.tarGz;
+            return;
+        }
+
+        // TAR: file-backed (no full load)
+        if (header.length >= 263 &&
+            header[257 .. 262] == cast(const(ubyte)[]) "ustar") {
+            _tar = new TarReader(path);
+            _format = DarkArchiveFormat.tar;
+            return;
+        }
+
+        throw new DarkArchiveException("Cannot detect archive format");
     }
 
     /// Open archive from memory buffer (auto-detect format).
     this(const(ubyte)[] data) {
         _rawData = data;
-        detectAndOpen();
+        detectAndOpenFromMemory();
     }
 
-    private void detectAndOpen() {
+    private void detectAndOpenFromMemory() {
         if (_rawData.length < 4)
             throw new DarkArchiveException("Archive data too small to detect format");
 
-        // ZIP: starts with "PK\x03\x04" or "PK\x05\x06" (empty zip)
-        if (_rawData.length >= 4 &&
-            _rawData[0] == 'P' && _rawData[1] == 'K' &&
+        // ZIP
+        if (_rawData[0] == 'P' && _rawData[1] == 'K' &&
             (_rawData[2] == 3 || _rawData[2] == 5)) {
             _zip = new ZipReader(_rawData);
             _format = DarkArchiveFormat.zip;
             return;
         }
 
-        // GZIP: starts with 0x1f 0x8b
+        // GZIP
         if (isGzip(_rawData)) {
             auto tarData = gunzip(_rawData);
             _tar = new TarReader(tarData);
@@ -116,7 +150,7 @@ struct DarkArchiveReader {
             return;
         }
 
-        // TAR: check for ustar magic at offset 257
+        // TAR
         if (_rawData.length >= 263 &&
             _rawData[257 .. 262] == cast(const(ubyte)[]) "ustar") {
             _tar = new TarReader(_rawData);

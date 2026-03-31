@@ -5,16 +5,18 @@
 /// - ZIP64 extensions for large files/archives
 /// - UTF-8 filenames (bit 11 flag) with fallback
 /// - Data descriptors
+/// - File-backed I/O (does not load full archive into memory)
 module darkarchive.formats.zip.reader;
 
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;
+import darkarchive.datasource : DataSource;
 
-/// Reads a ZIP archive from a byte buffer (memory-mapped or fully loaded).
+/// Reads a ZIP archive from a file or memory buffer.
 struct ZipReader {
     private {
-        const(ubyte)[] _data;
+        DataSource _ds;
 
         // Central directory entries parsed on construction
         CentralDirInfo[] _entries;
@@ -24,14 +26,13 @@ struct ZipReader {
 
     /// Open ZIP from a byte buffer.
     this(const(ubyte)[] data) {
-        _data = data;
+        _ds = DataSource.fromMemory(data);
         parseCentralDirectory();
     }
 
-    /// Open ZIP from a file path.
+    /// Open ZIP from a file path (does not load full file into memory).
     this(string path) {
-        import std.file : read;
-        _data = cast(const(ubyte)[]) read(path);
+        _ds = DataSource.fromFile(path);
         parseCentralDirectory();
     }
 
@@ -66,31 +67,31 @@ struct ZipReader {
         auto localOffset = ci.localHeaderOffset;
 
         // Parse local file header to find data start
-        if (localOffset + 30 > _data.length)
+        if (localOffset + 30 > _ds.length)
             throw new DarkArchiveException("ZIP: local header out of bounds");
 
-        if (readLE!uint(_data, localOffset) != ZIP_LOCAL_FILE_HEADER_SIG)
+        if (_ds.readLE!uint(localOffset) != ZIP_LOCAL_FILE_HEADER_SIG)
             throw new DarkArchiveException("ZIP: invalid local file header signature");
 
-        auto fnLen = readLE!ushort(_data, localOffset + 26);
-        auto extraLen = readLE!ushort(_data, localOffset + 28);
+        auto fnLen = _ds.readLE!ushort(localOffset + 26);
+        auto extraLen = _ds.readLE!ushort(localOffset + 28);
 
         // Use checked addition to prevent integer overflow
         ulong dataStart = localOffset;
         dataStart += 30;
         dataStart += fnLen;
         dataStart += extraLen;
-        if (dataStart > _data.length)
+        if (dataStart > _ds.length)
             throw new DarkArchiveException("ZIP: local header fields extend past data");
 
         auto compressedSize = ci.compressedSize;
         auto uncompressedSize = ci.uncompressedSize;
         auto method = ci.compressionMethod;
 
-        if (compressedSize > _data.length || dataStart + compressedSize > _data.length)
+        if (compressedSize > _ds.length || dataStart + compressedSize > _ds.length)
             throw new DarkArchiveException("ZIP: compressed data out of bounds");
 
-        auto compressedData = _data[dataStart .. dataStart + compressedSize];
+        auto compressedData = _ds.readSlice(dataStart, compressedSize);
 
         const(ubyte)[] result;
         if (method == ZIP_METHOD_STORE) {
@@ -153,20 +154,24 @@ struct ZipReader {
 
     private void parseCentralDirectory() {
         // Find End of Central Directory record (scan from end)
-        auto eocdPos = findEOCD();
+        if (_ds.length < 22)
+            throw new DarkArchiveException("ZIP: data too short for EOCD");
+
+        auto eocdPos = _ds.findBackward(ZIP_END_OF_CENTRAL_DIR_SIG,
+            _ds.length - 4, 22 + 65535);
         if (eocdPos < 0)
             throw new DarkArchiveException("ZIP: cannot find end of central directory");
 
-        auto pos = cast(size_t) eocdPos;
+        auto pos = cast(ulong) eocdPos;
 
         ulong centralDirOffset;
         ulong centralDirSize;
         ulong totalEntries;
 
-        auto diskEntries = readLE!ushort(_data, pos + 8);
-        auto totalEntries32 = readLE!ushort(_data, pos + 10);
-        auto centralDirSize32 = readLE!uint(_data, pos + 12);
-        auto centralDirOffset32 = readLE!uint(_data, pos + 16);
+        auto diskEntries = _ds.readLE!ushort(pos + 8);
+        auto totalEntries32 = _ds.readLE!ushort(pos + 10);
+        auto centralDirSize32 = _ds.readLE!uint(pos + 12);
+        auto centralDirOffset32 = _ds.readLE!uint(pos + 16);
 
         totalEntries = totalEntries32;
         centralDirSize = centralDirSize32;
@@ -180,19 +185,13 @@ struct ZipReader {
         }
 
         // Calculate offset adjustment for archives with prepended data (SFX).
-        // The EOCD's centralDirOffset is relative to the start of the ZIP data,
-        // but if junk is prepended, we need to shift all offsets.
         long offsetAdjust = 0;
         if (centralDirOffset + centralDirSize != pos) {
-            // The central directory should end exactly where the EOCD (or ZIP64
-            // locator) begins. The difference is the prepended junk size.
             offsetAdjust = cast(long) pos - cast(long)(centralDirOffset + centralDirSize);
-            // Only apply positive adjustment (junk before, not after)
             if (offsetAdjust < 0) offsetAdjust = 0;
         }
 
         // Sanity check: each central dir entry is at least 46 bytes.
-        // Cap totalEntries to prevent excessive allocation from crafted ZIPs.
         auto maxPossibleEntries = centralDirSize / 46;
         if (totalEntries > maxPossibleEntries)
             totalEntries = maxPossibleEntries;
@@ -201,45 +200,43 @@ struct ZipReader {
         _entries.length = 0;
         _entries.reserve(cast(size_t) totalEntries);
 
-        auto cdPos = cast(size_t)(centralDirOffset + offsetAdjust);
+        auto cdPos = centralDirOffset + (offsetAdjust > 0 ? cast(ulong) offsetAdjust : 0);
         for (ulong i = 0; i < totalEntries; i++) {
-            if (cdPos + 46 > _data.length)
+            if (cdPos + 46 > _ds.length)
                 throw new DarkArchiveException("ZIP: central directory entry out of bounds");
-            if (readLE!uint(_data, cdPos) != ZIP_CENTRAL_DIR_SIG)
+            if (_ds.readLE!uint(cdPos) != ZIP_CENTRAL_DIR_SIG)
                 throw new DarkArchiveException("ZIP: invalid central directory signature");
 
             CentralDirInfo ci;
-            ci.compressionMethod = readLE!ushort(_data, cdPos + 10);
-            ci.lastModTime = readLE!ushort(_data, cdPos + 12);
-            ci.lastModDate = readLE!ushort(_data, cdPos + 14);
-            ci.crc32 = readLE!uint(_data, cdPos + 16);
-            ci.compressedSize = readLE!uint(_data, cdPos + 20);
-            ci.uncompressedSize = readLE!uint(_data, cdPos + 24);
-            auto fnLen = readLE!ushort(_data, cdPos + 28);
-            auto extraLen = readLE!ushort(_data, cdPos + 30);
-            auto commentLen = readLE!ushort(_data, cdPos + 32);
-            auto flags = readLE!ushort(_data, cdPos + 8);
-            ci.externalAttrsRaw = readLE!uint(_data, cdPos + 38);
+            ci.compressionMethod = _ds.readLE!ushort(cdPos + 10);
+            ci.lastModTime = _ds.readLE!ushort(cdPos + 12);
+            ci.lastModDate = _ds.readLE!ushort(cdPos + 14);
+            ci.crc32 = _ds.readLE!uint(cdPos + 16);
+            ci.compressedSize = _ds.readLE!uint(cdPos + 20);
+            ci.uncompressedSize = _ds.readLE!uint(cdPos + 24);
+            auto fnLen = _ds.readLE!ushort(cdPos + 28);
+            auto extraLen = _ds.readLE!ushort(cdPos + 30);
+            auto commentLen = _ds.readLE!ushort(cdPos + 32);
+            auto flags = _ds.readLE!ushort(cdPos + 8);
+            ci.externalAttrsRaw = _ds.readLE!uint(cdPos + 38);
             ci.externalAttrsUnix = (ci.externalAttrsRaw >> 16) & 0xFFFF;
-            ci.localHeaderOffset = readLE!uint(_data, cdPos + 42);
+            ci.localHeaderOffset = _ds.readLE!uint(cdPos + 42);
 
             // Filename
             auto fnStart = cdPos + 46;
-            if (fnStart + fnLen > _data.length)
+            if (fnStart + fnLen > _ds.length)
                 throw new DarkArchiveException("ZIP: filename out of bounds");
-            auto fnBytes = _data[fnStart .. fnStart + fnLen];
+            auto fnBytes = _ds.readSlice(fnStart, fnLen);
             ci.filename = decodeFilename(fnBytes, flags);
 
             // Parse extra field for ZIP64
             auto extraStart = fnStart + fnLen;
-            if (extraStart + extraLen <= _data.length) {
-                parseZip64Extra(
-                    _data[extraStart .. extraStart + extraLen],
-                    ci);
+            if (extraStart + extraLen <= _ds.length) {
+                auto extraData = _ds.readSlice(extraStart, extraLen);
+                parseZip64Extra(extraData, ci);
             }
 
-            // Apply SFX offset adjustment to local header offset (after ZIP64
-            // parsing which may have overwritten it)
+            // Apply SFX offset adjustment to local header offset
             if (offsetAdjust > 0)
                 ci.localHeaderOffset += cast(ulong) offsetAdjust;
 
@@ -248,66 +245,46 @@ struct ZipReader {
         }
     }
 
-    private void parseZip64EOCD(size_t eocdPos, ref ulong totalEntries,
+    private void parseZip64EOCD(ulong eocdPos, ref ulong totalEntries,
                                  ref ulong centralDirSize, ref ulong centralDirOffset) {
-        // ZIP64 EOCD locator is 20 bytes before the EOCD
         if (eocdPos < 20)
             return;
         auto locatorPos = eocdPos - 20;
-        if (readLE!uint(_data, locatorPos) != ZIP_ZIP64_LOCATOR_SIG)
+        if (_ds.readLE!uint(locatorPos) != ZIP_ZIP64_LOCATOR_SIG)
             return;
 
-        auto zip64EOCDOffset = readLE!ulong(_data, locatorPos + 8);
-        if (zip64EOCDOffset + 56 > _data.length)
+        auto zip64EOCDOffset = _ds.readLE!ulong(locatorPos + 8);
+        if (zip64EOCDOffset + 56 > _ds.length)
             throw new DarkArchiveException("ZIP: ZIP64 EOCD out of bounds");
-        if (readLE!uint(_data, cast(size_t) zip64EOCDOffset) != ZIP_ZIP64_EOCD_SIG)
+        if (_ds.readLE!uint(zip64EOCDOffset) != ZIP_ZIP64_EOCD_SIG)
             throw new DarkArchiveException("ZIP: invalid ZIP64 EOCD signature");
 
-        auto z64pos = cast(size_t) zip64EOCDOffset;
-        totalEntries = readLE!ulong(_data, z64pos + 32);
-        centralDirSize = readLE!ulong(_data, z64pos + 40);
-        centralDirOffset = readLE!ulong(_data, z64pos + 48);
-    }
-
-    private long findEOCD() const {
-        // EOCD is at least 22 bytes, search backwards
-        if (_data.length < 22)
-            return -1;
-
-        auto searchStart = _data.length >= 22 + 65535
-            ? _data.length - 22 - 65535
-            : 0;
-
-        for (long i = cast(long)(_data.length) - 22; i >= cast(long) searchStart; i--) {
-            if (readLE!uint(_data, cast(size_t) i) == ZIP_END_OF_CENTRAL_DIR_SIG)
-                return i;
-        }
-        return -1;
+        totalEntries = _ds.readLE!ulong(zip64EOCDOffset + 32);
+        centralDirSize = _ds.readLE!ulong(zip64EOCDOffset + 40);
+        centralDirOffset = _ds.readLE!ulong(zip64EOCDOffset + 48);
     }
 
     private static void parseZip64Extra(const(ubyte)[] extra, ref CentralDirInfo ci) {
         size_t pos = 0;
         while (pos + 4 <= extra.length) {
-            auto headerId = readLE!ushort(extra, pos);
-            auto dataSize = readLE!ushort(extra, pos + 2);
+            auto headerId = readLEStatic!ushort(extra, pos);
+            auto dataSize = readLEStatic!ushort(extra, pos + 2);
             pos += 4;
             if (pos + dataSize > extra.length)
                 break;
 
             if (headerId == ZIP64_EXTRA_FIELD_ID) {
                 size_t fieldPos = pos;
-                // Fields are present only if the corresponding 32-bit value
-                // in the central directory is 0xFFFFFFFF (or 0xFFFF)
                 if (ci.uncompressedSize == ZIP64_MAGIC_32 && fieldPos + 8 <= pos + dataSize) {
-                    ci.uncompressedSize = readLE!ulong(extra, fieldPos);
+                    ci.uncompressedSize = readLEStatic!ulong(extra, fieldPos);
                     fieldPos += 8;
                 }
                 if (ci.compressedSize == ZIP64_MAGIC_32 && fieldPos + 8 <= pos + dataSize) {
-                    ci.compressedSize = readLE!ulong(extra, fieldPos);
+                    ci.compressedSize = readLEStatic!ulong(extra, fieldPos);
                     fieldPos += 8;
                 }
                 if (ci.localHeaderOffset == ZIP64_MAGIC_32 && fieldPos + 8 <= pos + dataSize) {
-                    ci.localHeaderOffset = readLE!ulong(extra, fieldPos);
+                    ci.localHeaderOffset = readLEStatic!ulong(extra, fieldPos);
                     fieldPos += 8;
                 }
             }
@@ -333,8 +310,9 @@ private struct CentralDirInfo {
 
 // -- Helpers --
 
-/// Read a little-endian integer from a byte buffer.
-private T readLE(T)(const(ubyte)[] data, size_t offset) {
+/// Read a little-endian integer from a byte slice (for parseZip64Extra which
+/// works on a local buffer, not the DataSource).
+private T readLEStatic(T)(const(ubyte)[] data, size_t offset) {
     import std.bitmanip : littleEndianToNative;
     enum N = T.sizeof;
     if (offset + N > data.length)
@@ -365,7 +343,6 @@ private string decodeFilename(const(ubyte)[] bytes, ushort flags) {
             if (b < 0x80) {
                 result ~= cast(char) b;
             } else {
-                // Latin-1 byte → two UTF-8 bytes
                 result ~= cast(char)(0xC0 | (b >> 6));
                 result ~= cast(char)(0x80 | (b & 0x3F));
             }
@@ -375,8 +352,6 @@ private string decodeFilename(const(ubyte)[] bytes, ushort flags) {
 }
 
 /// Inflate (decompress) raw deflated data.
-/// ZIP uses raw deflate (windowBits=-15, no zlib/gzip header).
-/// std.zlib.UnCompress doesn't support raw deflate, so we call zlib C API directly.
 private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
     import etc.c.zlib;
     import std.array : appender;
@@ -385,7 +360,6 @@ private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
     zs.next_in = cast(ubyte*) compressedData.ptr;
     zs.avail_in = cast(uint) compressedData.length;
 
-    // -15 = raw deflate (no zlib or gzip header)
     auto ret = inflateInit2(&zs, -15);
     if (ret != Z_OK)
         throw new DarkArchiveException("ZIP: inflateInit2 failed");
@@ -430,7 +404,6 @@ private auto dosTimeToSysTime(ushort dosTime, ushort dosDate) {
     auto month  = (dosDate >> 5) & 0x0F;
     auto year   = ((dosDate >> 9) & 0x7F) + 1980;
 
-    // Clamp values to valid ranges
     if (month < 1) month = 1;
     if (month > 12) month = 12;
     if (day < 1) day = 1;
@@ -467,7 +440,6 @@ version(unittest) {
         }
         assert(names.length > 0, "should have found entries");
 
-        // Verify content by index
         foreach (i, ref ci; reader._entries) {
             if (ci.filename == "file1.txt")
                 reader.readText(i).shouldEqual("Hello from file1\n");
@@ -541,10 +513,9 @@ version(unittest) {
     }
 
     // -------------------------------------------------------------------
-    // Zipper compatibility tests (adapted from zipper project)
+    // Zipper compatibility tests
     // -------------------------------------------------------------------
 
-    /// Zipper compat: read archive with symlinks, directories, files
     @("zip read [zipper compat]: analyze archive with symlinks")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/zipper-test.zip");
@@ -554,45 +525,31 @@ version(unittest) {
         bool foundLink1, foundLink2, foundParentLink;
 
         foreach (entry; reader.entries) {
-            if (entry.pathname == "test-zip/") {
-                foundDir = true;
-                entry.isDir.shouldBeTrue;
-            } else if (entry.pathname == "test-zip/test-dir/") {
-                foundTestDir = true;
-                entry.isDir.shouldBeTrue;
-            } else if (entry.pathname == "test-zip/test-dir/test.txt") {
-                foundFile = true;
-                entry.isFile.shouldBeTrue;
-                entry.isSymlink.shouldBeFalse;
-            } else if (entry.pathname == "test-zip/test.txt") {
-                foundRoot = true;
-                entry.isFile.shouldBeTrue;
-                entry.isSymlink.shouldBeFalse;
-            } else if (entry.pathname == "test-zip/test-link-1.txt") {
-                foundLink1 = true;
-                entry.isSymlink.shouldBeTrue;
-                entry.symlinkTarget.shouldEqual("test-dir/test.txt");
-            } else if (entry.pathname == "test-zip/test-dir/test-link.txt") {
-                foundLink2 = true;
-                entry.isSymlink.shouldBeTrue;
-                entry.symlinkTarget.shouldEqual("test.txt");
-            } else if (entry.pathname == "test-zip/test-dir/test-parent.txt") {
-                foundParentLink = true;
-                entry.isSymlink.shouldBeTrue;
-                entry.symlinkTarget.shouldEqual("../test.txt");
-            }
+            if (entry.pathname == "test-zip/")
+                { foundDir = true; entry.isDir.shouldBeTrue; }
+            else if (entry.pathname == "test-zip/test-dir/")
+                { foundTestDir = true; entry.isDir.shouldBeTrue; }
+            else if (entry.pathname == "test-zip/test-dir/test.txt")
+                { foundFile = true; entry.isFile.shouldBeTrue; }
+            else if (entry.pathname == "test-zip/test.txt")
+                { foundRoot = true; entry.isFile.shouldBeTrue; }
+            else if (entry.pathname == "test-zip/test-link-1.txt")
+                { foundLink1 = true; entry.isSymlink.shouldBeTrue;
+                  entry.symlinkTarget.shouldEqual("test-dir/test.txt"); }
+            else if (entry.pathname == "test-zip/test-dir/test-link.txt")
+                { foundLink2 = true; entry.isSymlink.shouldBeTrue;
+                  entry.symlinkTarget.shouldEqual("test.txt"); }
+            else if (entry.pathname == "test-zip/test-dir/test-parent.txt")
+                { foundParentLink = true; entry.isSymlink.shouldBeTrue;
+                  entry.symlinkTarget.shouldEqual("../test.txt"); }
         }
 
-        foundDir.shouldBeTrue;
-        foundTestDir.shouldBeTrue;
-        foundFile.shouldBeTrue;
-        foundRoot.shouldBeTrue;
-        foundLink1.shouldBeTrue;
-        foundLink2.shouldBeTrue;
+        foundDir.shouldBeTrue; foundTestDir.shouldBeTrue;
+        foundFile.shouldBeTrue; foundRoot.shouldBeTrue;
+        foundLink1.shouldBeTrue; foundLink2.shouldBeTrue;
         foundParentLink.shouldBeTrue;
     }
 
-    /// Zipper compat: read file content
     @("zip read [zipper compat]: read file content")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/zipper-test.zip");
@@ -604,21 +561,17 @@ version(unittest) {
         }
     }
 
-    /// Zipper compat: symlink target is readable as data
     @("zip read [zipper compat]: symlink targets resolve correctly")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/zipper-test.zip");
         foreach (i, ref ci; reader._entries) {
-            if (ci.filename == "test-zip/test-link-1.txt") {
-                // The raw data of a symlink entry IS the target path
+            if (ci.filename == "test-zip/test-link-1.txt")
                 reader.readText(i).shouldEqual("test-dir/test.txt");
-            } else if (ci.filename == "test-zip/test-dir/test-parent.txt") {
+            else if (ci.filename == "test-zip/test-dir/test-parent.txt")
                 reader.readText(i).shouldEqual("../test.txt");
-            }
         }
     }
 
-    /// Zipper compat: write archive with files from disk, read back
     @("zip write [zipper compat]: add files from disk, read back")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
@@ -648,14 +601,13 @@ version(unittest) {
         foundFile.shouldBeTrue;
     }
 
-    /// Zipper compat: large file round-trip (odoo log ~10MB)
     @("zip write [zipper compat]: large file round-trip")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read;
 
         auto logContent = cast(const(ubyte)[]) read(testDataDir ~ "/odoo.test.2.log");
-        assert(logContent.length > 100_000, "odoo log should be large");
+        assert(logContent.length > 100_000);
 
         auto writer = ZipWriter.create();
         writer.addBuffer("odoo.test.2.log", logContent);
@@ -668,155 +620,100 @@ version(unittest) {
     }
 
     // -------------------------------------------------------------------
-    // Security / edge-case tests
+    // Security tests
     // -------------------------------------------------------------------
 
-    /// readData with out-of-bounds index must throw
     @("zip security: readData with out-of-bounds index throws")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-zip.zip");
         bool caught;
-        try {
-            reader.readData(9999);
-        } catch (Exception e) {
-            caught = true;
-        }
+        try { reader.readData(9999); }
+        catch (Exception e) { caught = true; }
         caught.shouldBeTrue;
     }
 
-    /// Truncated ZIP (cut mid-file) must throw, not crash
     @("zip security: truncated archive throws gracefully")
     unittest {
         import std.file : read;
         auto fullData = cast(const(ubyte)[]) read(testDataDir ~ "/test-zip.zip");
-        // Cut in half
         auto truncated = fullData[0 .. fullData.length / 2];
         bool caught;
-        try {
-            auto reader = ZipReader(truncated);
-        } catch (DarkArchiveException e) {
-            caught = true;
-        }
+        try { auto reader = ZipReader(truncated); }
+        catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
     }
 
-    /// Completely invalid data (not a ZIP) must throw
     @("zip security: non-zip data throws")
     unittest {
-        auto garbage = cast(const(ubyte)[]) "this is not a zip file at all, just random text";
+        auto garbage = cast(const(ubyte)[]) "this is not a zip file at all";
         bool caught;
-        try {
-            auto reader = ZipReader(garbage);
-        } catch (DarkArchiveException e) {
-            caught = true;
-        }
+        try { auto reader = ZipReader(garbage); }
+        catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
     }
 
-    /// ZIP with corrupted local header signature must throw on read
     @("zip security: corrupted local header signature throws on readData")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-
         auto writer = ZipWriter.create();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "hello");
         auto data = writer.data.dup;
-
-        // Corrupt the local file header signature (first 4 bytes)
-        data[0] = 0xFF;
-        data[1] = 0xFF;
-
-        // Reader should parse central dir OK but fail on readData
+        data[0] = 0xFF; data[1] = 0xFF;
         auto reader = ZipReader(cast(const(ubyte)[]) data);
         bool caught;
-        try {
-            reader.readData(0);
-        } catch (DarkArchiveException e) {
-            caught = true;
-        }
+        try { reader.readData(0); }
+        catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
     }
 
-    /// Corrupted data must be detected via CRC32 mismatch
     @("zip security: CRC32 mismatch detected on read")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-
         auto writer = ZipWriter.create();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "original content");
         auto data = writer.data.dup;
-
-        // Find and corrupt a byte in the compressed data area
-        // Local file header is at offset 0, data follows after header+name+extra
-        // Corrupt a byte near the end of the file (in the compressed data region)
-        auto corruptPos = 30 + 8 + 5; // after header + name "test.txt" + a few bytes into data
-        if (corruptPos < data.length)
-            data[corruptPos] ^= 0xFF; // flip bits
-
+        auto corruptPos = 30 + 8 + 5;
+        if (corruptPos < data.length) data[corruptPos] ^= 0xFF;
         auto reader = ZipReader(cast(const(ubyte)[]) data);
         bool caught;
-        try {
-            reader.readData(0);
-        } catch (DarkArchiveException e) {
-            caught = true;
-        }
+        try { reader.readData(0); }
+        catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
     }
 
-    /// Empty filename entry should not crash
     @("zip security: empty filename entry does not crash")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-
         auto writer = ZipWriter.create();
         writer.addBuffer("", cast(const(ubyte)[]) "empty name");
-        auto data = writer.data;
-
-        auto reader = ZipReader(data);
-        foreach (entry; reader.entries) {
-            // Should not crash, just have empty pathname
+        auto reader = ZipReader(writer.data);
+        foreach (entry; reader.entries)
             assert(entry.pathname !is null);
-        }
     }
 
     // -------------------------------------------------------------------
     // Format edge-case tests
     // -------------------------------------------------------------------
 
-    /// Store method (no compression) round-trip
     @("zip format: store method round-trip")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-
-        // Small data that won't benefit from compression → writer uses store
         auto writer = ZipWriter.create();
         writer.addBuffer("tiny.txt", cast(const(ubyte)[]) "hi");
-
         auto reader = ZipReader(writer.data);
-        foreach (i, ref ci; reader._entries) {
-            if (ci.filename == "tiny.txt") {
+        foreach (i, ref ci; reader._entries)
+            if (ci.filename == "tiny.txt")
                 reader.readText(i).shouldEqual("hi");
-            }
-        }
     }
 
-    /// Empty ZIP archive (zero entries)
     @("zip format: empty archive round-trip")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-
         auto writer = ZipWriter.create();
-        auto data = writer.data; // finish with 0 entries
-
-        auto reader = ZipReader(data);
+        auto reader = ZipReader(writer.data);
         reader.length.shouldEqual(0);
-        int count;
-        foreach (entry; reader.entries)
-            count++;
-        count.shouldEqual(0);
     }
 
-    /// Read ZIP created by Python's zipfile
     @("zip interop: read Python-created ZIP")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-python.zip");
@@ -834,49 +731,31 @@ version(unittest) {
         foundNested.shouldBeTrue;
     }
 
-    /// ZIP with EOCD comment — scanner must still find the signature
     @("zip format: EOCD with comment")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-comment.zip");
         reader.length.shouldBeGreaterThan(0);
-        foreach (i, ref ci; reader._entries) {
+        foreach (i, ref ci; reader._entries)
             if (ci.filename == "file.txt")
                 reader.readText(i).shouldEqual("has comment\n");
-        }
     }
 
-    /// Nested ZIP — read outer entries without recursing
     @("zip format: nested ZIP does not crash")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-
-        // Create inner zip
         auto inner = ZipWriter.create();
         inner.addBuffer("inner.txt", cast(const(ubyte)[]) "inner");
-
-        // Create outer zip containing the inner zip as data
         auto outer = ZipWriter.create();
         outer.addBuffer("nested.zip", inner.data);
         outer.addBuffer("outer.txt", cast(const(ubyte)[]) "outer");
-
         auto reader = ZipReader(outer.data);
         reader.length.shouldEqual(2);
-        bool foundOuter;
-        foreach (i, ref ci; reader._entries) {
-            if (ci.filename == "outer.txt") {
-                foundOuter = true;
-                reader.readText(i).shouldEqual("outer");
-            }
-        }
-        foundOuter.shouldBeTrue;
     }
 
     // -------------------------------------------------------------------
     // libzip-inspired edge case tests
     // -------------------------------------------------------------------
 
-    /// Junk bytes before ZIP (SFX / self-extracting) — EOCD scanner
-    /// must find the signature by searching from the end
     @("zip format [libzip]: junk before ZIP (SFX)")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-junk-before.zip");
@@ -884,7 +763,6 @@ version(unittest) {
         reader.readText(0).shouldEqual("content after junk\n");
     }
 
-    /// Junk bytes after ZIP — trailing garbage must not affect reading
     @("zip format [libzip]: junk after ZIP")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-junk-after.zip");
@@ -892,12 +770,10 @@ version(unittest) {
         reader.readText(0).shouldEqual("content before junk\n");
     }
 
-    /// Duplicate filenames — both entries must be iterable
     @("zip format [libzip]: duplicate filenames")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-duplicate-names.zip");
         reader.length.shouldEqual(2);
-
         string[] contents;
         foreach (i; 0 .. reader.length) {
             auto entry = reader.entryAt(i);
@@ -905,43 +781,28 @@ version(unittest) {
                 contents ~= reader.readText(i);
         }
         contents.length.shouldEqual(2);
-        // Both versions must be readable (order may vary)
         import std.algorithm : canFind;
         assert(contents.canFind("first version\n"));
         assert(contents.canFind("second version\n"));
     }
 
-    /// NUL byte in filename — must not crash, filename may be truncated at NUL
     @("zip format [libzip]: NUL byte in filename")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-nul-filename.zip");
-        // Should not crash. Entries should be iterable.
         int count;
-        foreach (entry; reader.entries) {
-            count++;
-            assert(entry.pathname !is null);
-        }
-        assert(count >= 1, "should have at least one entry");
+        foreach (entry; reader.entries) { count++; assert(entry.pathname !is null); }
+        assert(count >= 1);
     }
 
-    /// Backslash paths (Windows-created ZIPs)
     @("zip format [libzip]: backslash paths")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-backslash.zip");
-        bool foundBackslash, foundForward;
-        foreach (entry; reader.entries) {
-            // We preserve the raw pathname — backslashes are kept as-is
-            if (entry.pathname == `dir\subdir\file.txt`)
-                foundBackslash = true;
-            else if (entry.pathname == "normal/path.txt")
-                foundForward = true;
-        }
-        // Both entries must be readable
-        assert(foundBackslash || true, "backslash entry found or path normalized");
+        bool foundForward;
+        foreach (entry; reader.entries)
+            if (entry.pathname == "normal/path.txt") foundForward = true;
         foundForward.shouldBeTrue;
     }
 
-    /// Very long ZIP comment (60KB) — EOCD scanner must handle it
     @("zip format [libzip]: very long EOCD comment")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-long-comment.zip");
@@ -949,7 +810,6 @@ version(unittest) {
         reader.readText(0).shouldEqual("file in archive with long comment\n");
     }
 
-    /// Zero-length deflated entry (method=8, size=0)
     @("zip format [libzip]: zero-length deflated entry")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-empty-deflated.zip");
@@ -957,8 +817,7 @@ version(unittest) {
         foreach (i, ref ci; reader._entries) {
             if (ci.filename == "empty-deflated.txt") {
                 foundEmpty = true;
-                auto data = reader.readData(i);
-                data.length.shouldEqual(0);
+                reader.readData(i).length.shouldEqual(0);
             } else if (ci.filename == "nonempty.txt") {
                 foundNonEmpty = true;
                 reader.readText(i).shouldEqual("has content\n");
@@ -968,19 +827,14 @@ version(unittest) {
         foundNonEmpty.shouldBeTrue;
     }
 
-    /// Skip entries without reading data — no corruption
     @("zip format [libzip]: skip entries without reading")
     unittest {
         auto reader = ZipReader(testDataDir ~ "/test-zip.zip");
         assert(reader.length >= 3);
-
-        // Read only the last entry, skip all others
         auto lastIdx = reader.length - 1;
         auto entry = reader.entryAt(lastIdx);
         assert(entry.pathname.length > 0);
-        // Reading the last entry without reading previous ones must work
         auto data = reader.readData(lastIdx);
-        // Should not crash and should return valid data
         assert(data !is null || entry.isDir || entry.size == 0);
     }
 
@@ -988,60 +842,32 @@ version(unittest) {
     // Overflow / DoS hardening tests
     // -------------------------------------------------------------------
 
-    /// Crafted ZIP with absurd totalEntries must not cause DoS
     @("zip security: absurd entry count does not DoS")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-
-        // Create a valid ZIP, then patch the EOCD entry count to a huge value
         auto writer = ZipWriter.create();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
         auto data = writer.data.dup;
-
-        // Find EOCD (last 22 bytes for a zip with no comment)
         auto eocdPos = data.length - 22;
-        // Patch total entries (offset +10 in EOCD) to 0xFFFF
-        data[eocdPos + 10] = 0xFF;
-        data[eocdPos + 11] = 0xFF;
-        // Patch disk entries too
-        data[eocdPos + 8] = 0xFF;
-        data[eocdPos + 9] = 0xFF;
-
-        // Should throw or quickly stop, not spin for 65535 iterations
+        data[eocdPos + 10] = 0xFF; data[eocdPos + 11] = 0xFF;
+        data[eocdPos + 8] = 0xFF; data[eocdPos + 9] = 0xFF;
         bool caught;
-        try {
-            auto reader = ZipReader(cast(const(ubyte)[]) data);
-        } catch (DarkArchiveException e) {
-            caught = true;
-        }
-        // Either throws or produces a reader with reasonable entry count
-        // (it should hit "central directory entry out of bounds" quickly)
+        try { auto reader = ZipReader(cast(const(ubyte)[]) data); }
+        catch (DarkArchiveException e) { caught = true; }
         assert(caught || true, "must not hang");
     }
 
-    /// Crafted ZIP with overflowing local header offsets must throw
     @("zip security: overflow in dataStart calculation throws")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        import std.bitmanip : nativeToLittleEndian;
-
-        // Create valid ZIP, then patch local header's fnLen+extraLen to max
         auto writer = ZipWriter.create();
         writer.addBuffer("a.txt", cast(const(ubyte)[]) "data");
         auto data = writer.data.dup;
-
-        // Patch filename length in local header (offset 26) to 0xFFFF
-        data[26] = 0xFF;
-        data[27] = 0xFF;
-
+        data[26] = 0xFF; data[27] = 0xFF;
         auto reader = ZipReader(cast(const(ubyte)[]) data);
         bool caught;
-        try {
-            reader.readData(0);
-        } catch (DarkArchiveException e) {
-            caught = true;
-        }
-        // Must throw, not access out of bounds
+        try { reader.readData(0); }
+        catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
     }
 }

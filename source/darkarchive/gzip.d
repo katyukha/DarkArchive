@@ -37,6 +37,15 @@ bool isGzip(const(ubyte)[] data) {
     return data.length >= 2 && data[0] == 0x1f && data[1] == 0x8b;
 }
 
+/// Check if a file starts with gzip magic bytes (reads only 2 bytes).
+bool isGzipFile(string path) {
+    import std.stdio : File;
+    auto f = File(path, "rb");
+    ubyte[2] magic;
+    auto got = f.rawRead(magic[]);
+    return got.length == 2 && magic[0] == 0x1f && magic[1] == 0x8b;
+}
+
 
 // ===========================================================================
 // Unit tests
@@ -161,7 +170,6 @@ version(unittest) {
     /// Truncated gzip (just header, no data) must throw
     @("gzip security: truncated gzip throws")
     unittest {
-        // Just the 10-byte gzip header, no compressed data or trailer
         ubyte[10] header = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xFF];
         bool caught;
         try {
@@ -170,5 +178,21 @@ version(unittest) {
             caught = true;
         }
         caught.shouldBeTrue;
+    }
+
+    /// Streaming gzip decompression via GzipSequentialReader + TarReader
+    @("gzip: streaming decompression via GzipSequentialReader")
+    unittest {
+        import darkarchive.datasource : GzipSequentialReader;
+
+        auto gzStream = new GzipSequentialReader(testDataDir ~ "/test.tar.gz");
+        auto reader = TarReader(gzStream);
+        string[] names;
+        foreach (entry; reader.entries) {
+            names ~= entry.pathname;
+            if (entry.pathname == "./file1.txt")
+                reader.readText().shouldEqual("Hello from file1\n");
+        }
+        assert(names.length > 0, "should find entries via streaming gzip");
     }
 }
