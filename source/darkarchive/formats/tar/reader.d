@@ -713,6 +713,22 @@ version(unittest) {
         }
     }
 
+    /// CVE-2022-36227 pattern: pax size with absurd value must not crash
+    @("CVE: pax size attribute with absurd value")
+    unittest {
+        import darkarchive.formats.tar.writer : TarWriter;
+
+        // Create a tar with a normal entry, then manually test pax parsing
+        // with a malformed size value
+        auto maliciousPax = cast(const(ubyte)[])
+            "30 size=99999999999999999999\n";  // exceeds long, to!size_t throws
+
+        // parsePaxData should handle this gracefully (not crash)
+        auto attrs = parsePaxData(maliciousPax);
+        // The key may or may not be in the result depending on parsing,
+        // but it must not crash
+    }
+
     /// Corrupted header mid-archive must throw, not silently truncate
     @("tar security: corrupted header mid-archive throws")
     unittest {
