@@ -27,8 +27,10 @@ struct TarWriter {
     /// Add a file from a memory buffer.
     ref TarWriter addBuffer(string archiveName, const(ubyte)[] fileData,
                              uint permissions = octal!644) return {
-        writePaxIfNeeded(archiveName, fileData.length);
-        writeHeader(archiveName, '0', fileData.length, permissions, null);
+        auto paxHandlesSize = writePaxIfNeeded(archiveName, fileData.length);
+        // If pax handles the size (>8GB), write 0 in the header's octal size field
+        writeHeader(archiveName, '0',
+            paxHandlesSize ? 0 : fileData.length, permissions, null);
         writeData(fileData);
         return this;
     }
@@ -80,23 +82,28 @@ struct TarWriter {
 
     // -- Private --
 
-    private void writePaxIfNeeded(string name, ulong size, string linkname = null) {
+    /// Returns true if pax handled the size field (caller should write 0 in header).
+    private bool writePaxIfNeeded(string name, ulong size, string linkname = null) {
         string[string] attrs;
+        bool handlesSize;
 
         // Need pax extended header if name > 100 chars or contains non-ASCII
         if (name.length > 100 || needsPaxEncoding(name))
             attrs["path"] = name;
         if (linkname !is null && (linkname.length > 100 || needsPaxEncoding(linkname)))
             attrs["linkpath"] = linkname;
-        if (size > 0x1FFFFFFFF) // > max octal in 12 bytes
+        if (size > 0x1FFFFFFFF) { // > max octal in 12 bytes
             attrs["size"] = formatDecimal(size);
+            handlesSize = true;
+        }
 
         if (attrs.length == 0)
-            return;
+            return false;
 
         auto paxData = encodePaxData(attrs);
         writeHeader("PaxHeader", 'x', paxData.length, octal!644, null);
         writeData(cast(const(ubyte)[]) paxData);
+        return handlesSize;
     }
 
     private void writeHeader(string name, char typeflag, ulong size,

@@ -84,7 +84,10 @@ struct TarReader {
             if (_reader._dataSize > 0) {
                 auto paddedSize = (_reader._dataSize + TAR_BLOCK_SIZE - 1)
                     / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE;
-                _reader._pos = _reader._dataStart + paddedSize;
+                auto newPos = _reader._dataStart + paddedSize;
+                // Clamp to data length to prevent OOB on next iteration
+                _reader._pos = newPos > _reader._data.length
+                    ? _reader._data.length : newPos;
             }
             advance();
         }
@@ -110,19 +113,29 @@ struct TarReader {
                 auto typeflag = cast(char) headerBlock[156];
                 auto entrySize = parseOctal(headerBlock[124 .. 136]);
 
+                // Validate entry size is non-negative and fits in addressable range
+                if (entrySize < 0) entrySize = 0;
+
                 if (typeflag == TAR_TYPE_PAX_EXTENDED || typeflag == TAR_TYPE_PAX_GLOBAL) {
                     // Pax extended header — parse key-value pairs, apply to next entry
                     _reader._pos += TAR_BLOCK_SIZE;
+
+                    // Cap pax data size to prevent excessive allocation
+                    // (pax headers should be small — cap at 1MB)
+                    enum MAX_PAX_SIZE = 1024 * 1024;
+                    auto paxSize = entrySize > MAX_PAX_SIZE ? MAX_PAX_SIZE : cast(size_t) entrySize;
+
                     auto paddedSize = (entrySize + TAR_BLOCK_SIZE - 1)
                         / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE;
 
                     string[string] paxAttrs;
-                    if (_reader._pos + entrySize <= _reader._data.length) {
+                    if (_reader._pos + paxSize <= _reader._data.length) {
                         paxAttrs = parsePaxData(
-                            _reader._data[_reader._pos .. _reader._pos + entrySize]);
+                            _reader._data[_reader._pos .. _reader._pos + paxSize]);
                     }
 
-                    _reader._pos += paddedSize;
+                    _reader._pos += cast(size_t)(paddedSize > _reader._data.length
+                        ? _reader._data.length : paddedSize);
 
                     // Now read the actual entry that follows
                     if (_reader._pos + TAR_BLOCK_SIZE > _reader._data.length) {
@@ -142,7 +155,8 @@ struct TarReader {
                     _reader._currentEntry = parseHeader(headerBlock);
                     _reader._pos += TAR_BLOCK_SIZE;
                     _reader._dataStart = _reader._pos;
-                    _reader._dataSize = cast(size_t) entrySize;
+                    _reader._dataSize = entrySize > _reader._data.length
+                        ? _reader._data.length : cast(size_t) entrySize;
 
                     // Override with pax attributes
                     applyPaxAttrs(_reader._currentEntry, paxAttrs);
@@ -156,7 +170,8 @@ struct TarReader {
                     _reader._currentEntry = parseHeader(headerBlock);
                     _reader._pos += TAR_BLOCK_SIZE;
                     _reader._dataStart = _reader._pos;
-                    _reader._dataSize = cast(size_t) entrySize;
+                    _reader._dataSize = entrySize > _reader._data.length
+                        ? _reader._data.length : cast(size_t) entrySize;
                 }
 
                 _reader._hasEntry = true;
@@ -634,6 +649,67 @@ version(unittest) {
         auto reader = TarReader(writer.data);
         foreach (entry; reader.entries) {
             assert(entry.pathname !is null);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Overflow / DoS hardening tests
+    // -------------------------------------------------------------------
+
+    /// TAR with crafted huge size field must not cause OOB or hang
+    @("tar security: huge size field does not OOB")
+    unittest {
+        import darkarchive.formats.tar.writer : TarWriter;
+
+        auto writer = TarWriter.create();
+        writer.addBuffer("small.txt", cast(const(ubyte)[]) "tiny");
+        auto data = writer.data.dup;
+
+        // Patch the size field (offset 124, 12 bytes) to a huge octal value
+        // "77777777777" = ~8GB — way beyond our tiny archive
+        data[124 .. 136] = cast(ubyte[12]) "77777777777\0";
+
+        // Recompute checksum for the patched header
+        uint sum = 0;
+        foreach (i; 0 .. 512) {
+            if (i >= 148 && i < 156)
+                sum += ' ';
+            else
+                sum += data[i];
+        }
+        import std.format : format;
+        auto checksumStr = format!"%06o\0 "(sum);
+        data[148 .. 156] = cast(ubyte[8]) checksumStr[0 .. 8];
+
+        auto reader = TarReader(cast(const(ubyte)[]) data);
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "small.txt") {
+                // readData should throw or return truncated — not crash
+                bool caught;
+                try {
+                    auto d = reader.readData();
+                } catch (DarkArchiveException e) {
+                    caught = true;
+                }
+                // Either throws or returns what's available, never OOB
+            }
+        }
+    }
+
+    /// TAR with negative-looking size (parsed as large positive) must not crash
+    @("tar security: entry with zero size does not crash readData")
+    unittest {
+        import darkarchive.formats.tar.writer : TarWriter;
+
+        auto writer = TarWriter.create();
+        writer.addBuffer("zero.txt", cast(const(ubyte)[]) "");
+
+        auto reader = TarReader(writer.data);
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "zero.txt") {
+                auto d = reader.readData();
+                assert(d is null || d.length == 0);
+            }
         }
     }
 

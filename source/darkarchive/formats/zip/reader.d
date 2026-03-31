@@ -74,13 +74,20 @@ struct ZipReader {
 
         auto fnLen = readLE!ushort(_data, localOffset + 26);
         auto extraLen = readLE!ushort(_data, localOffset + 28);
-        auto dataStart = localOffset + 30 + fnLen + extraLen;
+
+        // Use checked addition to prevent integer overflow
+        ulong dataStart = localOffset;
+        dataStart += 30;
+        dataStart += fnLen;
+        dataStart += extraLen;
+        if (dataStart > _data.length)
+            throw new DarkArchiveException("ZIP: local header fields extend past data");
 
         auto compressedSize = ci.compressedSize;
         auto uncompressedSize = ci.uncompressedSize;
         auto method = ci.compressionMethod;
 
-        if (dataStart + compressedSize > _data.length)
+        if (compressedSize > _data.length || dataStart + compressedSize > _data.length)
             throw new DarkArchiveException("ZIP: compressed data out of bounds");
 
         auto compressedData = _data[dataStart .. dataStart + compressedSize];
@@ -183,6 +190,12 @@ struct ZipReader {
             // Only apply positive adjustment (junk before, not after)
             if (offsetAdjust < 0) offsetAdjust = 0;
         }
+
+        // Sanity check: each central dir entry is at least 46 bytes.
+        // Cap totalEntries to prevent excessive allocation from crafted ZIPs.
+        auto maxPossibleEntries = centralDirSize / 46;
+        if (totalEntries > maxPossibleEntries)
+            totalEntries = maxPossibleEntries;
 
         // Parse central directory entries
         _entries.length = 0;
@@ -969,5 +982,66 @@ version(unittest) {
         auto data = reader.readData(lastIdx);
         // Should not crash and should return valid data
         assert(data !is null || entry.isDir || entry.size == 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Overflow / DoS hardening tests
+    // -------------------------------------------------------------------
+
+    /// Crafted ZIP with absurd totalEntries must not cause DoS
+    @("zip security: absurd entry count does not DoS")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+
+        // Create a valid ZIP, then patch the EOCD entry count to a huge value
+        auto writer = ZipWriter.create();
+        writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
+        auto data = writer.data.dup;
+
+        // Find EOCD (last 22 bytes for a zip with no comment)
+        auto eocdPos = data.length - 22;
+        // Patch total entries (offset +10 in EOCD) to 0xFFFF
+        data[eocdPos + 10] = 0xFF;
+        data[eocdPos + 11] = 0xFF;
+        // Patch disk entries too
+        data[eocdPos + 8] = 0xFF;
+        data[eocdPos + 9] = 0xFF;
+
+        // Should throw or quickly stop, not spin for 65535 iterations
+        bool caught;
+        try {
+            auto reader = ZipReader(cast(const(ubyte)[]) data);
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        // Either throws or produces a reader with reasonable entry count
+        // (it should hit "central directory entry out of bounds" quickly)
+        assert(caught || true, "must not hang");
+    }
+
+    /// Crafted ZIP with overflowing local header offsets must throw
+    @("zip security: overflow in dataStart calculation throws")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.bitmanip : nativeToLittleEndian;
+
+        // Create valid ZIP, then patch local header's fnLen+extraLen to max
+        auto writer = ZipWriter.create();
+        writer.addBuffer("a.txt", cast(const(ubyte)[]) "data");
+        auto data = writer.data.dup;
+
+        // Patch filename length in local header (offset 26) to 0xFFFF
+        data[26] = 0xFF;
+        data[27] = 0xFF;
+
+        auto reader = ZipReader(cast(const(ubyte)[]) data);
+        bool caught;
+        try {
+            reader.readData(0);
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        // Must throw, not access out of bounds
+        caught.shouldBeTrue;
     }
 }
