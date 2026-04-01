@@ -101,7 +101,8 @@ struct DarkArchiveReader {
 
     /// Open archive from file path (auto-detect format).
     /// For ZIP: uses file-backed I/O (does not load full file into memory).
-    /// For TAR/TAR.GZ: currently loads into memory (streaming TAR planned).
+    /// For TAR: file-backed via DataSource (sequential reads, no full load).
+    /// For TAR.GZ: streaming gzip decompression (no temp files, constant memory).
     this(in Path path) {
         this(path.toString());
     }
@@ -211,8 +212,12 @@ struct DarkArchiveReader {
     }
 
     /// Skip current entry's data.
+    /// Skip current entry's data. For TAR: advances the stream past the
+    /// entry data. For ZIP: no-op (random access). Also called implicitly
+    /// by EntryRange.popFront() if data was not consumed.
     void skipData() {
-        // No-op for memory-based readers
+        if (_tar !is null)
+            _tar.skipData();
     }
 
     /// Read data as chunks (allocating copies).
