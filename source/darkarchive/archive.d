@@ -212,6 +212,123 @@ struct DarkArchiveReader {
         return readData();
     }
 
+    // -- Entry data reader for processEntries delegate --
+
+    /// Provides data access for a matched entry inside processEntries.
+    static struct EntryDataReader {
+        private DarkArchiveReader* _parent;
+        private size_t _zipIdx;
+
+        /// Read full entry data into memory. For small entries.
+        /// For large entries, use `readChunks` instead.
+        ubyte[] readAll() {
+            if (_parent._zip !is null) {
+                return cast(ubyte[]) _parent._zip.readData(_zipIdx).dup;
+            } else {
+                auto d = _parent._tar.readData();
+                return d is null ? [] : cast(ubyte[]) d.dup;
+            }
+        }
+
+        /// Read entry data as text.
+        string readText() {
+            return cast(string) readAll();
+        }
+
+        /// Read entry data in chunks, calling `sink` for each chunk.
+        /// Each chunk is at most `chunkSize` bytes. Never loads the full
+        /// entry into memory — true streaming for 30GB+ entries.
+        void readChunks(scope void delegate(const(ubyte)[] chunk) sink,
+                         size_t chunkSize = 8192) {
+            if (_parent._zip !is null) {
+                // ZIP: streaming inflate — reads compressed data from
+                // DataSource in chunks, decompresses in chunks
+                _parent._zip.readDataChunked(_zipIdx, sink, chunkSize);
+            } else {
+                // TAR: streaming read from SequentialReader in chunks
+                _parent._tar.readDataChunked(sink, chunkSize);
+            }
+        }
+    }
+
+    // -- processEntries methods --
+
+    /// Process all entries in the archive, calling `processor` for each.
+    ///
+    /// Returns: number of entries processed (total entry count).
+    size_t processEntries(
+            scope void delegate(const ref DarkArchiveEntry entry,
+                                scope EntryDataReader dataReader) processor) {
+        size_t count;
+
+        if (_zip !is null) {
+            foreach (i; 0 .. _zip.length) {
+                auto entry = _zip.entryAt(i);
+                auto dr = EntryDataReader(&this, i);
+                processor(entry, dr);
+                count++;
+            }
+        } else {
+            foreach (entry; _tar.entries()) {
+                auto dr = EntryDataReader(&this, 0);
+                processor(entry, dr);
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// Process specific entries by name. Stops iteration early once all
+    /// requested names are found.
+    ///
+    /// Params:
+    ///   names = entry pathnames to search for
+    ///   processor = delegate called for each matched entry
+    ///
+    /// Returns: number of entries matched and processed.
+    ///   Compare with `names.length` to check if all were found.
+    size_t processEntries(
+            const(string)[] names,
+            scope void delegate(const ref DarkArchiveEntry entry,
+                                scope EntryDataReader dataReader) processor) {
+        if (names.length == 0) return 0;
+
+        // Build lookup set
+        bool[string] remaining;
+        foreach (name; names)
+            remaining[name] = true;
+
+        size_t count;
+
+        if (_zip !is null) {
+            foreach (i; 0 .. _zip.length) {
+                auto entry = _zip.entryAt(i);
+                if (entry.pathname in remaining) {
+                    auto dr = EntryDataReader(&this, i);
+                    processor(entry, dr);
+                    count++;
+                    remaining.remove(entry.pathname);
+                    if (remaining.length == 0)
+                        break; // all found — early exit
+                }
+            }
+        } else {
+            foreach (entry; _tar.entries()) {
+                if (entry.pathname in remaining) {
+                    auto dr = EntryDataReader(&this, 0);
+                    processor(entry, dr);
+                    count++;
+                    remaining.remove(entry.pathname);
+                    if (remaining.length == 0)
+                        break;
+                }
+            }
+        }
+
+        return count;
+    }
+
     /// Extract entire archive to directory.
     ///
     /// Security defaults:
@@ -303,9 +420,26 @@ struct DarkArchiveReader {
                     verifyPathWithinRoot(parent.toString(), destStr);
                 }
 
-                auto data = readAll();
-                write(fullPath.toString(), data);
+                // Write entry data to file in chunks — never loads full
+                // entry into memory, safe for multi-GB entries.
+                auto outPath = fullPath.toString();
+                writeEntryToFile(outPath);
             }
+        }
+    }
+
+    /// Write current entry's data to a file in chunks.
+    private void writeEntryToFile(string outPath) {
+        import std.stdio : File;
+        auto f = File(outPath, "wb");
+        if (_zip !is null) {
+            _zip.readDataChunked(_zipIndex, (const(ubyte)[] chunk) {
+                f.rawWrite(chunk);
+            });
+        } else {
+            _tar.readDataChunked((const(ubyte)[] chunk) {
+                f.rawWrite(chunk);
+            });
         }
     }
 
@@ -1490,5 +1624,269 @@ version(unittest) {
             assert(entry.pathname == "file.txt:hidden");
         }
         count.shouldEqual(1);
+    }
+
+    // -------------------------------------------------------------------
+    // processEntries tests
+    // -------------------------------------------------------------------
+
+    /// processEntries on ZIP — find specific entry and read content
+    @("processEntries: ZIP find and read specific entry")
+    unittest {
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer
+            .addBuffer("a.txt", cast(const(ubyte)[]) "content A")
+            .addBuffer("b.txt", cast(const(ubyte)[]) "content B")
+            .addBuffer("c.txt", cast(const(ubyte)[]) "content C");
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        string found;
+        auto count = reader.processEntries(["b.txt"],
+            (const ref entry, scope dataReader) {
+                found = dataReader.readText();
+            });
+
+        count.shouldEqual(1);
+        found.shouldEqual("content B");
+    }
+
+    /// processEntries on TAR — sequential find
+    @("processEntries: TAR find and read specific entry")
+    unittest {
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("first.txt", cast(const(ubyte)[]) "first");
+        tw.addBuffer("second.txt", cast(const(ubyte)[]) "second");
+        tw.addBuffer("third.txt", cast(const(ubyte)[]) "third");
+        auto tarData = tw.data;
+
+        auto reader = DarkArchiveReader(tarData);
+        string found;
+        auto count = reader.processEntries(["second.txt"],
+            (const ref entry, scope dataReader) {
+                found = dataReader.readText();
+            });
+
+        count.shouldEqual(1);
+        found.shouldEqual("second");
+    }
+
+    /// processEntries — returns 0 when no match, delegate never called
+    @("processEntries: returns 0 when no match")
+    unittest {
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("exists.txt", cast(const(ubyte)[]) "data");
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        bool delegateCalled;
+        auto count = reader.processEntries(["nonexistent.txt"],
+            (const ref entry, scope dataReader) {
+                delegateCalled = true;
+            });
+
+        count.shouldEqual(0);
+        delegateCalled.shouldBeFalse;
+    }
+
+    /// processEntries — multiple entries, all found
+    @("processEntries: multiple entries all found")
+    unittest {
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer
+            .addBuffer("x.txt", cast(const(ubyte)[]) "X")
+            .addBuffer("y.txt", cast(const(ubyte)[]) "Y")
+            .addBuffer("z.txt", cast(const(ubyte)[]) "Z");
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        string[] found;
+        auto count = reader.processEntries(["z.txt", "x.txt"],
+            (const ref entry, scope dataReader) {
+                found ~= dataReader.readText();
+            });
+
+        count.shouldEqual(2);
+        import std.algorithm : canFind;
+        assert(found.canFind("X"));
+        assert(found.canFind("Z"));
+    }
+
+    /// processEntries on TAR.GZ — works through gzip layer
+    @("processEntries: TAR.GZ through gzip layer")
+    unittest {
+        import std.file : remove, exists;
+        import darkarchive.formats.tar : TarWriter, gzipCompress;
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("gz-file.txt", cast(const(ubyte)[]) "gzipped content");
+        auto gzData = gzipCompress(tw.data);
+
+        auto reader = DarkArchiveReader(gzData);
+        string found;
+        auto count = reader.processEntries(["gz-file.txt"],
+            (const ref entry, scope dataReader) {
+                found = dataReader.readText();
+            });
+
+        count.shouldEqual(1);
+        found.shouldEqual("gzipped content");
+    }
+
+    /// processEntries all-entries overload — delegate called for every entry
+    @("processEntries: all-entries overload")
+    unittest {
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer
+            .addBuffer("one.txt", cast(const(ubyte)[]) "1")
+            .addBuffer("two.txt", cast(const(ubyte)[]) "2")
+            .addBuffer("three.txt", cast(const(ubyte)[]) "3");
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        int count;
+        reader.processEntries(
+            (const ref entry, scope dataReader) {
+                count++;
+            });
+
+        count.shouldEqual(3);
+    }
+
+    /// processEntries — delegate reads data via readAll
+    @("processEntries: delegate reads binary data via readAll")
+    unittest {
+        auto testData = new ubyte[](1024);
+        foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("binary.bin", testData);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        ubyte[] found;
+        reader.processEntries(["binary.bin"],
+            (const ref entry, scope dataReader) {
+                found = dataReader.readAll();
+            });
+
+        found.length.shouldEqual(1024);
+        found.shouldEqual(testData);
+    }
+
+    /// processEntries with real test-data archives
+    @("processEntries: real test-zip.zip")
+    unittest {
+        auto reader = DarkArchiveReader(Path(testDataDir, "test-zip.zip"));
+        string content;
+        auto count = reader.processEntries(["file1.txt"],
+            (const ref entry, scope dataReader) {
+                content = dataReader.readText();
+            });
+        count.shouldEqual(1);
+        content.shouldEqual("Hello from file1\n");
+    }
+
+    /// processEntries with real tar.gz
+    @("processEntries: real test.tar.gz")
+    unittest {
+        auto reader = DarkArchiveReader(Path(testDataDir, "test.tar.gz"));
+        string content;
+        auto count = reader.processEntries(["./file2.txt"],
+            (const ref entry, scope dataReader) {
+                content = dataReader.readText();
+            });
+        count.shouldEqual(1);
+        content.shouldEqual("Hello from file2\n");
+    }
+
+    /// processEntries — read data in chunks without loading full entry
+    @("processEntries: chunked read avoids full memory load")
+    unittest {
+        // Create entry with 32KB of data
+        auto testData = new ubyte[](32768);
+        foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("large.bin", testData);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        size_t totalBytes;
+        size_t chunkCount;
+        reader.processEntries(["large.bin"],
+            (const ref entry, scope dataReader) {
+                // Read in chunks — no single 32KB allocation
+                dataReader.readChunks((const(ubyte)[] chunk) {
+                    totalBytes += chunk.length;
+                    chunkCount++;
+                    assert(chunk.length > 0);
+                    assert(chunk.length <= 8192); // each chunk <= 8KB
+                });
+            });
+
+        totalBytes.shouldEqual(32768);
+        assert(chunkCount >= 4, "should have multiple chunks for 32KB data");
+    }
+
+    /// processEntries — chunked read on TAR works
+    @("processEntries: chunked read on TAR")
+    unittest {
+        import darkarchive.formats.tar : TarWriter;
+
+        auto testData = new ubyte[](16384);
+        foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("tardata.bin", testData);
+
+        auto reader = DarkArchiveReader(tw.data);
+        size_t totalBytes;
+        reader.processEntries(["tardata.bin"],
+            (const ref entry, scope dataReader) {
+                dataReader.readChunks((const(ubyte)[] chunk) {
+                    totalBytes += chunk.length;
+                });
+            });
+
+        totalBytes.shouldEqual(16384);
+    }
+
+    /// processEntries — extractTo uses chunked writes (not readAll)
+    @("processEntries: extractTo uses streaming write")
+    unittest {
+        import std.file : exists, rmdirRecurse, readText, getSize;
+
+        // Create archive with a 64KB entry
+        auto testData = new ubyte[](65536);
+        foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("big.bin", testData);
+
+        auto extractDir = Path(testDataDir, "streaming-extract-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        reader.extractTo(extractDir);
+
+        // Verify file was written correctly
+        auto extractedPath = (extractDir ~ "big.bin").toString;
+        assert(exists(extractedPath));
+        getSize(extractedPath).shouldEqual(65536);
+    }
+
+    /// processEntries — chunked read on empty entry produces no chunks
+    @("processEntries: chunked read on empty entry")
+    unittest {
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("empty.txt", cast(const(ubyte)[]) "");
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        int chunkCount;
+        reader.processEntries(["empty.txt"],
+            (const ref entry, scope dataReader) {
+                dataReader.readChunks((const(ubyte)[] chunk) {
+                    chunkCount++;
+                });
+            });
+
+        chunkCount.shouldEqual(0);
     }
 }

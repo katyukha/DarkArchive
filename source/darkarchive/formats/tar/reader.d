@@ -18,8 +18,10 @@ struct TarReader {
 
         // Current entry state
         DarkArchiveEntry _currentEntry;
-        ubyte[] _currentData;   // current entry's data (read from stream)
+        ubyte[] _currentData;    // current entry data (null if not yet read)
+        size_t _currentDataSize; // size of current entry data
         bool _hasEntry;
+        bool _dataConsumed;      // true if data was read or skipped
     }
 
     @disable this();
@@ -49,11 +51,49 @@ struct TarReader {
         return EntryRange(&this);
     }
 
-    /// Read the current entry's data.
+    /// Read the current entry's full data into memory.
+    /// For large entries, use readDataChunked instead.
     const(ubyte)[] readData() {
-        if (!_hasEntry)
+        if (!_hasEntry || _currentDataSize == 0)
             return null;
+        // If data was already consumed (chunked read or previous readData), return cached
+        if (_currentData !is null)
+            return _currentData;
+        if (_dataConsumed)
+            return null; // already skipped past this entry's data
+        // Read from stream
+        try {
+            _currentData = _stream.read(_currentDataSize);
+            _dataConsumed = true;
+        } catch (DarkArchiveException) {
+            _currentData = null;
+            _dataConsumed = true;
+        }
         return _currentData;
+    }
+
+    /// Read current entry data in chunks via sink delegate.
+    /// Never loads full entry into memory — safe for multi-GB entries.
+    void readDataChunked(scope void delegate(const(ubyte)[] chunk) sink,
+                          size_t chunkSize = 8192) {
+        if (!_hasEntry || _currentDataSize == 0)
+            return;
+        if (_dataConsumed)
+            return; // already read or skipped
+
+        // Read from stream in chunks
+        size_t remaining = _currentDataSize;
+        while (remaining > 0) {
+            auto toRead = remaining > chunkSize ? chunkSize : remaining;
+            try {
+                auto chunk = _stream.read(toRead);
+                sink(chunk);
+                remaining -= chunk.length;
+            } catch (DarkArchiveException) {
+                break;
+            }
+        }
+        _dataConsumed = true;
     }
 
     /// Read current entry data as text.
@@ -62,9 +102,13 @@ struct TarReader {
         return d is null ? "" : cast(string) d.idup;
     }
 
-    /// Skip current entry's data (advance to next header).
+    /// Skip current entry's data. In streaming mode, this advances
+    /// the stream position past the entry data.
     void skipData() {
-        // No-op — position is advanced in popFront
+        if (_hasEntry && !_dataConsumed && _currentDataSize > 0) {
+            _stream.skip(_currentDataSize);
+            _dataConsumed = true;
+        }
     }
 
     static struct EntryRange {
@@ -84,7 +128,12 @@ struct TarReader {
         }
 
         void popFront() {
-            // Skip remaining data + padding from current entry
+            // If data was not consumed by the user, skip it in the stream
+            if (!_reader._dataConsumed && _reader._currentDataSize > 0) {
+                _reader._stream.skip(_reader._currentDataSize);
+                _reader._dataConsumed = true;
+            }
+            // Skip padding
             if (_pendingSkip > 0) {
                 _reader._stream.skip(_pendingSkip);
                 _pendingSkip = 0;
@@ -175,20 +224,12 @@ struct TarReader {
                     _reader._currentEntry = parseHeader(headerBlock);
                 }
 
-                // Read entry data from stream
-                if (dataSize > 0) {
-                    try {
-                        _reader._currentData = _reader._stream.read(dataSize);
-                        // Set pending skip for padding bytes
-                        _pendingSkip = paddedSize - dataSize;
-                    } catch (DarkArchiveException) {
-                        _reader._currentData = null;
-                        _pendingSkip = 0;
-                    }
-                } else {
-                    _reader._currentData = null;
-                    _pendingSkip = 0;
-                }
+                // Record entry data size — actual reading happens lazily
+                // in readData() or readDataChunked()
+                _reader._currentDataSize = dataSize;
+                _reader._currentData = null;
+                _reader._dataConsumed = false;
+                _pendingSkip = paddedSize > dataSize ? paddedSize - dataSize : 0;
 
                 _reader._hasEntry = true;
                 return;

@@ -119,6 +119,61 @@ struct ZipReader {
         return result;
     }
 
+    /// Read entry data in chunks via a sink delegate. Never loads the full
+    /// entry into memory — safe for multi-GB entries. CRC32 verified
+    /// incrementally across all chunks.
+    void readDataChunked(size_t index,
+                          scope void delegate(const(ubyte)[] chunk) sink,
+                          size_t chunkSize = 8192) {
+        if (index >= _entries.length)
+            throw new DarkArchiveException("ZIP: entry index out of bounds");
+        auto ci = &_entries[index];
+        auto localOffset = ci.localHeaderOffset;
+
+        if (localOffset + 30 > _ds.length)
+            throw new DarkArchiveException("ZIP: local header out of bounds");
+        if (_ds.readLE!uint(localOffset) != ZIP_LOCAL_FILE_HEADER_SIG)
+            throw new DarkArchiveException("ZIP: invalid local file header signature");
+
+        auto fnLen = _ds.readLE!ushort(localOffset + 26);
+        auto extraLen = _ds.readLE!ushort(localOffset + 28);
+        ulong dataStart = localOffset + 30 + fnLen + extraLen;
+        if (dataStart > _ds.length)
+            throw new DarkArchiveException("ZIP: local header fields extend past data");
+
+        auto compressedSize = ci.compressedSize;
+        auto method = ci.compressionMethod;
+
+        if (compressedSize > _ds.length || dataStart + compressedSize > _ds.length)
+            throw new DarkArchiveException("ZIP: compressed data out of bounds");
+
+        if (method == ZIP_METHOD_STORE) {
+            // Store: read from DataSource in chunks (no decompression)
+            import std.digest.crc : CRC32;
+            CRC32 crc;
+
+            ulong remaining = compressedSize;
+            ulong pos = dataStart;
+            while (remaining > 0) {
+                auto toRead = remaining > chunkSize ? chunkSize : cast(size_t) remaining;
+                auto chunk = _ds.readSlice(pos, toRead);
+                crc.put(chunk);
+                sink(chunk);
+                pos += toRead;
+                remaining -= toRead;
+            }
+
+            verifyCRC(ci.crc32, crc);
+        } else if (method == ZIP_METHOD_DEFLATE) {
+            // Deflate: read compressed data in chunks, inflate, yield decompressed chunks
+            inflateChunked(_ds, dataStart, compressedSize, ci.crc32, sink, chunkSize);
+        } else {
+            import std.format : format;
+            throw new DarkArchiveException(
+                "ZIP: unsupported compression method %d".format(method));
+        }
+    }
+
     /// Read entry data as text.
     string readText(size_t index) {
         return cast(string) readData(index).dup;
@@ -389,6 +444,75 @@ private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
     }
 
     return result[];
+}
+
+/// Streaming inflate: read compressed data from DataSource in chunks,
+/// decompress in chunks, yield decompressed chunks to sink.
+/// Peak memory: inputChunk + outputChunk (~16KB), not entry size.
+private void inflateChunked(ref DataSource ds, ulong dataStart,
+                             ulong compressedSize, uint expectedCRC,
+                             scope void delegate(const(ubyte)[] chunk) sink,
+                             size_t chunkSize) {
+    import etc.c.zlib;
+    import std.digest.crc : CRC32;
+
+    z_stream zs;
+    auto ret = inflateInit2(&zs, -15);
+    if (ret != Z_OK)
+        throw new DarkArchiveException("ZIP: inflateInit2 failed");
+    scope(exit) inflateEnd(&zs);
+
+    CRC32 crc;
+    auto outBuf = new ubyte[](chunkSize);
+
+    ulong compRemaining = compressedSize;
+    ulong compPos = dataStart;
+    enum INPUT_CHUNK = 64 * 1024; // 64KB compressed read chunks
+
+    while (true) {
+        // Feed more compressed data if zlib needs it
+        if (zs.avail_in == 0 && compRemaining > 0) {
+            auto toRead = compRemaining > INPUT_CHUNK
+                ? INPUT_CHUNK : cast(size_t) compRemaining;
+            auto compChunk = ds.readSlice(compPos, toRead);
+            zs.next_in = cast(ubyte*) compChunk.ptr;
+            zs.avail_in = cast(uint) compChunk.length;
+            compPos += toRead;
+            compRemaining -= toRead;
+        }
+
+        zs.next_out = outBuf.ptr;
+        zs.avail_out = cast(uint) outBuf.length;
+
+        ret = etc.c.zlib.inflate(&zs, Z_NO_FLUSH);
+
+        auto produced = outBuf.length - zs.avail_out;
+        if (produced > 0) {
+            auto decompChunk = outBuf[0 .. produced];
+            crc.put(decompChunk);
+            sink(decompChunk);
+        }
+
+        if (ret == Z_STREAM_END)
+            break;
+        if (ret != Z_OK)
+            throw new DarkArchiveException("ZIP: inflate failed");
+    }
+
+    verifyCRC(expectedCRC, crc);
+}
+
+/// Verify CRC32 against expected value.
+private void verifyCRC(T)(uint expectedCRC, ref T crc) {
+    if (expectedCRC != 0) {
+        auto computed = crc.finish();
+        uint computedVal = (cast(uint) computed[0])
+                         | (cast(uint) computed[1] << 8)
+                         | (cast(uint) computed[2] << 16)
+                         | (cast(uint) computed[3] << 24);
+        if (computedVal != expectedCRC)
+            throw new DarkArchiveException("ZIP: CRC32 mismatch (data corrupted)");
+    }
 }
 
 /// Convert DOS date/time to SysTime.
