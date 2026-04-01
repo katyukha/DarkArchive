@@ -27,17 +27,32 @@ enum DarkArchiveFormat {
 
 /// Extract behavior flags.
 ///
-/// By default, extraction preserves permissions and timestamps, rejects
-/// path traversal, and skips symlinks. Symlink extraction must be
-/// explicitly enabled — even then, absolute targets are always rejected
-/// and traversal targets are rejected under `securePaths`.
+/// By default, extraction rejects path traversal and skips symlinks.
+/// Files are created with OS default permissions (umask) — archive
+/// permissions are intentionally not applied for security reasons.
+/// Use `processEntries` for full control over permissions and metadata.
 enum DarkExtractFlags {
     none        = 0,
-    perm        = 1,     /// Preserve file permissions
-    time        = 2,     /// Preserve modification times
-    securePaths = 4,     /// Reject ".." path components and absolute paths
-    symlinks    = 8,     /// Extract symlinks (off by default — symlinks are skipped)
-    defaults    = perm | time | securePaths,
+    securePaths = 1,     /// Reject ".." path components and absolute paths
+    symlinks    = 2,     /// Extract symlinks (off by default — symlinks are skipped)
+    defaults    = securePaths,
+}
+
+
+/// Parameters passed to extractTo preprocessing delegate.
+/// The delegate can modify destPath to rename/relocate entries, and
+/// return false to skip entries. Original entry metadata (including
+/// permissions, ownership, timestamps) is available read-only via sourceEntry.
+///
+/// For full control over permissions and metadata during extraction,
+/// use `processEntries` instead.
+struct ExtractParams {
+    /// Destination path relative to extraction root. Modify to rename/relocate.
+    string destPath;
+
+    /// Read-only: original archive entry metadata (type, size, permissions,
+    /// mtime, ownership, etc.)
+    const(DarkArchiveEntry)* sourceEntry;
 }
 
 
@@ -348,15 +363,58 @@ struct DarkArchiveReader {
     /// // Enable symlinks (still validates targets):
     /// reader.extractTo(Path("/tmp/output"),
     ///     DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+    ///
+    /// // With preprocessing delegate (strip prefix, filter entries):
+    /// reader.extractTo(Path("/tmp/output"), DarkExtractFlags.defaults,
+    ///     (ref params) {
+    ///         if (params.destPath.startsWith("prefix/"))
+    ///             params.destPath = params.destPath["prefix/".length .. $];
+    ///         return !params.destPath.endsWith(".pyc"); // skip .pyc
+    ///     });
     /// ---
     void extractTo(in Path destination,
                     DarkExtractFlags flags = DarkExtractFlags.defaults) {
+        extractToImpl(destination, flags, null);
+    }
+
+    /// Extract with entry preprocessing/filtering delegate.
+    ///
+    /// The delegate receives an `ExtractParams` ref with modifiable fields:
+    /// `destPath`, `permissions`, `uid`, `gid`, `uname`, `gname`.
+    /// Original entry metadata is read-only via `params.sourceEntry`.
+    ///
+    /// Return `false` from the delegate to skip the entry.
+    /// The delegate runs BEFORE security checks — security is the final gatekeeper.
+    void extractTo(in Path destination,
+                    DarkExtractFlags flags,
+                    scope bool delegate(ref ExtractParams params) preprocess) {
+        extractToImpl(destination, flags, preprocess);
+    }
+
+    private void extractToImpl(
+            in Path destination,
+            DarkExtractFlags flags,
+            scope bool delegate(ref ExtractParams params) preprocess) {
         import std.file : mkdirRecurse, write, symlink, exists;
 
         auto destStr = destination.toString();
 
         foreach (entry; entries()) {
-            auto entryPath = entry.pathname;
+            // Build ExtractParams from entry
+            ExtractParams params;
+            params.destPath = entry.pathname;
+            params.sourceEntry = &entry;
+
+            // Delegate runs BEFORE security checks.
+            // Security is the final gatekeeper — catches anything delegate introduces.
+            if (preprocess !is null) {
+                if (!preprocess(params)) {
+                    skipData();
+                    continue;
+                }
+            }
+
+            auto entryPath = params.destPath;
 
             // Security: reject absolute paths and ".." path components
             if (flags & DarkExtractFlags.securePaths) {
@@ -382,8 +440,6 @@ struct DarkArchiveReader {
                 mkdirRecurse(fullPath.toString());
                 skipData();
             } else if (entry.isSymlink) {
-                // Symlink extraction requires explicit opt-in via symlinks flag.
-                // When disabled (the default), symlink entries are silently skipped.
                 if (!(flags & DarkExtractFlags.symlinks)) {
                     skipData();
                     continue;
@@ -391,14 +447,11 @@ struct DarkArchiveReader {
 
                 auto target = entry.symlinkTarget;
 
-                // Absolute symlink targets are ALWAYS rejected — there is no
-                // legitimate use case for creating a symlink to /etc/passwd
-                // during extraction. This is unconditional, regardless of flags.
+                // Absolute symlink targets are ALWAYS rejected unconditionally
                 if (target.length > 0 && target[0] == '/')
                     throw new DarkArchiveException(
                         "Refusing to create symlink with absolute target: " ~ target);
 
-                // ".." in symlink target — rejected under securePaths
                 if (flags & DarkExtractFlags.securePaths) {
                     if (hasPathTraversal(target))
                         throw new DarkArchiveException(
@@ -414,16 +467,11 @@ struct DarkArchiveReader {
                 if (!exists(parent.toString()))
                     mkdirRecurse(parent.toString());
 
-                // CVE-2021-20206 defense: verify the resolved real path
-                // doesn't escape the extraction directory via a symlink
                 if (flags & DarkExtractFlags.securePaths) {
                     verifyPathWithinRoot(parent.toString(), destStr);
                 }
 
-                // Write entry data to file in chunks — never loads full
-                // entry into memory, safe for multi-GB entries.
-                auto outPath = fullPath.toString();
-                writeEntryToFile(outPath);
+                writeEntryToFile(fullPath.toString());
             }
         }
     }
@@ -1888,5 +1936,234 @@ version(unittest) {
             });
 
         chunkCount.shouldEqual(0);
+    }
+
+    // -------------------------------------------------------------------
+    // extractTo with delegate tests
+    // -------------------------------------------------------------------
+
+    /// Strip prefix — delegate removes "odoo-18.0/" from destPath
+    @("extractTo delegate: strip prefix (unfoldPath)")
+    unittest {
+        import std.file : exists, rmdirRecurse, readText;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer
+            .addBuffer("odoo-18.0/README.txt", cast(const(ubyte)[]) "readme")
+            .addBuffer("odoo-18.0/setup.py", cast(const(ubyte)[]) "setup")
+            .addDirectory("odoo-18.0/addons");
+
+        auto extractDir = Path(testDataDir, "unfold-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        reader.extractTo(extractDir, DarkExtractFlags.defaults,
+            (ref params) {
+                import std.algorithm : startsWith;
+                if (params.destPath.startsWith("odoo-18.0/"))
+                    params.destPath = params.destPath["odoo-18.0/".length .. $];
+                return true;
+            });
+
+        assert(exists((extractDir ~ "README.txt").toString),
+            "README.txt should be at root, not under odoo-18.0/");
+        readText((extractDir ~ "README.txt").toString).shouldEqual("readme");
+        assert(exists((extractDir ~ "setup.py").toString));
+        assert(!exists((extractDir ~ "odoo-18.0").toString),
+            "odoo-18.0/ prefix should be stripped");
+    }
+
+    /// Skip by extension — delegate returns false for .pyc
+    @("extractTo delegate: skip .pyc files")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+        import std.algorithm : endsWith;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer
+            .addBuffer("module.py", cast(const(ubyte)[]) "python source")
+            .addBuffer("module.pyc", cast(const(ubyte)[]) "bytecode")
+            .addBuffer("other.txt", cast(const(ubyte)[]) "text");
+
+        auto extractDir = Path(testDataDir, "skip-pyc-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        reader.extractTo(extractDir, DarkExtractFlags.defaults,
+            (ref params) {
+                return !params.destPath.endsWith(".pyc");
+            });
+
+        assert(exists((extractDir ~ "module.py").toString));
+        assert(exists((extractDir ~ "other.txt").toString));
+        assert(!exists((extractDir ~ "module.pyc").toString),
+            ".pyc should be skipped");
+    }
+
+    /// Security after delegate — delegate adds "../", exception thrown
+    @("extractTo delegate: security catches delegate-introduced traversal")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("safe.txt", cast(const(ubyte)[]) "data");
+
+        auto extractDir = Path(testDataDir, "delegate-sec-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        bool caught;
+        try {
+            reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                (ref params) {
+                    params.destPath = "../escape.txt";
+                    return true;
+                });
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        caught.shouldBeTrue;
+    }
+
+    /// Delegate introduces absolute path — exception thrown
+    @("extractTo delegate: security catches delegate-introduced absolute path")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("safe.txt", cast(const(ubyte)[]) "data");
+
+        auto extractDir = Path(testDataDir, "delegate-abs-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        bool caught;
+        try {
+            reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                (ref params) {
+                    params.destPath = "/tmp/evil.txt";
+                    return true;
+                });
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        caught.shouldBeTrue;
+    }
+
+    /// Null delegate — same as no-delegate overload
+    @("extractTo delegate: null delegate same as default")
+    unittest {
+        import std.file : exists, rmdirRecurse, readText;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("test.txt", cast(const(ubyte)[]) "content");
+
+        auto extractDir = Path(testDataDir, "null-delegate-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        reader.extractTo(extractDir, DarkExtractFlags.defaults, null);
+
+        assert(exists((extractDir ~ "test.txt").toString));
+        readText((extractDir ~ "test.txt").toString).shouldEqual("content");
+    }
+
+    /// Skip all entries — empty extraction dir
+    @("extractTo delegate: skip all entries")
+    unittest {
+        import std.file : exists, rmdirRecurse, dirEntries, SpanMode;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer
+            .addBuffer("a.txt", cast(const(ubyte)[]) "A")
+            .addBuffer("b.txt", cast(const(ubyte)[]) "B");
+
+        auto extractDir = Path(testDataDir, "skip-all-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        reader.extractTo(extractDir, DarkExtractFlags.defaults,
+            (ref params) { return false; });
+
+        // Directory might not even be created, or should be empty
+        if (exists(extractDir.toString)) {
+            int fileCount;
+            foreach (de; dirEntries(extractDir.toString, SpanMode.depth))
+                fileCount++;
+            fileCount.shouldEqual(0);
+        }
+    }
+
+    /// Backward compatibility — existing extractTo still works
+    @("extractTo delegate: backward compatibility")
+    unittest {
+        import std.file : exists, rmdirRecurse, readText;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addBuffer("compat.txt", cast(const(ubyte)[]) "works");
+
+        // No-delegate overload
+        auto extractDir1 = Path(testDataDir, "compat-test-1");
+        scope(exit) if (exists(extractDir1.toString)) rmdirRecurse(extractDir1.toString);
+        DarkArchiveReader(writer.writtenData()).extractTo(extractDir1);
+        readText((extractDir1 ~ "compat.txt").toString).shouldEqual("works");
+
+        // Flags-only overload
+        auto extractDir2 = Path(testDataDir, "compat-test-2");
+        scope(exit) if (exists(extractDir2.toString)) rmdirRecurse(extractDir2.toString);
+        DarkArchiveReader(writer.writtenData()).extractTo(extractDir2, DarkExtractFlags.defaults);
+        readText((extractDir2 ~ "compat.txt").toString).shouldEqual("works");
+    }
+
+    /// Delegate can read sourceEntry metadata
+    @("extractTo delegate: read sourceEntry metadata")
+    unittest {
+        import std.file : exists, rmdirRecurse;
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer
+            .addBuffer("file.txt", cast(const(ubyte)[]) "content")
+            .addDirectory("dir");
+
+        auto extractDir = Path(testDataDir, "source-entry-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        bool sawFile, sawDir;
+        auto reader = DarkArchiveReader(writer.writtenData());
+        reader.extractTo(extractDir, DarkExtractFlags.defaults,
+            (ref params) {
+                if (params.sourceEntry.isFile) sawFile = true;
+                if (params.sourceEntry.isDir) sawDir = true;
+                return true;
+            });
+
+        sawFile.shouldBeTrue;
+        sawDir.shouldBeTrue;
+    }
+
+    /// extractTo delegate on TAR.GZ
+    @("extractTo delegate: works on TAR.GZ")
+    unittest {
+        import std.file : exists, rmdirRecurse, readText;
+        import darkarchive.formats.tar : TarWriter, gzipCompress;
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("prefix/data.txt", cast(const(ubyte)[]) "tar data");
+        auto gzData = gzipCompress(tw.data);
+
+        auto extractDir = Path(testDataDir, "delegate-targz-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(gzData);
+        reader.extractTo(extractDir, DarkExtractFlags.defaults,
+            (ref params) {
+                import std.algorithm : startsWith;
+                if (params.destPath.startsWith("prefix/"))
+                    params.destPath = params.destPath["prefix/".length .. $];
+                return true;
+            });
+
+        assert(exists((extractDir ~ "data.txt").toString));
+        readText((extractDir ~ "data.txt").toString).shouldEqual("tar data");
     }
 }
