@@ -33,6 +33,15 @@ struct DataSource {
         return ds;
     }
 
+    /// Close the underlying file handle (if file-backed). Safe to call
+    /// multiple times or on memory-backed sources (no-op).
+    void close() {
+        if (_file !is null) {
+            _file.close();
+            _file = null;
+        }
+    }
+
     /// Total size of the data source.
     ulong length() const {
         if (_file !is null)
@@ -119,7 +128,6 @@ struct DataSource {
 /// Unlike DataSource, this is a class for polymorphic dispatch.
 class SequentialReader {
     /// Read exactly `len` bytes at the current position. Advances position.
-    /// Returns the bytes, or throws if not enough data.
     ubyte[] read(size_t len) {
         assert(false, "not implemented");
     }
@@ -134,6 +142,9 @@ class SequentialReader {
         assert(false, "not implemented");
         return true;
     }
+
+    /// Close underlying resources.
+    void close() {}
 }
 
 /// SequentialReader backed by a DataSource (memory or file).
@@ -162,6 +173,11 @@ class DataSourceSequentialReader : SequentialReader {
 
     override bool empty() {
         return _pos >= _ds.length;
+    }
+
+    override void close() {
+        if (_ds !is null)
+            _ds.close();
     }
 }
 
@@ -223,6 +239,10 @@ class GzipSequentialReader : SequentialReader {
         if (_decompPos < _decompBuf.length) return false;
         if (_inflateEOF) return true;
         return !decompressMore();
+    }
+
+    override void close() {
+        _file.close();
     }
 
     private void ensureAvailable(size_t needed) {

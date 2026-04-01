@@ -46,6 +46,12 @@ struct TarReader {
         _stream = stream;
     }
 
+    /// Close the underlying data source.
+    void close() {
+        if (_stream !is null)
+            _stream.close();
+    }
+
     /// Iterate over entries.
     auto entries() {
         return EntryRange(&this);

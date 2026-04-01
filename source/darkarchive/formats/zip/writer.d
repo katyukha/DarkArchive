@@ -496,7 +496,6 @@ version(unittest) {
         import std.file : write, remove, exists;
 
         auto outPath = "test-data/test-writer-roundtrip.zip";
-        scope(exit) if (exists(outPath)) remove(outPath);
 
         auto writer = ZipWriter.create();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "file content");
@@ -504,6 +503,11 @@ version(unittest) {
         write(outPath, writer.data);
 
         auto reader = ZipReader(outPath);
+        scope(exit) {
+            reader.close();
+            if (exists(outPath)) remove(outPath);
+        }
+
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("file content");
     }

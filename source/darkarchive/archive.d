@@ -188,6 +188,13 @@ struct DarkArchiveReader {
         return _format;
     }
 
+    /// Close the underlying file handles. Call before deleting the archive
+    /// file on Windows (where open files cannot be deleted).
+    void close() {
+        if (_zip !is null) _zip.close();
+        if (_tar !is null) _tar.close();
+    }
+
     /// Iterate over entries.
     auto entries() {
         if (_zip !is null)
@@ -886,7 +893,6 @@ version(unittest) {
         import std.file : remove, exists;
 
         auto outPath = Path(testDataDir, "test-hl-write.zip");
-        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
 
         {
             auto writer = DarkArchiveWriter(outPath);
@@ -896,6 +902,11 @@ version(unittest) {
         }
 
         auto reader = DarkArchiveReader(outPath);
+        scope(exit) {
+            reader.close();
+            if (exists(outPath.toString)) remove(outPath.toString);
+        }
+
         bool foundHello;
         foreach (entry; reader.entries) {
             if (entry.pathname == "hello.txt") {
@@ -914,7 +925,6 @@ version(unittest) {
         import std.file : remove, exists;
 
         auto outPath = Path(testDataDir, "test-hl-write.tar.gz");
-        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
 
         {
             auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tarGz);
@@ -924,6 +934,11 @@ version(unittest) {
         }
 
         auto reader = DarkArchiveReader(outPath);
+        scope(exit) {
+            reader.close();
+            if (exists(outPath.toString)) remove(outPath.toString);
+        }
+
         int count;
         foreach (entry; reader.entries) {
             count++;

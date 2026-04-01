@@ -41,6 +41,11 @@ struct ZipReader {
         return _entries.length;
     }
 
+    /// Close the underlying file handle.
+    void close() {
+        _ds.close();
+    }
+
     /// Iterate over entries.
     auto entries() {
         static struct EntryRange {
