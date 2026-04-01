@@ -678,10 +678,9 @@ version(unittest) {
         }
         auto reader = TarReader(cast(const(ubyte)[]) data);
         int count;
-        bool threw;
-        try {
-            foreach (entry; reader.entries) count++;
-        } catch (DarkArchiveException e) { threw = true; }
-        assert(threw || count >= 1);
+        foreach (entry; reader.entries) count++;
+        // First entry is intact, second has corrupted checksum → iteration
+        // stops at the corrupted header. First entry must be preserved.
+        count.shouldEqual(1);
     }
 }

@@ -2300,4 +2300,53 @@ version(unittest) {
         }
         assert(fileCount >= 2, "should have at least 2 files");
     }
+
+    /// addTree with dangling symlink — must throw (broken source data)
+    @("addTree: dangling symlink throws")
+    unittest {
+        version(Posix) {
+            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
+                symlink, getcwd;
+
+            auto srcDir = Path(getcwd(), testDataDir, "dangling-sym-src");
+            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
+            mkdirRecurse(srcDir.toString);
+            write((srcDir ~ "real.txt").toString, "real content");
+            symlink("nonexistent-target.txt", (srcDir ~ "dangling.txt").toString);
+
+            auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+            bool threw;
+            try {
+                writer.addTree(srcDir);
+            } catch (Exception e) {
+                threw = true;
+            }
+            threw.shouldBeTrue;
+        }
+    }
+
+    /// addTree with circular symlinks — must throw, not hang
+    @("addTree: circular symlinks throw, not hang")
+    unittest {
+        version(Posix) {
+            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
+                symlink, getcwd;
+
+            auto srcDir = Path(getcwd(), testDataDir, "circular-sym-src");
+            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
+            mkdirRecurse(srcDir.toString);
+            write((srcDir ~ "real.txt").toString, "real content");
+            symlink("circular-b.txt", (srcDir ~ "circular-a.txt").toString);
+            symlink("circular-a.txt", (srcDir ~ "circular-b.txt").toString);
+
+            auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+            bool threw;
+            try {
+                writer.addTree(srcDir);
+            } catch (Exception e) {
+                threw = true;
+            }
+            threw.shouldBeTrue;
+        }
+    }
 }

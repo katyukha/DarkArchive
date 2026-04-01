@@ -966,19 +966,20 @@ version(unittest) {
     // Overflow / DoS hardening tests
     // -------------------------------------------------------------------
 
-    @("zip security: absurd entry count does not DoS")
+    @("zip security: absurd entry count capped by central dir size")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto writer = ZipWriter.create();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
         auto data = writer.data.dup;
+        // Patch EOCD entry count to 0xFFFF (absurd)
         auto eocdPos = data.length - 22;
         data[eocdPos + 10] = 0xFF; data[eocdPos + 11] = 0xFF;
         data[eocdPos + 8] = 0xFF; data[eocdPos + 9] = 0xFF;
-        bool caught;
-        try { auto reader = ZipReader(cast(const(ubyte)[]) data); }
-        catch (DarkArchiveException e) { caught = true; }
-        assert(caught || true, "must not hang");
+        // Reader should cap totalEntries to centralDirSize/46 (~1 entry)
+        auto reader = ZipReader(cast(const(ubyte)[]) data);
+        reader.length.shouldEqual(1);
+        reader.readText(0).shouldEqual("x");
     }
 
     @("zip security: overflow in dataStart calculation throws")
