@@ -1,5 +1,5 @@
 name "darkarchive"
-description "Pure D library for reading and writing archive formats (zip, tar, tar.gz)"
+description "Archive read/write library born in the darkest and deepst place of nothing."
 authors "Dmytro Katyukha"
 copyright "Copyright © 2026, Dmytro Katyukha"
 license "MPL-2.0"

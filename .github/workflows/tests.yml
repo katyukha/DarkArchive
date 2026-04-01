@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+    branches: ['*']
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04]
+        compiler: [dmd-latest, dmd-2.111.0, ldc-latest, ldc-1.40.0]
+        include:
+          # macOS — LDC only (DMD has issues on macOS)
+          - { os: macOS-latest, compiler: ldc-latest }
+          - { os: macOS-14, compiler: ldc-latest }
+          - { os: macOS-15, compiler: ldc-latest }
+          - { os: macOS-latest, compiler: ldc-1.41.0 }
+          # Windows — secondary target
+          - { os: windows-latest, compiler: dmd-latest }
+          - { os: windows-latest, compiler: ldc-latest }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ${{ matrix.compiler }}
+
+      - name: Build library
+        run: dub build
+
+      - name: Run tests
+        run: dub test -c unittest
