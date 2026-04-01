@@ -548,7 +548,8 @@ except Exception as e:
     print(f"FAIL: {e}")
     sys.exit(1)
 `]);
-        result.output.shouldEqual("OK\n");
+        import std.string : strip;
+        result.output.strip.shouldEqual("OK");
     }
 
     /// Filename > 65535 bytes must throw, not silently truncate

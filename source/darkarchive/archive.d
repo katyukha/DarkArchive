@@ -972,6 +972,7 @@ version(unittest) {
         // Read zip
         {
             auto r = DarkArchiveReader(zipPath);
+            scope(exit) r.close();
             foreach (e; r.entries) {
                 if (e.pathname == "cross.txt")
                     r.readText().shouldEqual("Cross-format test");
@@ -983,6 +984,7 @@ version(unittest) {
         // Read tar.gz
         {
             auto r = DarkArchiveReader(tarPath);
+            scope(exit) r.close();
             foreach (e; r.entries) {
                 if (e.pathname == "cross.txt")
                     r.readText().shouldEqual("Cross-format test");
