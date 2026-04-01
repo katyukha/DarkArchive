@@ -395,7 +395,7 @@ struct DarkArchiveReader {
             in Path destination,
             DarkExtractFlags flags,
             scope bool delegate(ref ExtractParams params) preprocess) {
-        import std.file : mkdirRecurse, write, symlink, exists;
+        import std.file : mkdirRecurse, write, exists;
 
         auto destStr = destination.toString();
 
@@ -460,7 +460,14 @@ struct DarkArchiveReader {
                 auto parent = fullPath.parent;
                 if (!exists(parent.toString()))
                     mkdirRecurse(parent.toString());
-                symlink(entry.symlinkTarget, fullPath.toString());
+                version(Posix) {
+                    import std.file : symlink;
+                    symlink(entry.symlinkTarget, fullPath.toString());
+                } else {
+                    throw new DarkArchiveException(
+                        "Symlink extraction is not supported on this platform: "
+                        ~ entryPath);
+                }
                 skipData();
             } else {
                 auto parent = fullPath.parent;
@@ -495,9 +502,7 @@ struct DarkArchiveReader {
     /// Defends against two-step symlink+file attacks (CVE-2021-20206 pattern).
     private static void verifyPathWithinRoot(string path, string root) {
         import std.path : absolutePath, buildNormalizedPath;
-        import std.file : isSymlink, readLink, exists;
 
-        // Resolve the actual filesystem path (following symlinks)
         auto resolved = resolveRealPath(path);
         auto normalRoot = buildNormalizedPath(absolutePath(root));
 
@@ -509,35 +514,42 @@ struct DarkArchiveReader {
     /// Poor man's realpath: resolve symlinks in path components.
     private static string resolveRealPath(string path) {
         import std.path : absolutePath, buildNormalizedPath, dirName, baseName;
-        import std.file : isSymlink, readLink, exists;
+        import std.file : exists;
 
         auto normalized = buildNormalizedPath(absolutePath(path));
 
-        // Walk each component and resolve symlinks
-        string[] parts;
-        auto remaining = normalized;
-        while (remaining.length > 0 && remaining != "/" && remaining != ".") {
-            auto base = baseName(remaining);
-            auto parent = dirName(remaining);
-            if (parent == remaining) break; // root
-            parts = base ~ parts;
-            remaining = parent;
-        }
-        parts = remaining ~ parts;
+        version(Posix) {
+            import std.file : isSymlink, readLink;
 
-        string resolved = parts[0]; // root
-        foreach (part; parts[1 .. $]) {
-            resolved = buildNormalizedPath(resolved, part);
-            if (exists(resolved) && isSymlink(resolved)) {
-                auto target = readLink(resolved);
-                if (target.length > 0 && target[0] == '/')
-                    resolved = target; // absolute symlink
-                else
-                    resolved = buildNormalizedPath(dirName(resolved), target);
+            // Walk each component and resolve symlinks
+            string[] parts;
+            auto remaining = normalized;
+            while (remaining.length > 0 && remaining != "/" && remaining != ".") {
+                auto base = baseName(remaining);
+                auto parent = dirName(remaining);
+                if (parent == remaining) break; // root
+                parts = base ~ parts;
+                remaining = parent;
             }
-        }
+            parts = remaining ~ parts;
 
-        return buildNormalizedPath(resolved);
+            string resolved = parts[0]; // root
+            foreach (part; parts[1 .. $]) {
+                resolved = buildNormalizedPath(resolved, part);
+                if (exists(resolved) && isSymlink(resolved)) {
+                    auto target = readLink(resolved);
+                    if (target.length > 0 && target[0] == '/')
+                        resolved = target; // absolute symlink
+                    else
+                        resolved = buildNormalizedPath(dirName(resolved), target);
+                }
+            }
+
+            return buildNormalizedPath(resolved);
+        } else {
+            // On Windows, no symlink resolution — just normalize
+            return normalized;
+        }
     }
 
     private static bool pathStartsWith(string s, string prefix) {
@@ -692,7 +704,7 @@ struct DarkArchiveWriter {
 
     /// ditto
     ref DarkArchiveWriter addTree(string rootPath, string prefix = null) return {
-        import std.file : dirEntries, SpanMode, isDir, isFile, isSymlink, readLink;
+        import std.file : dirEntries, SpanMode, isDir, isFile;
 
         auto root = Path(rootPath);
         if (prefix is null)
@@ -702,10 +714,18 @@ struct DarkArchiveWriter {
             auto relPath = Path(de.name).relativeTo(root);
             auto archName = prefix ~ "/" ~ relPath;
 
-            if (de.isSymlink) {
-                auto target = readLink(de.name);
-                addSymlink(archName, target);
-            } else if (de.isDir) {
+            version(Posix) {
+                import std.file : isSymlink, readLink;
+                if (de.isSymlink) {
+                    auto target = readLink(de.name);
+                    addSymlink(archName, target);
+                    continue;
+                }
+            }
+            // Note: on Windows, symlinks in the source tree are skipped
+            // (treated as regular files or directories) since readLink
+            // is not available. Use addSymlink() explicitly if needed.
+            if (de.isDir) {
                 addDirectory(archName);
             } else if (de.isFile) {
                 add(de.name, archName);
