@@ -573,9 +573,9 @@ struct DarkArchiveReader {
     private static bool pathStartsWith(string s, string prefix) {
         if (s.length < prefix.length) return false;
         if (s[0 .. prefix.length] != prefix) return false;
-        // Ensure it's a proper prefix (ends at / boundary or exact match)
+        // Ensure it's a proper prefix (ends at path separator boundary or exact match)
         if (s.length == prefix.length) return true;
-        return s[prefix.length] == '/';
+        return s[prefix.length] == '/' || s[prefix.length] == '\\';
     }
 
     // -- Private: unified entry iterator --
