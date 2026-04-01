@@ -177,6 +177,7 @@ class GzipSequentialReader : SequentialReader {
         File _file;
         UnCompress _inflater;
         ubyte[] _decompBuf;  // buffered decompressed data
+        ubyte[] _readBuf;    // reusable compressed read buffer (heap)
         size_t _decompPos;   // read position within _decompBuf
         bool _fileEOF;
         bool _inflateEOF;
@@ -234,7 +235,11 @@ class GzipSequentialReader : SequentialReader {
     private bool decompressMore() {
         if (_inflateEOF) return false;
 
-        ubyte[CHUNK_SIZE] readBuf;
+        // Heap-allocated read buffer (stack would overflow on Windows
+        // where default stack size is 1MB)
+        if (_readBuf is null)
+            _readBuf = new ubyte[](CHUNK_SIZE);
+        auto readBuf = _readBuf;
         while (true) {
             if (_fileEOF) {
                 auto tail = cast(ubyte[]) _inflater.flush();
