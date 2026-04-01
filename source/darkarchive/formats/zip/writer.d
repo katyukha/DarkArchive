@@ -6,7 +6,6 @@ module darkarchive.formats.zip.writer;
 
 import std.bitmanip : nativeToLittleEndian;
 import std.conv : octal;
-import std.string : toStringz;
 
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;

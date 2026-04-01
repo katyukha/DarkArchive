@@ -112,42 +112,6 @@ struct DataSource {
         return -1;
     }
 
-    /// Provide a chunk range for reading data sequentially from an offset.
-    /// Each chunk is `chunkSize` bytes (last chunk may be smaller).
-    auto chunkedRead(ulong offset, ulong totalLen, size_t chunkSize = 4 * 1024 * 1024) {
-        return ChunkedRange(&this, offset, totalLen, chunkSize);
-    }
-
-    private static struct ChunkedRange {
-        DataSource* _src;
-        ulong _offset;
-        ulong _remaining;
-        size_t _chunkSize;
-        const(ubyte)[] _current;
-
-        this(DataSource* src, ulong offset, ulong totalLen, size_t chunkSize) {
-            _src = src;
-            _offset = offset;
-            _remaining = totalLen;
-            _chunkSize = chunkSize;
-            if (_remaining > 0)
-                popFront();
-        }
-
-        bool empty() { return _remaining == 0 && _current.length == 0; }
-        const(ubyte)[] front() { return _current; }
-
-        void popFront() {
-            if (_remaining == 0) {
-                _current = null;
-                return;
-            }
-            auto toRead = _remaining > _chunkSize ? _chunkSize : cast(size_t) _remaining;
-            _current = _src.readSlice(_offset, toRead);
-            _offset += toRead;
-            _remaining -= toRead;
-        }
-    }
 }
 
 /// Sequential byte stream — used by TarReader for both plain TAR (backed by
@@ -361,21 +325,6 @@ version(unittest) {
         auto pos = ds.findBackward(ZIP_END_OF_CENTRAL_DIR_SIG,
             ds.length - 4, 22 + 65535);
         assert(pos >= 0, "should find EOCD signature in file");
-    }
-
-    @("datasource: chunkedRead")
-    unittest {
-        auto data = new ubyte[](10000);
-        foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
-        auto ds = DataSource.fromMemory(data);
-
-        size_t totalRead;
-        foreach (chunk; ds.chunkedRead(0, 10000, 4096)) {
-            assert(chunk.length > 0);
-            assert(chunk.length <= 4096);
-            totalRead += chunk.length;
-        }
-        totalRead.shouldEqual(10000);
     }
 
     @("datasource: out-of-bounds read throws")
