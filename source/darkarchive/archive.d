@@ -1153,7 +1153,7 @@ version(unittest) {
     }
 
     /// Symlink with absolute target: rejected when symlinks flag IS set
-    @("security: extractTo rejects absolute symlink when symlinks enabled")
+    version(Posix) @("security: extractTo rejects absolute symlink when symlinks enabled")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -1196,7 +1196,7 @@ version(unittest) {
     }
 
     /// Symlink with traversal target: rejected when symlinks flag IS set
-    @("security: extractTo rejects traversal symlink when symlinks enabled")
+    version(Posix) @("security: extractTo rejects traversal symlink when symlinks enabled")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -1269,7 +1269,7 @@ version(unittest) {
     }
 
     /// CVE-2021-20206: With symlinks enabled, absolute target is still rejected
-    @("CVE: two-step symlink+file — absolute target rejected with symlinks enabled")
+    version(Posix) @("CVE: two-step symlink+file — absolute target rejected with symlinks enabled")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -1315,7 +1315,7 @@ version(unittest) {
     }
 
     /// CVE-2021-20206 relative: with symlinks enabled, traversal target rejected
-    @("CVE: two-step relative symlink — rejected with symlinks enabled")
+    version(Posix) @("CVE: two-step relative symlink — rejected with symlinks enabled")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -1406,7 +1406,7 @@ version(unittest) {
     }
 
     /// With symlinks flag but no securePaths, absolute symlink is still rejected
-    @("security: absolute symlink rejected unconditionally with symlinks flag")
+    version(Posix) @("security: absolute symlink rejected unconditionally with symlinks flag")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
@@ -1459,7 +1459,7 @@ version(unittest) {
     }
 
     /// With symlinks flag, safe relative symlinks are created
-    @("security: symlinks created when flag is set")
+    version(Posix) @("security: symlinks created when flag is set")
     unittest {
         import std.file : exists, rmdirRecurse, isSymlink, readText;
         import darkarchive.formats.tar : TarWriter;
@@ -1486,7 +1486,7 @@ version(unittest) {
     }
 
     /// With symlinks flag, absolute targets are still rejected
-    @("security: absolute symlink still rejected even with symlinks flag")
+    version(Posix) @("security: absolute symlink still rejected even with symlinks flag")
     unittest {
         import std.file : exists, rmdirRecurse;
         import darkarchive.formats.tar : TarWriter;
