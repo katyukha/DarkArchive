@@ -39,6 +39,12 @@ enum DarkExtractFlags {
 }
 
 
+/// Controls symlink handling in addTree.
+enum FollowSymlinks {
+    yes,  /// Follow symlinks, archive target content as regular file (default)
+    no,   /// Preserve symlinks as symlink entries (Posix only)
+}
+
 /// Parameters passed to extractTo preprocessing delegate.
 /// The delegate can modify destPath to rename/relocate entries, and
 /// return false to skip entries. Original entry metadata (including
@@ -698,12 +704,18 @@ struct DarkArchiveWriter {
     }
 
     /// Add directory tree recursively.
-    ref DarkArchiveWriter addTree(in Path rootPath, string prefix = null) return {
-        return addTree(rootPath.toString(), prefix);
+    ///
+    /// By default, symlinks are followed and the target content is archived
+    /// as a regular file. Use `FollowSymlinks.no` to preserve symlinks as
+    /// symlink entries in the archive (Posix only — throws on Windows).
+    ref DarkArchiveWriter addTree(in Path rootPath, string prefix = null,
+                                   FollowSymlinks followSym = FollowSymlinks.yes) return {
+        return addTree(rootPath.toString(), prefix, followSym);
     }
 
     /// ditto
-    ref DarkArchiveWriter addTree(string rootPath, string prefix = null) return {
+    ref DarkArchiveWriter addTree(string rootPath, string prefix = null,
+                                   FollowSymlinks followSym = FollowSymlinks.yes) return {
         import std.file : dirEntries, SpanMode, isDir, isFile;
 
         auto root = Path(rootPath);
@@ -717,14 +729,28 @@ struct DarkArchiveWriter {
             version(Posix) {
                 import std.file : isSymlink, readLink;
                 if (de.isSymlink) {
-                    auto target = readLink(de.name);
-                    addSymlink(archName, target);
+                    if (followSym == FollowSymlinks.no) {
+                        // Preserve symlink as symlink entry
+                        auto target = readLink(de.name);
+                        addSymlink(archName, target);
+                    } else {
+                        // Follow symlink — archive target content as regular file
+                        if (de.isDir) {
+                            addDirectory(archName);
+                        } else {
+                            add(de.name, archName);
+                        }
+                    }
                     continue;
                 }
+            } else {
+                // On Windows: FollowSymlinks.no is not supported
+                if (followSym == FollowSymlinks.no) {
+                    throw new DarkArchiveException(
+                        "FollowSymlinks.no is not supported on this platform");
+                }
             }
-            // Note: on Windows, symlinks in the source tree are skipped
-            // (treated as regular files or directories) since readLink
-            // is not available. Use addSymlink() explicitly if needed.
+
             if (de.isDir) {
                 addDirectory(archName);
             } else if (de.isFile) {
@@ -2185,5 +2211,93 @@ version(unittest) {
 
         assert(exists((extractDir ~ "data.txt").toString));
         readText((extractDir ~ "data.txt").toString).shouldEqual("tar data");
+    }
+
+    // -------------------------------------------------------------------
+    // addTree symlink following tests
+    // -------------------------------------------------------------------
+
+    /// addTree follows symlinks by default — archives target content
+    @("addTree: follows symlinks by default")
+    unittest {
+        version(Posix) {
+            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
+                symlink, readText, getcwd;
+
+            auto srcDir = Path(getcwd(), testDataDir, "symlink-follow-src");
+            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
+            mkdirRecurse(srcDir.toString);
+            write((srcDir ~ "real.txt").toString, "real content");
+            symlink("real.txt", (srcDir ~ "link.txt").toString);
+
+            // Archive with default (follow symlinks)
+            auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+            writer.addTree(srcDir);
+
+            // Read back — link.txt should be a regular file with real content
+            auto reader = DarkArchiveReader(writer.writtenData());
+            bool foundLink;
+            foreach (entry; reader.entries) {
+                import std.algorithm : endsWith;
+                if (entry.pathname.endsWith("link.txt")) {
+                    foundLink = true;
+                    entry.isFile.shouldBeTrue;
+                    entry.isSymlink.shouldBeFalse;
+                }
+            }
+            foundLink.shouldBeTrue;
+        }
+    }
+
+    /// addTree with FollowSymlinks.no preserves symlinks (Posix only)
+    @("addTree: FollowSymlinks.no preserves symlinks")
+    unittest {
+        version(Posix) {
+            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
+                symlink, getcwd;
+
+            auto srcDir = Path(getcwd(), testDataDir, "symlink-preserve-src");
+            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
+            mkdirRecurse(srcDir.toString);
+            write((srcDir ~ "target.txt").toString, "target content");
+            symlink("target.txt", (srcDir ~ "preserved.txt").toString);
+
+            auto writer = DarkArchiveWriter(DarkArchiveFormat.tar);
+            writer.addTree(srcDir, null, FollowSymlinks.no);
+
+            auto reader = DarkArchiveReader(writer.writtenData());
+            bool foundSymlink;
+            foreach (entry; reader.entries) {
+                import std.algorithm : endsWith;
+                if (entry.pathname.endsWith("preserved.txt")) {
+                    foundSymlink = true;
+                    entry.isSymlink.shouldBeTrue;
+                    entry.symlinkTarget.shouldEqual("target.txt");
+                }
+            }
+            foundSymlink.shouldBeTrue;
+        }
+    }
+
+    /// addTree default on directory with no symlinks — works same as before
+    @("addTree: no symlinks in source works normally")
+    unittest {
+        import std.file : exists, rmdirRecurse, mkdirRecurse, write, getcwd;
+
+        auto srcDir = Path(getcwd(), testDataDir, "nosym-tree-src");
+        scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
+        mkdirRecurse((srcDir ~ "sub").toString);
+        write((srcDir ~ "a.txt").toString, "aaa");
+        write((srcDir ~ "sub/b.txt").toString, "bbb");
+
+        auto writer = DarkArchiveWriter(DarkArchiveFormat.zip);
+        writer.addTree(srcDir);
+
+        auto reader = DarkArchiveReader(writer.writtenData());
+        int fileCount;
+        foreach (entry; reader.entries) {
+            if (entry.isFile) fileCount++;
+        }
+        assert(fileCount >= 2, "should have at least 2 files");
     }
 }
