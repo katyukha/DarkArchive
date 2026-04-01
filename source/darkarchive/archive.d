@@ -793,11 +793,15 @@ struct DarkArchiveWriter {
         return this;
     }
 
-    /// Add symlink.
+    /// Add symlink entry.
+    /// For TAR: stored as a symlink entry (typeflag '2').
+    /// For ZIP: stored as a file whose content is the target path, with
+    /// Unix symlink mode in external attributes.
     ref DarkArchiveWriter addSymlink(string archiveName, string target) return {
         if (_tar !is null)
             _tar.addSymlink(archiveName, target);
-        // ZIP doesn't natively support symlinks in our implementation
+        else if (_zip !is null)
+            _zip.addSymlink(archiveName, target);
         return this;
     }
 

@@ -67,6 +67,25 @@ struct ZipWriter {
         return this;
     }
 
+    /// Add symlink entry. The target path is stored as the file data,
+    /// and Unix symlink mode (0o120777) is set in external attributes.
+    ref ZipWriter addSymlink(string archiveName, string target,
+                              uint permissions = octal!777) return {
+        import std.digest.crc : crc32Of;
+
+        auto targetBytes = cast(const(ubyte)[]) target;
+        auto crc = crc32Of(targetBytes);
+        uint crcVal = (cast(uint) crc[0])
+                    | (cast(uint) crc[1] << 8)
+                    | (cast(uint) crc[2] << 16)
+                    | (cast(uint) crc[3] << 24);
+
+        writeLocalEntry(archiveName, ZIP_METHOD_STORE, crcVal,
+            targetBytes.length, targetBytes.length, targetBytes,
+            permissions, false, true);
+        return this;
+    }
+
     /// Add from a streaming source. Uses data descriptors since size is unknown upfront.
     ref ZipWriter addStream(string archiveName,
                               scope void delegate(scope void delegate(const(ubyte)[])) reader,
@@ -124,7 +143,8 @@ struct ZipWriter {
     private void writeLocalEntry(string name, ushort method, uint crc,
                                   ulong compSize, ulong uncompSize,
                                   const(ubyte)[] compData,
-                                  uint permissions, bool isDir) {
+                                  uint permissions, bool isDir,
+                                  bool isSymlink = false) {
         auto localOffset = _buf.length;
 
         ushort flags = ZIP_FLAG_UTF8; // Always write UTF-8 filenames
@@ -171,19 +191,21 @@ struct ZipWriter {
             name, method, crc,
             compSize, uncompSize,
             localOffset, flags, versionNeeded,
-            permissions, isDir, extra.dup
+            permissions, isDir, isSymlink, extra.dup
         );
     }
 
     private void writeCentralDirEntry(ref LocalEntryInfo le) {
         auto nameBytes = cast(const(ubyte)[]) le.name;
 
-        // External attributes: Unix permissions in upper 16 bits
+        // External attributes: Unix mode in upper 16 bits
         uint externalAttrs;
         if (le.isDir)
-            externalAttrs = ((le.permissions | 0x4000) << 16) | 0x10; // MS-DOS dir attr
+            externalAttrs = ((le.permissions | 0x4000) << 16) | 0x10; // S_IFDIR + MS-DOS dir
+        else if (le.isSymlink)
+            externalAttrs = ((le.permissions | 0xA000) << 16); // S_IFLNK (0o120000)
         else
-            externalAttrs = ((le.permissions | 0x8000) << 16);
+            externalAttrs = ((le.permissions | 0x8000) << 16); // S_IFREG
 
         bool needZip64Offset = le.localOffset >= ZIP64_MAGIC_32;
         bool needZip64 = le.compSize >= ZIP64_MAGIC_32 ||
@@ -329,6 +351,7 @@ private struct LocalEntryInfo {
     ushort versionNeeded;
     uint permissions;
     bool isDir;
+    bool isSymlink;
     ubyte[] extra;
 }
 
@@ -540,5 +563,32 @@ except Exception as e:
             caught = true;
         }
         caught.shouldBeTrue;
+    }
+
+    /// ZIP symlink round-trip: write symlink, read back
+    @("zip write: symlink round-trip")
+    unittest {
+        import darkarchive.formats.zip.reader : ZipReader;
+
+        auto writer = ZipWriter.create();
+        writer.addBuffer("target.txt", cast(const(ubyte)[]) "target content");
+        writer.addSymlink("link.txt", "target.txt");
+
+        auto reader = ZipReader(writer.data);
+        reader.length.shouldEqual(2);
+
+        bool foundTarget, foundLink;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "target.txt") {
+                foundTarget = true;
+                entry.isFile.shouldBeTrue;
+            } else if (entry.pathname == "link.txt") {
+                foundLink = true;
+                entry.isSymlink.shouldBeTrue;
+                entry.symlinkTarget.shouldEqual("target.txt");
+            }
+        }
+        foundTarget.shouldBeTrue;
+        foundLink.shouldBeTrue;
     }
 }
