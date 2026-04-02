@@ -27,6 +27,7 @@ struct ZipReader {
     /// Open ZIP from a file path (does not load full file into memory).
     this(string path) {
         _ds = DataSource.fromFile(path);
+        scope(failure) _ds.close();
         parseCentralDirectory();
     }
 
@@ -705,12 +706,14 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-addfiles.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addDirectory("test-data");
         writer.addBuffer("test-data/addons-list.txt",
             cast(const(ubyte)[]) addonsContent);
         writer.finish();
 
         auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         bool foundDir, foundFile;
         size_t i;
         foreach (entry; reader.entries) {
@@ -738,10 +741,12 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-largefile.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("odoo.test.2.log", logContent);
         writer.finish();
 
         auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(1);
         auto readBack = reader.readData(0);
         readBack.length.shouldEqual(logContent.length);
@@ -794,14 +799,18 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-corrupthdr.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "hello");
         writer.finish();
+
         auto data = cast(ubyte[]) read(tmpPath);
         data[0] = 0xFF; data[1] = 0xFF;
         auto corruptPath = testDataDir ~ "/test-zipr-corrupthdr-bad.zip";
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
+
         auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
         bool caught;
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }
@@ -815,15 +824,19 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-crc.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "original content");
         writer.finish();
+
         auto data = cast(ubyte[]) read(tmpPath);
         auto corruptPos = 30 + 8 + 5;
         if (corruptPos < data.length) data[corruptPos] ^= 0xFF;
         auto corruptPath = testDataDir ~ "/test-zipr-crc-bad.zip";
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
+
         auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
         bool caught;
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }
@@ -837,9 +850,12 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-emptyname.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("", cast(const(ubyte)[]) "empty name");
         writer.finish();
+
         auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries)
             assert(entry.pathname !is null);
     }
@@ -855,9 +871,12 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-store.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("tiny.txt", cast(const(ubyte)[]) "hi");
         writer.finish();
+
         auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         foreach (i, ref ci; reader._entries)
             if (ci.filename == "tiny.txt")
                 reader.readText(i).shouldEqual("hi");
@@ -870,8 +889,11 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-empty.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.finish();
+
         auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(0);
     }
 
@@ -908,16 +930,22 @@ version(unittest) {
         auto innerPath = testDataDir ~ "/test-zipr-nested-inner.zip";
         scope(exit) if (exists(innerPath)) remove(innerPath);
         auto inner = ZipWriter.createToFile(innerPath);
+        scope(exit) inner.close();
         inner.addBuffer("inner.txt", cast(const(ubyte)[]) "inner");
         inner.finish();
+
         auto innerData = cast(const(ubyte)[]) read(innerPath);
         auto outerPath = testDataDir ~ "/test-zipr-nested-outer.zip";
         scope(exit) if (exists(outerPath)) remove(outerPath);
+
         auto outer = ZipWriter.createToFile(outerPath);
+        scope(exit) outer.close();
         outer.addBuffer("nested.zip", innerData);
         outer.addBuffer("outer.txt", cast(const(ubyte)[]) "outer");
         outer.finish();
+
         auto reader = ZipReader(outerPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(2);
     }
 
@@ -1018,8 +1046,10 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-absurdcount.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
         writer.finish();
+
         auto data = cast(ubyte[]) read(tmpPath);
         // Patch EOCD entry count to 0xFFFF (absurd)
         auto eocdPos = data.length - 22;
@@ -1028,8 +1058,10 @@ version(unittest) {
         auto patchedPath = testDataDir ~ "/test-zipr-absurdcount-patched.zip";
         scope(exit) if (exists(patchedPath)) remove(patchedPath);
         write(patchedPath, data);
+
         // Reader should cap totalEntries to centralDirSize/46 (~1 entry)
         auto reader = ZipReader(patchedPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("x");
     }
@@ -1041,14 +1073,18 @@ version(unittest) {
         auto tmpPath = testDataDir ~ "/test-zipr-overflow.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("a.txt", cast(const(ubyte)[]) "data");
         writer.finish();
+
         auto data = cast(ubyte[]) read(tmpPath);
         data[26] = 0xFF; data[27] = 0xFF;
         auto corruptPath = testDataDir ~ "/test-zipr-overflow-bad.zip";
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
+
         auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
         bool caught;
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }

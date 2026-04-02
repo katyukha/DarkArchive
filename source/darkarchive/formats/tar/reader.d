@@ -488,6 +488,7 @@ version(unittest) {
         padded[0 .. garbage.length] = garbage[];
         write(tmpPath, padded);
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(0);
@@ -500,14 +501,18 @@ version(unittest) {
         auto tmpPath = "test-data/test-tarr-trunc-src.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "some content here");
         writer.finish();
+
         auto fullData = cast(ubyte[]) read(tmpPath);
         auto truncated = fullData[0 .. 512 + 5];
         auto corruptPath = "test-data/test-tarr-trunc.tar";
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, truncated);
+
         auto reader = TarReader(corruptPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
                 bool caught;
@@ -553,7 +558,9 @@ version(unittest) {
         ubyte[512] header;
         foreach (i, ref b; header) b = cast(ubyte)((i * 37 + 13) & 0xFF);
         write(tmpPath, header[]);
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(0);
@@ -571,10 +578,14 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto data = new ubyte[](512);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
+
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("exact512.bin", data);
         writer.finish();
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "exact512.bin") {
                 entry.size.shouldEqual(512);
@@ -594,10 +605,14 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto data = new ubyte[](513);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
+
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("over512.bin", data);
         writer.finish();
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "over512.bin") {
                 entry.size.shouldEqual(513);
@@ -615,9 +630,12 @@ version(unittest) {
         auto tmpPath = "test-data/test-tarr-onebyte.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("one.bin", [cast(ubyte) 0x42]);
         writer.finish();
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "one.bin") {
                 entry.size.shouldEqual(1);
@@ -647,9 +665,12 @@ version(unittest) {
         auto tmpPath = "test-data/test-tarr-emptyname.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("", cast(const(ubyte)[]) "no name");
         writer.finish();
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) {
             count++;
@@ -687,8 +708,10 @@ version(unittest) {
         auto tmpPath = "test-data/test-tarr-hugesize-src.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("small.txt", cast(const(ubyte)[]) "tiny");
         writer.finish();
+
         auto data = cast(ubyte[]) read(tmpPath);
         data[124 .. 136] = cast(ubyte[12]) "77777777777\0";
         uint sum = 0;
@@ -702,7 +725,9 @@ version(unittest) {
         auto corruptPath = "test-data/test-tarr-hugesize.tar";
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
+
         auto reader = TarReader(corruptPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "small.txt") {
                 bool caught;
@@ -719,9 +744,12 @@ version(unittest) {
         auto tmpPath = "test-data/test-tarr-zerosize.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("zero.txt", cast(const(ubyte)[]) "");
         writer.finish();
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "zero.txt") {
                 auto d = reader.readData();
@@ -737,10 +765,12 @@ version(unittest) {
         auto tmpPath = "test-data/test-tarr-corrupt-src.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("file1.txt", cast(const(ubyte)[]) "content 1")
             .addBuffer("file2.txt", cast(const(ubyte)[]) "content 2");
         writer.finish();
+
         auto data = cast(ubyte[]) read(tmpPath);
         if (data.length > 1024 + 156) {
             data[1024 + 148] = 0xFF;
@@ -749,7 +779,9 @@ version(unittest) {
         auto corruptPath = "test-data/test-tarr-corrupt-mid.tar";
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
+
         auto reader = TarReader(corruptPath);
+        scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
         // First entry is intact, second has corrupted checksum → iteration

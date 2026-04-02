@@ -509,6 +509,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
             .addBuffer("data/nested.txt", cast(const(ubyte)[]) "Nested content")
@@ -546,6 +547,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addStream("streamed.txt", (scope sink) {
             sink(cast(const(ubyte)[]) "Streamed content ");
             sink(cast(const(ubyte)[]) "chunk1");
@@ -571,6 +573,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
@@ -594,6 +597,7 @@ version(unittest) {
             b = cast(ubyte)(i % 256);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("large.bin", largeData);
         writer.finish();
 
@@ -618,6 +622,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("file.txt", cast(const(ubyte)[]) "content")
             .addDirectory("mydir");
@@ -646,6 +651,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("café.txt", cast(const(ubyte)[]) "coffee")
             .addBuffer("日本語.txt", cast(const(ubyte)[]) "japanese");
@@ -670,6 +676,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "file content");
         writer.finish();
 
@@ -694,6 +701,7 @@ version(unittest) {
         scope(exit) if (exists(outPath)) remove(outPath);
 
         auto writer = ZipWriter.createToFile(outPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("greeting.txt", cast(const(ubyte)[]) "Hello from D!\n")
             .addBuffer("data/info.txt", cast(const(ubyte)[]) "D archive\n")
@@ -732,6 +740,7 @@ except Exception as e:
         auto longName = "a".replicate(65536); // one byte over ushort.max
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         bool caught;
         try {
             writer.addBuffer(longName, cast(const(ubyte)[]) "x");
@@ -749,6 +758,7 @@ except Exception as e:
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("target.txt", cast(const(ubyte)[]) "target content");
         writer.addSymlink("link.txt", "target.txt");
         writer.finish();
@@ -782,6 +792,7 @@ except Exception as e:
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         bool caught;
         try {
             writer.addStream("short.bin", (scope sink) {
@@ -803,6 +814,7 @@ except Exception as e:
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         bool caught;
         try {
             writer.addStream("big.bin", (scope sink) {

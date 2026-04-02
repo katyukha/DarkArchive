@@ -300,12 +300,14 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
             .addBuffer("sub/nested.txt", cast(const(ubyte)[]) "Nested content");
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         bool foundHello, foundNested;
         foreach (entry; reader.entries) {
             if (entry.pathname == "hello.txt") {
@@ -327,10 +329,12 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addDirectory("mydir");
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries)
             if (entry.pathname == "mydir/")
                 entry.isDir.shouldBeTrue;
@@ -343,10 +347,12 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addSymlink("link.txt", "target.txt");
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "link.txt") {
                 entry.isSymlink.shouldBeTrue;
@@ -364,10 +370,12 @@ version(unittest) {
 
         auto longName = "深层目录/" ~ "子目录/".replicate(20) ~ "文件.txt";
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer(longName, cast(const(ubyte)[]) "pax content");
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == longName) {
                 reader.readText().shouldEqual("pax content");
@@ -384,6 +392,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
@@ -391,6 +400,7 @@ version(unittest) {
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(3);
@@ -409,6 +419,7 @@ version(unittest) {
         }
 
         auto writer = TarWriter.createToFile(tarTmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("file-a.txt", cast(const(ubyte)[]) "Content A")
             .addBuffer("file-b.txt", cast(const(ubyte)[]) "Content B");
@@ -427,6 +438,7 @@ version(unittest) {
         write(tarTmpPath2, decompressed);
 
         auto reader = TarReader(tarTmpPath2);
+        scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) {
             count++;
@@ -445,10 +457,12 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "tar file content");
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
                 reader.readText().shouldEqual("tar file content");
@@ -471,6 +485,7 @@ version(unittest) {
         }
 
         auto writer = TarWriter.createToFile(tarTmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello from D tar!\n")
             .addDirectory("mydir");
@@ -511,6 +526,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         bool caught;
         try {
             writer.addStream("short.bin", (scope sink) {
@@ -532,6 +548,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         bool caught;
         try {
             writer.addStream("big.bin", (scope sink) {
@@ -552,25 +569,23 @@ version(unittest) {
         auto outPath = "test-data/test-file-writer.tar";
         scope(exit) if (exists(outPath)) remove(outPath);
 
-        {
-            auto writer = TarWriter.createToFile(outPath);
-            writer
-                .addBuffer("streamed.txt", cast(const(ubyte)[]) "streamed content")
-                .addDirectory("streamdir");
-            writer.finish();
-        }
+        auto writer = TarWriter.createToFile(outPath);
+        scope(exit) writer.close();
+        writer
+            .addBuffer("streamed.txt", cast(const(ubyte)[]) "streamed content")
+            .addDirectory("streamdir");
+        writer.finish();
 
-        {
-            auto reader = TarReader(outPath);
-            bool found;
-            foreach (entry; reader.entries) {
-                if (entry.pathname == "streamed.txt") {
-                    found = true;
-                    reader.readText().shouldEqual("streamed content");
-                }
+        auto reader = TarReader(outPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "streamed.txt") {
+                found = true;
+                reader.readText().shouldEqual("streamed content");
             }
-            found.shouldBeTrue;
         }
+        found.shouldBeTrue;
     }
 
     /// UTF-8 filenames round-trip (parity with ZIP writer UTF-8 test)
@@ -583,6 +598,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("café.txt", cast(const(ubyte)[]) "coffee")
             .addBuffer("日本語.txt", cast(const(ubyte)[]) "japanese")
@@ -590,6 +606,7 @@ version(unittest) {
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         string[] names;
         foreach (entry; reader.entries)
             names ~= entry.pathname;
@@ -609,12 +626,14 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         foreach (i; 0 .. 150)
             writer.addBuffer("file_%04d.txt".format(i),
                 cast(const(ubyte)[]) "content %d".format(i));
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(150);
@@ -630,6 +649,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto writer = TarWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer
             .addBuffer("script.sh", cast(const(ubyte)[]) "#!/bin/sh",
                 octal!755)
@@ -641,6 +661,7 @@ version(unittest) {
         writer.finish();
 
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "script.sh")
                 entry.permissions.shouldEqual(octal!755);

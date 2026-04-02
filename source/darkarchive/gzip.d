@@ -63,7 +63,9 @@ version(unittest) {
         auto tmpPath = "test-data/test-gzip-tar-iterate.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
 
         string[] names;
         foreach (entry; reader.entries) {
@@ -88,7 +90,9 @@ version(unittest) {
         auto tmpPath = "test-data/test-gzip-empty-archive.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
 
         int count;
         foreach (entry; reader.entries) {
@@ -107,7 +111,9 @@ version(unittest) {
         auto tmpPath = "test-data/test-gzip-large-entry.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
+
         auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
 
         foreach (entry; reader.entries) {
             if (entry.pathname == "large-128k.bin") {
@@ -195,6 +201,7 @@ version(unittest) {
         auto tarTmpPath = "test-data/test-mem-consistency-inner.tar";
         scope(exit) if (exists(tarTmpPath)) remove(tarTmpPath);
         auto tw = TarWriter.createToFile(tarTmpPath);
+        scope(exit) tw.close();
         auto chunk = new ubyte[](4096); // 4KB per entry
         foreach (i; 0 .. 256) { // 256 * 4KB = 1MB total
             import std.format : format;
