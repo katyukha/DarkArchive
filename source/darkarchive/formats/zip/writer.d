@@ -98,13 +98,14 @@ struct ZipWriter {
                               scope void delegate(scope void delegate(const(ubyte)[])) reader,
                               long size = -1,
                               uint permissions = octal!644) return {
-        writeStreamingEntry(archiveName, reader, permissions);
+        writeStreamingEntry(archiveName, reader, permissions, size);
         return this;
     }
 
     private void writeStreamingEntry(string archiveName,
                                       scope void delegate(scope void delegate(const(ubyte)[])) reader,
-                                      uint permissions) {
+                                      uint permissions,
+                                      long declaredSize = -1) {
         import etc.c.zlib;
         import std.digest.crc : CRC32;
 
@@ -115,19 +116,32 @@ struct ZipWriter {
         if (nameBytes.length > ushort.max)
             throw new DarkArchiveException("ZIP: filename too long (max 65535 bytes)");
 
-        // Write local file header with zeros for CRC/sizes (data descriptor follows)
+        // For streaming, we don't know sizes upfront. Use ZIP64 local header
+        // unconditionally — safe for any size, and the data descriptor will
+        // use 8-byte fields. This avoids silent corruption for >4GB entries.
+        ushort versionNeeded = ZIP_VERSION_NEEDED_ZIP64;
+
+        // ZIP64 extra field with zero placeholders (actual sizes in data descriptor)
+        ubyte[20] zip64Extra;
+        zip64Extra[0 .. 2] = nativeToLittleEndian!ushort(ZIP64_EXTRA_FIELD_ID);
+        zip64Extra[2 .. 4] = nativeToLittleEndian!ushort(16); // data size: 2x ulong
+        zip64Extra[4 .. 12] = nativeToLittleEndian!ulong(0);  // uncompressed
+        zip64Extra[12 .. 20] = nativeToLittleEndian!ulong(0); // compressed
+
+        // Write local file header
         appendLE!uint(ZIP_LOCAL_FILE_HEADER_SIG);
-        appendLE!ushort(ZIP_VERSION_NEEDED_DEFAULT);
+        appendLE!ushort(versionNeeded);
         appendLE!ushort(flags);
         appendLE!ushort(ZIP_METHOD_DEFLATE);
         appendLE!ushort(0); // mod time
         appendLE!ushort(0); // mod date
         appendLE!uint(0);   // CRC32 — filled in data descriptor
-        appendLE!uint(0);   // compressed size — filled in data descriptor
-        appendLE!uint(0);   // uncompressed size — filled in data descriptor
+        appendLE!uint(ZIP64_MAGIC_32); // compressed size — ZIP64
+        appendLE!uint(ZIP64_MAGIC_32); // uncompressed size — ZIP64
         appendLE!ushort(cast(ushort) nameBytes.length);
-        appendLE!ushort(0); // extra field length
+        appendLE!ushort(cast(ushort) zip64Extra.length);
         output(nameBytes);
+        output(zip64Extra[]);
 
         // Set up incremental deflate + CRC32
         z_stream zs;
@@ -157,7 +171,11 @@ struct ZipWriter {
         }
 
         // Stream data: compute CRC32 + deflate incrementally
+        auto declSize = declaredSize >= 0 ? cast(ulong) declaredSize : ulong.max;
         reader((const(ubyte)[] chunk) {
+            if (declaredSize >= 0 && uncompressedSize + chunk.length > declSize)
+                throw new DarkArchiveException(
+                    "ZIP addStream: data exceeds declared size");
             crc.put(chunk);
             uncompressedSize += chunk.length;
 
@@ -165,6 +183,13 @@ struct ZipWriter {
             zs.avail_in = cast(uint) chunk.length;
             flushDeflate(Z_NO_FLUSH);
         });
+
+        if (declaredSize >= 0 && uncompressedSize != declSize) {
+            import std.format : format;
+            throw new DarkArchiveException(
+                "ZIP addStream: data size mismatch (declared %d, got %d)"
+                .format(declSize, uncompressedSize));
+        }
 
         // Finish deflate
         zs.next_in = null;
@@ -180,18 +205,18 @@ struct ZipWriter {
                     | (cast(uint) crcDigest[2] << 16)
                     | (cast(uint) crcDigest[3] << 24);
 
-        // Write data descriptor (with signature)
+        // Write ZIP64 data descriptor (8-byte sizes)
         appendLE!uint(ZIP_DATA_DESCRIPTOR_SIG);
         appendLE!uint(crcVal);
-        appendLE!uint(cast(uint) compressedSize);
-        appendLE!uint(cast(uint) uncompressedSize);
+        appendLE!ulong(compressedSize);
+        appendLE!ulong(uncompressedSize);
 
-        // Record for central directory
+        // Record for central directory (writeCentralDirEntry handles ZIP64)
         _localEntries ~= LocalEntryInfo(
             archiveName, ZIP_METHOD_DEFLATE, crcVal,
             compressedSize, uncompressedSize,
-            localOffset, flags, ZIP_VERSION_NEEDED_DEFAULT,
-            permissions, false, false, []
+            localOffset, flags, versionNeeded,
+            permissions, false, false, zip64Extra.dup
         );
     }
 
@@ -745,5 +770,48 @@ except Exception as e:
         }
         foundTarget.shouldBeTrue;
         foundLink.shouldBeTrue;
+    }
+
+    /// addStream with known size must throw if too few bytes provided
+    @("zip write security: addStream throws on size underflow")
+    unittest {
+        import std.file : exists, remove;
+        import darkarchive.exception : DarkArchiveException;
+
+        auto tmpPath = "test-data/test-zip-wrt-underflow.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = ZipWriter.createToFile(tmpPath);
+        bool caught;
+        try {
+            writer.addStream("short.bin", (scope sink) {
+                sink(cast(const(ubyte)[]) "only 10 bytes");
+            }, 1000);
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        caught.shouldBeTrue;
+    }
+
+    /// addStream with known size must throw if too many bytes provided
+    @("zip write security: addStream throws on size overflow")
+    unittest {
+        import std.file : exists, remove;
+        import darkarchive.exception : DarkArchiveException;
+
+        auto tmpPath = "test-data/test-zip-wrt-overflow.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = ZipWriter.createToFile(tmpPath);
+        bool caught;
+        try {
+            writer.addStream("big.bin", (scope sink) {
+                auto chunk = new ubyte[](2000);
+                sink(chunk);
+            }, 500);
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        caught.shouldBeTrue;
     }
 }

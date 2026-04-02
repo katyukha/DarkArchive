@@ -90,9 +90,18 @@ struct TarWriter {
             // Stream data chunks directly to output
             size_t totalWritten;
             reader((const(ubyte)[] chunk) {
+                if (totalWritten + chunk.length > usize)
+                    throw new DarkArchiveException(
+                        "TAR addStream: data exceeds declared size");
                 output(chunk);
                 totalWritten += chunk.length;
             });
+
+            if (totalWritten != usize)
+                throw new DarkArchiveException(
+                    "TAR addStream: data size mismatch (declared "
+                    ~ formatDecimal(usize) ~ ", got "
+                    ~ formatDecimal(totalWritten) ~ ")");
 
             // Pad to 512-byte boundary
             auto remainder = totalWritten % TAR_BLOCK_SIZE;
@@ -495,6 +504,49 @@ version(unittest) {
         caught.shouldBeTrue;
         TarWriter.testWriteOctal(field[], 420);
         assert(field[0] == '0' || (field[0] >= '1' && field[0] <= '7'));
+    }
+
+    /// addStream with known size must throw if too few bytes provided
+    @("tar write security: addStream throws on size underflow")
+    unittest {
+        import std.file : exists, remove;
+        import darkarchive.exception : DarkArchiveException;
+
+        auto tmpPath = "test-data/test-tarw-underflow.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
+        bool caught;
+        try {
+            writer.addStream("short.bin", (scope sink) {
+                sink(cast(const(ubyte)[]) "only 10 bytes");
+            }, 1000); // declared 1000, provided ~13
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        caught.shouldBeTrue;
+    }
+
+    /// addStream with known size must throw if too many bytes provided
+    @("tar write security: addStream throws on size overflow")
+    unittest {
+        import std.file : exists, remove;
+        import darkarchive.exception : DarkArchiveException;
+
+        auto tmpPath = "test-data/test-tarw-overflow.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
+        bool caught;
+        try {
+            writer.addStream("big.bin", (scope sink) {
+                auto chunk = new ubyte[](2000);
+                sink(chunk);
+            }, 500); // declared 500, provided 2000
+        } catch (DarkArchiveException e) {
+            caught = true;
+        }
+        caught.shouldBeTrue;
     }
 
     /// File-backed writer round-trip
