@@ -343,7 +343,7 @@ private {
 version(unittest) {
     import unit_threaded.assertions : shouldEqual, shouldBeTrue;
 
-    @("datasource: memory-backed read")
+    @("datasource: readSlice at offset")
     unittest {
         import std.file : write, remove;
         enum path = "test-data/tmp-datasource-read.bin";
@@ -356,11 +356,11 @@ version(unittest) {
         (cast(string) slice).shouldEqual("World!");
     }
 
-    @("datasource: file-backed read")
+    @("datasource: read ZIP magic bytes")
     unittest {
         auto ds = DataSource.fromFile("test-data/test-zip.zip");
+        scope(exit) ds.close();
         assert(ds.length > 0);
-        // Read first 2 bytes — should be "PK"
         auto sig = ds.readSlice(0, 2);
         sig[0].shouldEqual('P');
         sig[1].shouldEqual('K');
@@ -377,7 +377,7 @@ version(unittest) {
         ds.readLE!uint(0).shouldEqual(0x04034b50);
     }
 
-    @("datasource: findBackward file-backed")
+    @("datasource: findBackward finds EOCD signature")
     unittest {
         import darkarchive.formats.zip.types : ZIP_END_OF_CENTRAL_DIR_SIG;
         auto ds = DataSource.fromFile("test-data/test-zip.zip");
@@ -385,15 +385,6 @@ version(unittest) {
         auto pos = ds.findBackward(ZIP_END_OF_CENTRAL_DIR_SIG,
             ds.length - 4, 22 + 65535);
         assert(pos >= 0, "should find EOCD signature");
-    }
-
-    @("datasource: findBackward file")
-    unittest {
-        import darkarchive.formats.zip.types : ZIP_END_OF_CENTRAL_DIR_SIG;
-        auto ds = DataSource.fromFile("test-data/test-zip.zip");
-        auto pos = ds.findBackward(ZIP_END_OF_CENTRAL_DIR_SIG,
-            ds.length - 4, 22 + 65535);
-        assert(pos >= 0, "should find EOCD signature in file");
     }
 
     @("datasource: out-of-bounds read throws")

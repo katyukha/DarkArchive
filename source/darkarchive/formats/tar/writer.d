@@ -134,11 +134,6 @@ struct TarWriter {
         if (!_finished) finish();
     }
 
-    /// For testing writeOctal
-    static void testWriteOctal(ubyte[] field, ulong value) {
-        writeOctal(field, value);
-    }
-
     // -- Private --
 
     /// Returns true if pax handled the size field.
@@ -497,12 +492,12 @@ version(unittest) {
         ubyte[12] field;
         bool caught;
         try {
-            TarWriter.testWriteOctal(field[], ulong.max);
+            TarWriter.writeOctal(field[], ulong.max);
         } catch (DarkArchiveException e) {
             caught = true;
         }
         caught.shouldBeTrue;
-        TarWriter.testWriteOctal(field[], 420);
+        TarWriter.writeOctal(field[], 420);
         assert(field[0] == '0' || (field[0] >= '1' && field[0] <= '7'));
     }
 
@@ -575,6 +570,86 @@ version(unittest) {
                 }
             }
             found.shouldBeTrue;
+        }
+    }
+
+    /// UTF-8 filenames round-trip (parity with ZIP writer UTF-8 test)
+    @("tar write: UTF-8 filenames round-trip")
+    unittest {
+        import std.file : exists, remove;
+        import std.algorithm : canFind;
+
+        auto tmpPath = "test-data/test-tarw-utf8.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
+        writer
+            .addBuffer("café.txt", cast(const(ubyte)[]) "coffee")
+            .addBuffer("日本語.txt", cast(const(ubyte)[]) "japanese")
+            .addBuffer("Ünïcödé/nested.txt", cast(const(ubyte)[]) "nested");
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
+        string[] names;
+        foreach (entry; reader.entries)
+            names ~= entry.pathname;
+
+        assert(names.canFind("café.txt"), "missing café.txt");
+        assert(names.canFind("日本語.txt"), "missing 日本語.txt");
+        assert(names.canFind("Ünïcödé/nested.txt"), "missing Ünïcödé/nested.txt");
+    }
+
+    /// Many entries round-trip (parity with ZIP reader many-entries test)
+    @("tar write: 150 entries round-trip")
+    unittest {
+        import std.file : exists, remove;
+        import std.format : format;
+
+        auto tmpPath = "test-data/test-tarw-many.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
+        foreach (i; 0 .. 150)
+            writer.addBuffer("file_%04d.txt".format(i),
+                cast(const(ubyte)[]) "content %d".format(i));
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
+        int count;
+        foreach (entry; reader.entries) count++;
+        count.shouldEqual(150);
+    }
+
+    /// Permission value preservation round-trip
+    @("tar write: permission values preserved")
+    unittest {
+        import std.file : exists, remove;
+        import std.conv : octal;
+
+        auto tmpPath = "test-data/test-tarw-perms.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
+        writer
+            .addBuffer("script.sh", cast(const(ubyte)[]) "#!/bin/sh",
+                octal!755)
+            .addBuffer("readonly.txt", cast(const(ubyte)[]) "data",
+                octal!444)
+            .addBuffer("normal.txt", cast(const(ubyte)[]) "data",
+                octal!644)
+            .addDirectory("mydir", octal!755);
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "script.sh")
+                entry.permissions.shouldEqual(octal!755);
+            else if (entry.pathname == "readonly.txt")
+                entry.permissions.shouldEqual(octal!444);
+            else if (entry.pathname == "normal.txt")
+                entry.permissions.shouldEqual(octal!644);
+            else if (entry.pathname == "mydir/")
+                entry.permissions.shouldEqual(octal!755);
         }
     }
 }

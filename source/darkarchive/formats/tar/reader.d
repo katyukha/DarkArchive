@@ -521,11 +521,15 @@ version(unittest) {
     unittest {
         auto malicious1 = cast(const(ubyte)[]) "0 path=evil\n";
         auto result1 = parsePaxData(malicious1);
+        result1.length.shouldEqual(0); // "0" means zero-length record — nothing parsed
+
         auto malicious2 = cast(const(ubyte)[]) " path=evil\n";
         auto result2 = parsePaxData(malicious2);
+        result2.length.shouldEqual(0); // leading space — invalid length
+
         auto empty = cast(const(ubyte)[]) "";
         auto result3 = parsePaxData(empty);
-        assert(result3.length == 0);
+        result3.length.shouldEqual(0);
     }
 
     @("tar security: octal overflow throws")
@@ -624,15 +628,19 @@ version(unittest) {
         assert(false, "entry not found");
     }
 
-    @("tar format: GNU long filename does not crash")
+    @("tar format: GNU long filename does not crash, entries iterable")
     unittest {
+        // GNU tar uses ././@LongLink pseudo-entries for names > 100 chars.
+        // Our reader skips GNU extensions (only supports pax). Verify we
+        // still iterate without crashing and produce at least one entry.
         auto reader = TarReader(testDataDir ~ "/test-gnu-longname.tar");
-        int count;
-        foreach (entry; reader.entries) count++;
-        assert(count > 0);
+        string[] names;
+        foreach (entry; reader.entries)
+            names ~= entry.pathname;
+        assert(names.length > 0, "should have at least one entry");
     }
 
-    @("tar format: empty filename does not crash")
+    @("tar format: empty filename produces empty string, not null")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove;
@@ -642,8 +650,14 @@ version(unittest) {
         writer.addBuffer("", cast(const(ubyte)[]) "no name");
         writer.finish();
         auto reader = TarReader(tmpPath);
-        foreach (entry; reader.entries)
+        int count;
+        foreach (entry; reader.entries) {
+            count++;
             assert(entry.pathname !is null);
+            // Empty name should be empty string, not garbage
+            entry.pathname.length.shouldEqual(0);
+        }
+        count.shouldEqual(1);
     }
 
     // -------------------------------------------------------------------
@@ -652,8 +666,18 @@ version(unittest) {
 
     @("CVE: pax size attribute with absurd value")
     unittest {
+        // Pax record declares length 30 but actual data is shorter —
+        // parser must reject (recordLen > text.length) without crash.
         auto maliciousPax = cast(const(ubyte)[]) "30 size=99999999999999999999\n";
         auto attrs = parsePaxData(maliciousPax);
+        // Record length mismatch → parser stops, no attributes stored
+        attrs.length.shouldEqual(0);
+
+        // Well-formed record with absurd value — parser stores as string
+        auto wellFormed = cast(const(ubyte)[]) "29 size=99999999999999999999\n";
+        auto attrs2 = parsePaxData(wellFormed);
+        assert("size" in attrs2, "well-formed pax record should be parsed");
+        attrs2["size"].shouldEqual("99999999999999999999");
     }
 
     @("tar security: huge size field does not OOB")

@@ -1623,10 +1623,11 @@ version(unittest) {
             "null byte must not create file at truncated-suffix path");
     }
 
-    /// Filename "." (current directory) — must not overwrite extraction root
+    /// Filename "." (current directory) — must not overwrite extraction root.
+    /// extractTo strips "./" prefix, leaving empty path, which is skipped.
     @("attack: filename is just '.'")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
+        import std.file : exists, rmdirRecurse, remove, dirEntries, SpanMode;
 
         auto tmpPath = "test-data/test-atk-dot-name.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -1639,13 +1640,23 @@ version(unittest) {
         auto extractDir = Path(testDataDir, "sec-dot-name-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
 
-        // Should not crash or overwrite the extraction directory itself
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
-        // May throw or skip — either is acceptable
         try {
             reader.extractTo(extractDir);
-        } catch (Exception) {}
+        } catch (Exception) {
+            // May throw — acceptable
+        }
+
+        // Entry must be iterable with correct name
+        auto reader2 = DarkArchiveReader(tmpPath);
+        scope(exit) reader2.close();
+        int count;
+        foreach (entry; reader2.entries) {
+            count++;
+            entry.pathname.shouldEqual(".");
+        }
+        count.shouldEqual(1);
     }
 
     /// Duplicate filenames — second entry overwrites first. Library should
@@ -1672,7 +1683,8 @@ version(unittest) {
             "dupe.txt should contain content from one of the entries");
     }
 
-    /// Very long pathname (>1000 chars) — must not crash on extraction
+    /// Very long pathname (>1000 chars) — entry must be iterable and
+    /// content readable even if filesystem rejects extraction.
     @("attack: very long pathname")
     unittest {
         import std.file : exists, rmdirRecurse, remove;
@@ -1690,17 +1702,18 @@ version(unittest) {
             writer.finish();
         }
 
-        auto extractDir = Path(testDataDir, "sec-longpath-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
-
-        // Should not crash. May fail on filesystem limits — that's OK.
+        // Entry must be iterable with correct name and content
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
-        try {
-            reader.extractTo(extractDir);
-        } catch (Exception) {
-            // Filesystem may reject very long paths — acceptable
-        }
+        string foundName;
+        string foundContent;
+        reader.processEntries(
+            (const ref entry, scope dataReader) {
+                foundName = entry.pathname;
+                foundContent = dataReader.readText();
+            });
+        foundName.shouldEqual(longPath);
+        foundContent.shouldEqual("deep");
     }
 
     /// Control characters in filename (newlines, tabs)
