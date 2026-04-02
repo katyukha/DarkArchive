@@ -195,4 +195,62 @@ version(unittest) {
         }
         assert(names.length > 0, "should find entries via streaming gzip");
     }
+
+    /// Memory consistency: streaming through tar.gz should not accumulate memory
+    @("gzip: streaming does not accumulate memory")
+    unittest {
+        import darkarchive.formats.tar.writer : TarWriter, gzipCompress;
+        import darkarchive.datasource : GzipSequentialReader;
+        import core.memory : GC;
+
+        // Create tar.gz with many entries totaling ~1MB
+        auto tw = TarWriter.create();
+        auto chunk = new ubyte[](4096); // 4KB per entry
+        foreach (i; 0 .. 256) { // 256 * 4KB = 1MB total
+            import std.format : format;
+            tw.addBuffer("entry_%04d.bin".format(i), chunk);
+        }
+        auto gzData = gzipCompress(tw.data);
+
+        // Write to temp file
+        import std.file : write, remove, exists;
+        auto tmpPath = "test-data/test-mem-consistency.tar.gz";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, gzData);
+
+        // Force GC before measuring
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        // Stream through all entries, reading each via chunked API
+        auto gzStream = new GzipSequentialReader(tmpPath);
+        auto reader = TarReader(gzStream);
+        size_t totalRead;
+        foreach (entry; reader.entries) {
+            if (entry.isFile) {
+                reader.readDataChunked((const(ubyte)[] c) {
+                    totalRead += c.length;
+                });
+            }
+        }
+        reader.close();
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+
+        // Total data was ~1MB. With proper streaming, memory should not grow
+        // proportionally to archive size. Allow reasonable GC overhead (2MB)
+        // but reject growth > 4MB which would indicate accumulation.
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+        assert(growth < 4 * 1024 * 1024,
+            "memory grew by " ~ formatSize(growth) ~ " — possible memory leak");
+        assert(totalRead > 0, "should have read data");
+    }
+}
+
+private string formatSize(size_t bytes) {
+    import std.format : format;
+    if (bytes < 1024) return "%d B".format(bytes);
+    if (bytes < 1024 * 1024) return "%.1f KB".format(cast(double) bytes / 1024);
+    return "%.1f MB".format(cast(double) bytes / (1024 * 1024));
 }

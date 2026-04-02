@@ -197,7 +197,8 @@ class GzipSequentialReader : SequentialReader {
         size_t _decompPos;   // read position within _decompBuf
         bool _fileEOF;
         bool _inflateEOF;
-        enum CHUNK_SIZE = 4 * 1024 * 1024; // 4MB compressed read chunks
+        enum CHUNK_SIZE = 256 * 1024;    // 256KB compressed read chunks
+        enum COMPACT_THRESHOLD = 64 * 1024; // compact when 64KB consumed
     }
 
     this(string gzipPath) {
@@ -215,24 +216,23 @@ class GzipSequentialReader : SequentialReader {
             throw new DarkArchiveException("GZIP: unexpected end of compressed data");
         auto result = _decompBuf[_decompPos .. _decompPos + len].dup;
         _decompPos += len;
-        compactBuffer();
+        compact();
         return result;
     }
 
     override void skip(size_t len) {
-        // For large skips, decompress and discard in chunks
         while (len > 0) {
             auto available = _decompBuf.length - _decompPos;
             if (available == 0) {
                 if (!decompressMore())
-                    return; // EOF
+                    return;
                 continue;
             }
             auto toSkip = len > available ? available : len;
             _decompPos += toSkip;
             len -= toSkip;
-            compactBuffer();
         }
+        compact();
     }
 
     override bool empty() {
@@ -243,34 +243,36 @@ class GzipSequentialReader : SequentialReader {
 
     override void close() {
         _file.close();
+        _decompBuf = null;
+        _readBuf = null;
     }
 
     private void ensureAvailable(size_t needed) {
         while (_decompBuf.length - _decompPos < needed) {
             if (!decompressMore())
-                return; // can't get more
+                return;
         }
     }
 
     private bool decompressMore() {
         if (_inflateEOF) return false;
 
-        // Heap-allocated read buffer (stack would overflow on Windows
-        // where default stack size is 1MB)
+        // Compact before adding more data to keep buffer bounded
+        compact();
+
         if (_readBuf is null)
             _readBuf = new ubyte[](CHUNK_SIZE);
-        auto readBuf = _readBuf;
+
         while (true) {
             if (_fileEOF) {
                 auto tail = cast(ubyte[]) _inflater.flush();
-                if (tail.length > 0) {
+                if (tail.length > 0)
                     _decompBuf ~= tail;
-                }
                 _inflateEOF = true;
                 return _decompBuf.length - _decompPos > 0;
             }
 
-            auto got = _file.rawRead(readBuf[]);
+            auto got = _file.rawRead(_readBuf[]);
             if (got.length == 0) {
                 _fileEOF = true;
                 continue;
@@ -284,10 +286,12 @@ class GzipSequentialReader : SequentialReader {
         }
     }
 
-    private void compactBuffer() {
-        // When we've consumed a significant portion, compact to free memory
-        if (_decompPos > CHUNK_SIZE) {
-            _decompBuf = _decompBuf[_decompPos .. $].dup;
+    /// Compact buffer: discard consumed bytes when waste exceeds threshold.
+    /// Uses dup to release old backing store to GC.
+    private void compact() {
+        if (_decompPos >= COMPACT_THRESHOLD) {
+            auto remaining = _decompBuf[_decompPos .. $];
+            _decompBuf = remaining.dup;
             _decompPos = 0;
         }
     }

@@ -2,6 +2,7 @@
 ///
 /// Creates TAR archives in ustar format with pax extended headers
 /// for UTF-8 pathnames and large sizes.
+/// Supports both memory buffer and file-backed streaming modes.
 module darkarchive.formats.tar.writer;
 
 import std.conv : octal;
@@ -10,16 +11,44 @@ import std.bitmanip : nativeToLittleEndian;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.tar.types;
 
-/// Writes a TAR archive to a growing memory buffer.
+/// Writes a TAR archive to a memory buffer, file, or custom sink.
 struct TarWriter {
     private {
+        // Memory mode
         ubyte[] _buf;
+        // Sink mode (file, gzip compressor, etc.)
+        void delegate(const(ubyte)[]) _sink;
+        void delegate() _sinkFinish;
+        // Shared state
         bool _finished;
     }
 
+    /// Create a memory-backed writer (for tests, in-memory archives).
     static TarWriter create() {
         TarWriter w;
         w._buf = [];
+        w._finished = false;
+        return w;
+    }
+
+    /// Create a file-backed writer (streaming, constant memory).
+    static TarWriter createToFile(string path) {
+        import std.stdio : File;
+        auto f = new File(path, "wb");
+        TarWriter w;
+        w._sink = (const(ubyte)[] bytes) { f.rawWrite(bytes); };
+        w._sinkFinish = () { f.close(); };
+        w._finished = false;
+        return w;
+    }
+
+    /// Create a writer that pipes through a custom sink (e.g., gzip compressor).
+    static TarWriter createToSink(
+            void delegate(const(ubyte)[]) sink,
+            void delegate() sinkFinish = null) {
+        TarWriter w;
+        w._sink = sink;
+        w._sinkFinish = sinkFinish;
         w._finished = false;
         return w;
     }
@@ -28,7 +57,6 @@ struct TarWriter {
     ref TarWriter addBuffer(string archiveName, const(ubyte)[] fileData,
                              uint permissions = octal!644) return {
         auto paxHandlesSize = writePaxIfNeeded(archiveName, fileData.length);
-        // If pax handles the size (>8GB), write 0 in the header's octal size field
         writeHeader(archiveName, '0',
             paxHandlesSize ? 0 : fileData.length, permissions, null);
         writeData(fileData);
@@ -58,7 +86,6 @@ struct TarWriter {
                               scope void delegate(scope void delegate(const(ubyte)[])) reader,
                               long size = -1,
                               uint permissions = octal!644) return {
-        // Collect all data
         import std.array : appender;
         auto buf = appender!(ubyte[])();
         reader((const(ubyte)[] chunk) { buf ~= chunk; });
@@ -70,29 +97,40 @@ struct TarWriter {
     void finish() {
         if (_finished) return;
         _finished = true;
-        // Two 512-byte zero blocks mark end of archive
-        _buf.length += TAR_BLOCK_SIZE * 2;
+        ubyte[TAR_BLOCK_SIZE * 2] zeros = 0;
+        output(zeros[]);
+        if (_sinkFinish !is null)
+            _sinkFinish();
     }
 
-    /// Get the written archive data. Calls finish() if not already done.
+    /// Get the written archive data (memory mode only).
     const(ubyte)[] data() {
         if (!_finished) finish();
         return _buf;
     }
 
+    /// Close writer.
+    void close() {
+        if (!_finished) finish();
+    }
+
+    /// For testing writeOctal
+    static void testWriteOctal(ubyte[] field, ulong value) {
+        writeOctal(field, value);
+    }
+
     // -- Private --
 
-    /// Returns true if pax handled the size field (caller should write 0 in header).
+    /// Returns true if pax handled the size field.
     private bool writePaxIfNeeded(string name, ulong size, string linkname = null) {
         string[string] attrs;
         bool handlesSize;
 
-        // Need pax extended header if name > 100 chars or contains non-ASCII
         if (name.length > 100 || needsPaxEncoding(name))
             attrs["path"] = name;
         if (linkname !is null && (linkname.length > 100 || needsPaxEncoding(linkname)))
             attrs["linkpath"] = linkname;
-        if (size > 0x1FFFFFFFF) { // > max octal in 12 bytes
+        if (size > 0x1FFFFFFFF) {
             attrs["size"] = formatDecimal(size);
             handlesSize = true;
         }
@@ -111,85 +149,74 @@ struct TarWriter {
         ubyte[TAR_BLOCK_SIZE] header;
         header[] = 0;
 
-        // Name (truncate to 100 if needed — pax handles the full name)
         auto nameBytes = cast(const(ubyte)[]) name;
         auto nameLen = nameBytes.length > 100 ? 100 : nameBytes.length;
         header[0 .. nameLen] = nameBytes[0 .. nameLen];
 
-        // Mode
         writeOctal(header[100 .. 108], permissions);
-        // UID
-        writeOctal(header[108 .. 116], 0);
-        // GID
-        writeOctal(header[116 .. 124], 0);
-        // Size
+        writeOctal(header[108 .. 116], 0); // UID
+        writeOctal(header[116 .. 124], 0); // GID
         writeOctal(header[124 .. 136], size);
-        // Mtime (current time)
         import core.stdc.time : time;
         writeOctal(header[136 .. 148], cast(ulong) time(null));
-        // Typeflag
         header[156] = cast(ubyte) typeflag;
 
-        // Linkname
         if (linkname !is null) {
             auto lnBytes = cast(const(ubyte)[]) linkname;
             auto lnLen = lnBytes.length > 100 ? 100 : lnBytes.length;
             header[157 .. 157 + lnLen] = lnBytes[0 .. lnLen];
         }
 
-        // Magic + version (ustar)
         header[257 .. 263] = cast(const(ubyte)[]) "ustar\0";
         header[263 .. 265] = cast(const(ubyte)[]) "00";
 
-        // Compute checksum
         computeChecksum(header);
-
-        _buf ~= header[];
+        output(header[]);
     }
 
     private void writeData(const(ubyte)[] fileData) {
         if (fileData.length == 0) return;
-        _buf ~= fileData;
-        // Pad to 512-byte block boundary
+        output(fileData);
         auto remainder = fileData.length % TAR_BLOCK_SIZE;
         if (remainder > 0) {
-            auto padding = TAR_BLOCK_SIZE - remainder;
-            _buf.length += padding;
+            ubyte[TAR_BLOCK_SIZE] padding = 0;
+            output(padding[0 .. TAR_BLOCK_SIZE - remainder]);
+        }
+    }
+
+    /// Write bytes to output — memory buffer or sink.
+    private void output(const(ubyte)[] bytes) {
+        if (_sink !is null) {
+            _sink(bytes);
+        } else {
+            _buf ~= bytes;
         }
     }
 
     private static void computeChecksum(ref ubyte[TAR_BLOCK_SIZE] header) {
-        // Fill checksum field with spaces for computation
         header[148 .. 156] = ' ';
-
         uint sum = 0;
         foreach (b; header)
             sum += b;
-
         writeOctal(header[148 .. 156], sum);
-        header[155] = ' '; // Traditional: terminated by null and space
-    }
-
-    static void testWriteOctal(ubyte[] field, ulong value) {
-        writeOctal(field, value);
+        header[155] = ' ';
     }
 
     private static void writeOctal(ubyte[] field, ulong value) {
         import darkarchive.exception : DarkArchiveException;
 
         auto len = field.length;
-        // Max representable: (len-1) octal digits. Check before writing.
-        auto maxDigits = len - 1; // last byte is null terminator
+        auto maxDigits = len - 1;
         ulong maxValue = 1;
         foreach (_; 0 .. maxDigits)
             maxValue *= 8;
-        maxValue -= 1; // e.g. 12 bytes → 11 digits → max 0x1FFFFFFFF (8589934591)
+        maxValue -= 1;
 
         if (value > maxValue)
             throw new DarkArchiveException("TAR: value too large for octal field");
 
         field[] = '0';
-        field[len - 1] = 0; // null terminator
+        field[len - 1] = 0;
 
         if (value == 0) return;
 
@@ -212,17 +239,14 @@ private string encodePaxData(string[string] attrs) {
 
     foreach (key, value; attrs) {
         auto content = key ~ "=" ~ value ~ "\n";
-        // Record format: "<length> <content>"
-        // Length includes the length field itself + space + content
-        // Need to compute iteratively since length of length varies
         auto contentLen = content.length;
-        size_t totalLen = contentLen + 2; // minimum: "N " where N is 1 digit
+        size_t totalLen = contentLen + 2;
         while (true) {
             auto lenStr = formatDecimal(totalLen);
-            auto actual = lenStr.length + 1 + contentLen; // lenStr + space + content
+            auto actual = lenStr.length + 1 + contentLen;
             if (actual == totalLen) break;
             totalLen = actual;
-            if (totalLen > contentLen + 20) break; // safety
+            if (totalLen > contentLen + 20) break;
         }
         result ~= formatDecimal(totalLen);
         result ~= ' ';
@@ -247,6 +271,7 @@ ubyte[] gzipCompress(const(ubyte)[] data) {
 }
 
 
+
 // ===========================================================================
 // Unit tests
 // ===========================================================================
@@ -255,7 +280,6 @@ version(unittest) {
     import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
     import darkarchive.formats.tar.reader : TarReader;
 
-    /// Write tar round-trip with addBuffer
     @("tar write: round-trip with addBuffer")
     unittest {
         auto writer = TarWriter.create();
@@ -278,26 +302,20 @@ version(unittest) {
         foundNested.shouldBeTrue;
     }
 
-    /// Write directory
     @("tar write: addDirectory")
     unittest {
         auto writer = TarWriter.create();
         writer.addDirectory("mydir");
-
         auto reader = TarReader(writer.data);
-        foreach (entry; reader.entries) {
-            if (entry.pathname == "mydir/") {
+        foreach (entry; reader.entries)
+            if (entry.pathname == "mydir/")
                 entry.isDir.shouldBeTrue;
-            }
-        }
     }
 
-    /// Write symlink
     @("tar write: addSymlink")
     unittest {
         auto writer = TarWriter.create();
         writer.addSymlink("link.txt", "target.txt");
-
         auto reader = TarReader(writer.data);
         foreach (entry; reader.entries) {
             if (entry.pathname == "link.txt") {
@@ -307,15 +325,12 @@ version(unittest) {
         }
     }
 
-    /// Long UTF-8 pathname via pax
     @("tar write: long UTF-8 pathname via pax extended header")
     unittest {
         import std.array : replicate;
         auto longName = "深层目录/" ~ "子目录/".replicate(20) ~ "文件.txt";
-
         auto writer = TarWriter.create();
         writer.addBuffer(longName, cast(const(ubyte)[]) "pax content");
-
         auto reader = TarReader(writer.data);
         foreach (entry; reader.entries) {
             if (entry.pathname == longName) {
@@ -326,7 +341,6 @@ version(unittest) {
         assert(false, "pax entry not found");
     }
 
-    /// Method chaining
     @("tar write: method chaining")
     unittest {
         auto writer = TarWriter.create();
@@ -334,27 +348,21 @@ version(unittest) {
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
             .addDirectory("dir");
-
         auto reader = TarReader(writer.data);
         int count;
-        foreach (entry; reader.entries)
-            count++;
+        foreach (entry; reader.entries) count++;
         count.shouldEqual(3);
     }
 
-    /// tar.gz round-trip
     @("tar.gz write: round-trip via gzipCompress + gunzip")
     unittest {
         import darkarchive.gzip : gunzip;
-
         auto writer = TarWriter.create();
         writer
             .addBuffer("file-a.txt", cast(const(ubyte)[]) "Content A")
             .addBuffer("file-b.txt", cast(const(ubyte)[]) "Content B");
-
         auto gzData = gzipCompress(writer.data);
         assert(gzData.length > 0);
-
         auto tarData = gunzip(gzData);
         auto reader = TarReader(tarData);
         int count;
@@ -368,12 +376,10 @@ version(unittest) {
         count.shouldEqual(2);
     }
 
-    /// Written tar is readable
     @("tar write: single file, verify content")
     unittest {
         auto writer = TarWriter.create();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "tar file content");
-
         auto reader = TarReader(writer.data);
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
@@ -384,11 +390,6 @@ version(unittest) {
         assert(false, "entry not found");
     }
 
-    // -------------------------------------------------------------------
-    // Security / edge-case tests
-    // -------------------------------------------------------------------
-
-    /// Written tar.gz readable by system tar
     @("tar interop: written tar.gz readable by system tar")
     unittest {
         import darkarchive.gzip : gunzip;
@@ -405,24 +406,15 @@ version(unittest) {
         auto gzData = gzipCompress(writer.data);
         write(outPath, gzData);
 
-        // Verify with system tar
         auto result = execute(["tar", "tzf", outPath]);
         assert(result.status == 0, "tar failed: " ~ result.output);
         import std.algorithm : canFind;
         assert(result.output.canFind("hello.txt"), "tar listing missing hello.txt");
     }
 
-    /// writeOctal must throw when value doesn't fit in field
     @("tar write security: octal overflow in size field throws")
     unittest {
         import darkarchive.exception : DarkArchiveException;
-
-        // The size field in ustar is 12 bytes (11 octal digits + null).
-        // Max value: octal 77777777777 = 8,589,934,591 (~8GB).
-        // A file larger than that must trigger pax extended header for size,
-        // or throw if it can't be represented.
-
-        // Directly test writeOctal with a value that overflows 12-byte field
         ubyte[12] field;
         bool caught;
         try {
@@ -431,10 +423,36 @@ version(unittest) {
             caught = true;
         }
         caught.shouldBeTrue;
-
-        // Normal value should work
         TarWriter.testWriteOctal(field[], 420);
-        // Verify it wrote something (field[0] should not be null)
         assert(field[0] == '0' || (field[0] >= '1' && field[0] <= '7'));
+    }
+
+    /// File-backed writer round-trip
+    @("tar write: file-backed streaming round-trip")
+    unittest {
+        import std.file : exists, remove;
+
+        auto outPath = "test-data/test-file-writer.tar";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        {
+            auto writer = TarWriter.createToFile(outPath);
+            writer
+                .addBuffer("streamed.txt", cast(const(ubyte)[]) "streamed content")
+                .addDirectory("streamdir");
+            writer.finish();
+        }
+
+        {
+            auto reader = TarReader(outPath);
+            bool found;
+            foreach (entry; reader.entries) {
+                if (entry.pathname == "streamed.txt") {
+                    found = true;
+                    reader.readText().shouldEqual("streamed content");
+                }
+            }
+            found.shouldBeTrue;
+        }
     }
 }

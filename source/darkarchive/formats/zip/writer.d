@@ -10,17 +10,34 @@ import std.conv : octal;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;
 
-/// Writes a ZIP archive to a growing memory buffer.
+/// Writes a ZIP archive to a memory buffer or directly to a file.
 struct ZipWriter {
     private {
+        // Memory mode
         ubyte[] _buf;
+        // File mode
+        import std.stdio : File;
+        File* _file;
+        ulong _filePos;  // track position for central directory offsets
+        // Shared state
         LocalEntryInfo[] _localEntries;
         bool _finished;
     }
 
+    /// Create a memory-backed writer.
     static ZipWriter create() {
         ZipWriter w;
         w._buf = [];
+        w._localEntries = [];
+        w._finished = false;
+        return w;
+    }
+
+    /// Create a file-backed writer (streaming, constant memory).
+    static ZipWriter createToFile(string path) {
+        ZipWriter w;
+        w._file = new File(path, "wb");
+        w._filePos = 0;
         w._localEntries = [];
         w._finished = false;
         return w;
@@ -106,19 +123,26 @@ struct ZipWriter {
         return this;
     }
 
+    /// Close writer (for file mode).
+    void close() {
+        if (!_finished) finish();
+        if (_file !is null)
+            _file.close();
+    }
+
     /// Finalize the archive — write central directory and EOCD.
     void finish() {
         if (_finished) return;
         _finished = true;
 
-        auto centralDirOffset = _buf.length;
+        auto centralDirOffset = cast(ulong) outputPos();
 
         // Write central directory entries
         foreach (ref le; _localEntries) {
             writeCentralDirEntry(le);
         }
 
-        auto centralDirSize = _buf.length - centralDirOffset;
+        auto centralDirSize = outputPos() - centralDirOffset;
         auto entryCount = _localEntries.length;
 
         bool needZip64 = centralDirOffset >= ZIP64_MAGIC_32 ||
@@ -130,6 +154,12 @@ struct ZipWriter {
         }
 
         writeEOCD(entryCount, centralDirSize, centralDirOffset, needZip64);
+
+        // Close file to flush all data to disk
+        if (_file !is null) {
+            _file.close();
+            _file = null;
+        }
     }
 
     /// Get the written archive data. Calls finish() if not already done.
@@ -145,7 +175,7 @@ struct ZipWriter {
                                   const(ubyte)[] compData,
                                   uint permissions, bool isDir,
                                   bool isSymlink = false) {
-        auto localOffset = _buf.length;
+        auto localOffset = outputPos();
 
         ushort flags = ZIP_FLAG_UTF8; // Always write UTF-8 filenames
         auto nameBytes = cast(const(ubyte)[]) name;
@@ -179,12 +209,12 @@ struct ZipWriter {
         appendLE!uint(needZip64 ? ZIP64_MAGIC_32 : cast(uint) uncompSize);
         appendLE!ushort(cast(ushort) nameBytes.length);
         appendLE!ushort(cast(ushort) extra.length);
-        _buf ~= nameBytes;
-        _buf ~= extra;
+        output(nameBytes);
+        output(extra);
 
         // Data
         if (compData !is null && compData.length > 0)
-            _buf ~= compData;
+            output(compData);
 
         // Record for central directory
         _localEntries ~= LocalEntryInfo(
@@ -255,12 +285,12 @@ struct ZipWriter {
         appendLE!ushort(0); // internal attributes
         appendLE!uint(externalAttrs);
         appendLE!uint(needZip64Offset ? ZIP64_MAGIC_32 : cast(uint) le.localOffset);
-        _buf ~= nameBytes;
-        _buf ~= extra;
+        output(nameBytes);
+        output(extra);
     }
 
     private void writeZip64EOCD(ulong entryCount, ulong centralDirSize, ulong centralDirOffset) {
-        auto zip64EOCDOffset = _buf.length;
+        auto zip64EOCDOffset = outputPos();
 
         // ZIP64 End of Central Directory Record
         appendLE!uint(ZIP_ZIP64_EOCD_SIG);
@@ -294,7 +324,25 @@ struct ZipWriter {
     }
 
     private void appendLE(T)(T value) {
-        _buf ~= nativeToLittleEndian!T(value);
+        auto bytes = nativeToLittleEndian!T(value);
+        output(bytes[]);
+    }
+
+    /// Write bytes to output — either memory buffer or file.
+    private void output(const(ubyte)[] bytes) {
+        if (_file !is null) {
+            _file.rawWrite(bytes);
+            _filePos += bytes.length;
+        } else {
+            _buf ~= bytes;
+        }
+    }
+
+    /// Current output position.
+    private ulong outputPos() {
+        if (_file !is null)
+            return _filePos;
+        return _buf.length;
     }
 }
 

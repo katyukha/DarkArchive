@@ -65,6 +65,32 @@ struct ExtractParams {
 // DarkArchiveReader
 // ---------------------------------------------------------------------------
 
+/// Create a TarWriter that pipes output through streaming gzip compressor
+/// directly to a file. No temporary files, constant memory.
+private TarWriter createGzipTarWriter(string outputPath) {
+    import std.stdio : File;
+    import std.zlib : Compress, HeaderFormat;
+
+    auto outFile = new File(outputPath, "wb");
+    auto compressor = new Compress(6, HeaderFormat.gzip);
+
+    return TarWriter.createToSink(
+        // sink: compress and write each chunk
+        (const(ubyte)[] bytes) {
+            auto compressed = cast(ubyte[]) compressor.compress(bytes);
+            if (compressed.length > 0)
+                outFile.rawWrite(compressed);
+        },
+        // finish: flush compressor and close file
+        () {
+            auto tail = cast(ubyte[]) compressor.flush();
+            if (tail.length > 0)
+                outFile.rawWrite(tail);
+            outFile.close();
+        }
+    );
+}
+
 /// Check if a path contains ".." as a path component (not as part of a filename).
 /// "foo/../bar" → true, "file..name.txt" → false, ".." → true
 private bool hasPathTraversal(string path) {
@@ -205,10 +231,12 @@ struct DarkArchiveReader {
     /// Read current entry's data (for zip: by last iterated index).
     ubyte[] readAll() {
         if (_zip !is null) {
+            // ZIP readData may return a const slice — need dup for ownership
             return cast(ubyte[]) _zip.readData(_zipIndex).dup;
         } else {
+            // TAR readData returns owned data from SequentialReader — no dup needed
             auto d = _tar.readData();
-            return d is null ? [] : cast(ubyte[]) d.dup;
+            return d is null ? [] : cast(ubyte[]) d;
         }
     }
 
@@ -258,7 +286,7 @@ struct DarkArchiveReader {
                 return cast(ubyte[]) _parent._zip.readData(_zipIdx).dup;
             } else {
                 auto d = _parent._tar.readData();
-                return d is null ? [] : cast(ubyte[]) d.dup;
+                return d is null ? [] : cast(ubyte[]) d;
             }
         }
 
@@ -656,7 +684,7 @@ struct DarkArchiveWriter {
         ZipWriter* _zip;
         TarWriter* _tar;
         DarkArchiveFormat _format;
-        string _filePath; // null for memory writer
+        string _filePath;     // null for memory writer
         bool _finished;
     }
 
@@ -701,16 +729,37 @@ struct DarkArchiveWriter {
     }
 
     private void createWriter() {
-        final switch (_format) {
-            case DarkArchiveFormat.zip:
-                _zip = new ZipWriter();
-                *_zip = ZipWriter.create();
-                break;
-            case DarkArchiveFormat.tar:
-            case DarkArchiveFormat.tarGz:
-                _tar = new TarWriter();
-                *_tar = TarWriter.create();
-                break;
+        if (_filePath !is null) {
+            // File-backed: stream directly to disk
+            final switch (_format) {
+                case DarkArchiveFormat.zip:
+                    _zip = new ZipWriter();
+                    *_zip = ZipWriter.createToFile(_filePath);
+                    break;
+                case DarkArchiveFormat.tar:
+                    _tar = new TarWriter();
+                    *_tar = TarWriter.createToFile(_filePath);
+                    break;
+                case DarkArchiveFormat.tarGz:
+                    // Pipe tar output through streaming gzip compressor
+                    // directly to the output file. No temp files.
+                    _tar = new TarWriter();
+                    *_tar = createGzipTarWriter(_filePath);
+                    break;
+            }
+        } else {
+            // Memory-backed
+            final switch (_format) {
+                case DarkArchiveFormat.zip:
+                    _zip = new ZipWriter();
+                    *_zip = ZipWriter.create();
+                    break;
+                case DarkArchiveFormat.tar:
+                case DarkArchiveFormat.tarGz:
+                    _tar = new TarWriter();
+                    *_tar = TarWriter.create();
+                    break;
+            }
         }
     }
 
@@ -831,19 +880,20 @@ struct DarkArchiveWriter {
         return this;
     }
 
-    /// Finish and write to file (if file path was given).
+    /// Finish writing the archive.
     void finish() {
         if (_finished) return;
         _finished = true;
 
-        auto data = writtenData();
         if (_filePath !is null) {
-            import std.file : write;
-            write(_filePath, data);
+            if (_zip !is null)
+                _zip.finish();
+            else if (_tar !is null)
+                _tar.finish();
         }
     }
 
-    /// Get the written archive data.
+    /// Get the written archive data (memory mode only).
     const(ubyte)[] writtenData() {
         if (_zip !is null) {
             return _zip.data;
@@ -913,6 +963,7 @@ version(unittest) {
             writer
                 .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
                 .addDirectory("emptydir");
+            writer.finish();
         }
 
         auto reader = DarkArchiveReader(outPath);
@@ -945,6 +996,7 @@ version(unittest) {
             writer
                 .addBuffer("file-a.txt", cast(const(ubyte)[]) "Content A")
                 .addBuffer("file-b.txt", cast(const(ubyte)[]) "Content B");
+            writer.finish();
         }
 
         auto reader = DarkArchiveReader(outPath);
@@ -980,8 +1032,8 @@ version(unittest) {
 
         auto content = cast(const(ubyte)[]) "Cross-format test";
 
-        { DarkArchiveWriter(zipPath).addBuffer("cross.txt", content); }
-        { DarkArchiveWriter(tarPath, DarkArchiveFormat.tarGz).addBuffer("cross.txt", content); }
+        { auto w = DarkArchiveWriter(zipPath); w.addBuffer("cross.txt", content); w.finish(); }
+        { auto w = DarkArchiveWriter(tarPath, DarkArchiveFormat.tarGz); w.addBuffer("cross.txt", content); w.finish(); }
 
         // Read zip
         {
@@ -2499,4 +2551,153 @@ version(unittest) {
         assert(a4 & octal!100, "owner-execute preserved");
         assert(!(a4 & octal!40), "no group-read");
     }
+
+    // -------------------------------------------------------------------
+    // Write path memory tests
+    // -------------------------------------------------------------------
+
+    /// TAR write to file should not accumulate archive in memory
+    @("streaming write: TAR to file does not accumulate memory")
+    unittest {
+        import std.file : exists, remove, getSize;
+        import core.memory : GC;
+
+        auto outPath = Path(testDataDir, "mem-write-test.tar");
+        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+
+        auto chunk = new ubyte[](64 * 1024); // 64KB per entry
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
+            foreach (i; 0 .. 64) {
+                import std.format : format;
+                writer.addBuffer("file_%03d.bin".format(i), chunk);
+            }
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        // 4MB of data written. Memory growth should be << 4MB if streaming.
+        // Currently fails because writer holds full archive in _buf.
+        assert(growth < 2 * 1024 * 1024,
+            "TAR write: memory grew by " ~ formatMemSize(growth)
+            ~ " — writer should stream to file");
+
+        assert(exists(outPath.toString));
+        assert(getSize(outPath.toString) > 4 * 1024 * 1024);
+    }
+
+    /// ZIP write to file should not accumulate archive in memory
+    @("streaming write: ZIP to file does not accumulate memory")
+    unittest {
+        import std.file : exists, remove, getSize;
+        import core.memory : GC;
+
+        auto outPath = Path(testDataDir, "mem-write-test.zip");
+        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+
+        auto chunk = new ubyte[](64 * 1024);
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.zip);
+            foreach (i; 0 .. 64) {
+                import std.format : format;
+                writer.addBuffer("file_%03d.bin".format(i), chunk);
+            }
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        assert(growth < 2 * 1024 * 1024,
+            "ZIP write: memory grew by " ~ formatMemSize(growth)
+            ~ " — writer should stream to file");
+
+        assert(exists(outPath.toString));
+        assert(getSize(outPath.toString) > 0);
+    }
+
+    /// TAR.GZ write to file should not accumulate archive in memory
+    @("streaming write: TAR.GZ to file does not accumulate memory")
+    unittest {
+        import std.file : exists, remove, getSize;
+        import core.memory : GC;
+
+        auto outPath = Path(testDataDir, "mem-write-test.tar.gz");
+        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+
+        auto chunk = new ubyte[](64 * 1024);
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tarGz);
+            foreach (i; 0 .. 64) {
+                import std.format : format;
+                writer.addBuffer("file_%03d.bin".format(i), chunk);
+            }
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        assert(growth < 2 * 1024 * 1024,
+            "TAR.GZ write: memory grew by " ~ formatMemSize(growth)
+            ~ " — writer should stream to file");
+
+        assert(exists(outPath.toString));
+        assert(getSize(outPath.toString) > 0);
+    }
+
+    /// Written streaming archive should be readable and correct
+    @("streaming write: TAR round-trip via streaming write")
+    unittest {
+        import std.file : exists, remove;
+
+        auto outPath = Path(testDataDir, "stream-write-roundtrip.tar");
+        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
+            writer
+                .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello!")
+                .addBuffer("world.txt", cast(const(ubyte)[]) "World!");
+            writer.finish();
+        }
+
+        {
+            auto reader = DarkArchiveReader(outPath);
+            scope(exit) reader.close();
+            int count;
+            foreach (entry; reader.entries) {
+                count++;
+                if (entry.pathname == "hello.txt")
+                    reader.readText().shouldEqual("Hello!");
+                else if (entry.pathname == "world.txt")
+                    reader.readText().shouldEqual("World!");
+            }
+            count.shouldEqual(2);
+        }
+    }
+}
+
+private string formatMemSize(size_t bytes) {
+    import std.format : format;
+    if (bytes < 1024) return "%d B".format(bytes);
+    if (bytes < 1024 * 1024) return "%.1f KB".format(cast(double) bytes / 1024);
+    return "%.1f MB".format(cast(double) bytes / (1024 * 1024));
 }
