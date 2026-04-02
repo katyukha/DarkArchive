@@ -32,20 +32,6 @@ const(ubyte)[] gunzip(const(ubyte)[] data) {
     return result;
 }
 
-/// Check if data starts with gzip magic bytes.
-bool isGzip(const(ubyte)[] data) {
-    return data.length >= 2 && data[0] == 0x1f && data[1] == 0x8b;
-}
-
-/// Check if a file starts with gzip magic bytes (reads only 2 bytes).
-bool isGzipFile(string path) {
-    import std.stdio : File;
-    auto f = File(path, "rb");
-    ubyte[2] magic;
-    auto got = f.rawRead(magic[]);
-    return got.length == 2 && magic[0] == 0x1f && magic[1] == 0x8b;
-}
-
 
 // ===========================================================================
 // Unit tests
@@ -130,17 +116,6 @@ version(unittest) {
                 data.length.shouldEqual(128 * 1024);
             }
         }
-    }
-
-    /// isGzip detection
-    @("gzip: isGzip magic detection")
-    unittest {
-        import std.file : read;
-        auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test.tar.gz");
-        isGzip(gzData).shouldBeTrue;
-
-        auto zipData = cast(const(ubyte)[]) read(testDataDir ~ "/test-zip.zip");
-        isGzip(zipData).shouldEqual(false);
     }
 
     /// Corrupted gzip data must be detected (CRC32 or inflate error)

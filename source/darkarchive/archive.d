@@ -216,24 +216,6 @@ struct DarkArchiveReader {
             _tar.skipData();
     }
 
-    /// Read data as chunks (allocating copies).
-    auto readData() {
-        auto data = readAll();
-        static struct SingleChunkRange {
-            ubyte[] _data;
-            bool _done;
-            bool empty() { return _done; }
-            const(ubyte)[] front() { return _data; }
-            void popFront() { _done = true; }
-        }
-        return SingleChunkRange(data, data.length == 0);
-    }
-
-    /// Zero-copy read (for memory-based readers, same as readData).
-    auto readDataNoCopy() {
-        return readData();
-    }
-
     // -- Entry data reader for processEntries delegate --
 
     /// Provides data access for a matched entry inside processEntries.
