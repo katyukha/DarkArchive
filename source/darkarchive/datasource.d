@@ -5,23 +5,12 @@ module darkarchive.datasource;
 
 import darkarchive.exception : DarkArchiveException;
 
-/// Read-only data source. Backed by either a memory buffer or a file.
+/// Read-only data source backed by a file.
 struct DataSource {
     private {
-        // Memory-backed
-        const(ubyte)[] _memData;
-
-        // File-backed
         import std.stdio : File;
         File* _file;
         ulong _fileSize;
-    }
-
-    /// Create from memory buffer.
-    static DataSource fromMemory(const(ubyte)[] data) {
-        DataSource ds;
-        ds._memData = data;
-        return ds;
     }
 
     /// Create from file path (does not load file into memory).
@@ -44,28 +33,20 @@ struct DataSource {
 
     /// Total size of the data source.
     ulong length() const {
-        if (_file !is null)
-            return _fileSize;
-        return _memData.length;
+        return _fileSize;
     }
 
     /// Read a slice of bytes at the given offset.
-    /// For memory: returns a slice (zero-copy).
-    /// For file: reads into a new buffer.
     const(ubyte)[] readSlice(ulong offset, ulong len) {
         if (offset + len > length)
             throw new DarkArchiveException("DataSource: read past end of data");
 
-        if (_file !is null) {
-            _file.seek(offset);
-            auto buf = new ubyte[](cast(size_t) len);
-            auto got = _file.rawRead(buf);
-            if (got.length != len)
-                throw new DarkArchiveException("DataSource: short read from file");
-            return got;
-        }
-
-        return _memData[cast(size_t) offset .. cast(size_t)(offset + len)];
+        _file.seek(offset);
+        auto buf = new ubyte[](cast(size_t) len);
+        auto got = _file.rawRead(buf);
+        if (got.length != len)
+            throw new DarkArchiveException("DataSource: short read from file");
+        return got;
     }
 
     /// Read a little-endian integer at the given offset.
@@ -85,38 +66,28 @@ struct DataSource {
         auto sigBytes = nativeToLittleEndian(signature);
         auto searchStart = startPos >= maxSearch ? startPos - maxSearch : 0;
 
-        if (_file !is null) {
-            // File-backed: read in chunks from end
-            enum CHUNK = 4096;
-            auto buf = new ubyte[](CHUNK + 4); // overlap for cross-boundary signatures
+        // File-backed: read in chunks from end
+        enum CHUNK = 4096;
+        auto buf = new ubyte[](CHUNK + 4); // overlap for cross-boundary signatures
 
-            for (long pos = cast(long) startPos; pos >= cast(long) searchStart; pos -= CHUNK) {
-                auto readStart = pos >= CHUNK ? pos - CHUNK : 0;
-                auto readLen = cast(size_t)(pos + 4 - readStart);
-                if (readLen > buf.length) readLen = buf.length;
+        for (long pos = cast(long) startPos; pos >= cast(long) searchStart; pos -= CHUNK) {
+            auto readStart = pos >= CHUNK ? pos - CHUNK : 0;
+            auto readLen = cast(size_t)(pos + 4 - readStart);
+            if (readLen > buf.length) readLen = buf.length;
 
-                _file.seek(readStart);
-                auto got = _file.rawRead(buf[0 .. readLen]);
+            _file.seek(readStart);
+            auto got = _file.rawRead(buf[0 .. readLen]);
 
-                // Search backward in this chunk
-                for (long i = cast(long) got.length - 4; i >= 0; i--) {
-                    if (got[i .. i + 4] == sigBytes) {
-                        auto foundOffset = readStart + i;
-                        if (foundOffset <= startPos)
-                            return cast(long) foundOffset;
-                    }
+            // Search backward in this chunk
+            for (long i = cast(long) got.length - 4; i >= 0; i--) {
+                if (got[i .. i + 4] == sigBytes) {
+                    auto foundOffset = readStart + i;
+                    if (foundOffset <= startPos)
+                        return cast(long) foundOffset;
                 }
-
-                if (readStart == 0) break;
             }
-            return -1;
-        }
 
-        // Memory-backed: simple scan
-        for (long i = cast(long) startPos; i >= cast(long) searchStart; i--) {
-            if (i + 4 <= _memData.length &&
-                _memData[cast(size_t) i .. cast(size_t)(i + 4)] == sigBytes)
-                return i;
+            if (readStart == 0) break;
         }
         return -1;
     }
@@ -312,8 +283,12 @@ version(unittest) {
 
     @("datasource: memory-backed read")
     unittest {
-        auto data = cast(const(ubyte)[]) "Hello, World!";
-        auto ds = DataSource.fromMemory(data);
+        import std.file : write, remove;
+        enum path = "test-data/tmp-datasource-read.bin";
+        write(path, "Hello, World!");
+        scope(exit) remove(path);
+        auto ds = DataSource.fromFile(path);
+        scope(exit) ds.close();
         ds.length.shouldEqual(13);
         auto slice = ds.readSlice(7, 6);
         (cast(string) slice).shouldEqual("World!");
@@ -331,17 +306,20 @@ version(unittest) {
 
     @("datasource: readLE")
     unittest {
-        auto data = cast(const(ubyte)[]) [0x50, 0x4B, 0x03, 0x04, 0x00];
-        auto ds = DataSource.fromMemory(data);
+        import std.file : write, remove;
+        enum path = "test-data/tmp-datasource-readle.bin";
+        write(path, cast(const(ubyte)[]) [0x50, 0x4B, 0x03, 0x04, 0x00]);
+        scope(exit) remove(path);
+        auto ds = DataSource.fromFile(path);
+        scope(exit) ds.close();
         ds.readLE!uint(0).shouldEqual(0x04034b50);
     }
 
-    @("datasource: findBackward memory")
+    @("datasource: findBackward file-backed")
     unittest {
         import darkarchive.formats.zip.types : ZIP_END_OF_CENTRAL_DIR_SIG;
-        import std.file : read;
-        auto data = cast(const(ubyte)[]) read("test-data/test-zip.zip");
-        auto ds = DataSource.fromMemory(data);
+        auto ds = DataSource.fromFile("test-data/test-zip.zip");
+        scope(exit) ds.close();
         auto pos = ds.findBackward(ZIP_END_OF_CENTRAL_DIR_SIG,
             ds.length - 4, 22 + 65535);
         assert(pos >= 0, "should find EOCD signature");
@@ -358,9 +336,13 @@ version(unittest) {
 
     @("datasource: out-of-bounds read throws")
     unittest {
+        import std.file : write, remove;
         import darkarchive.exception : DarkArchiveException;
-        auto data = cast(const(ubyte)[]) "short";
-        auto ds = DataSource.fromMemory(data);
+        enum path = "test-data/tmp-datasource-oob.bin";
+        write(path, "short");
+        scope(exit) remove(path);
+        auto ds = DataSource.fromFile(path);
+        scope(exit) ds.close();
         bool caught;
         try {
             ds.readSlice(0, 100);

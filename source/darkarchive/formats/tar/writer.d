@@ -2,7 +2,7 @@
 ///
 /// Creates TAR archives in ustar format with pax extended headers
 /// for UTF-8 pathnames and large sizes.
-/// Supports both memory buffer and file-backed streaming modes.
+/// Supports file-backed and custom sink streaming modes.
 module darkarchive.formats.tar.writer;
 
 import std.conv : octal;
@@ -11,24 +11,14 @@ import std.bitmanip : nativeToLittleEndian;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.tar.types;
 
-/// Writes a TAR archive to a memory buffer, file, or custom sink.
+/// Writes a TAR archive to a file or custom sink.
 struct TarWriter {
     private {
-        // Memory mode
-        ubyte[] _buf;
         // Sink mode (file, gzip compressor, etc.)
         void delegate(const(ubyte)[]) _sink;
         void delegate() _sinkFinish;
         // Shared state
         bool _finished;
-    }
-
-    /// Create a memory-backed writer (for tests, in-memory archives).
-    static TarWriter create() {
-        TarWriter w;
-        w._buf = [];
-        w._finished = false;
-        return w;
     }
 
     /// Create a file-backed writer (streaming, constant memory).
@@ -101,12 +91,6 @@ struct TarWriter {
         output(zeros[]);
         if (_sinkFinish !is null)
             _sinkFinish();
-    }
-
-    /// Get the written archive data (memory mode only).
-    const(ubyte)[] data() {
-        if (!_finished) finish();
-        return _buf;
     }
 
     /// Close writer.
@@ -184,13 +168,11 @@ struct TarWriter {
         }
     }
 
-    /// Write bytes to output — memory buffer or sink.
+    /// Write bytes to output sink.
     private void output(const(ubyte)[] bytes) {
-        if (_sink !is null) {
-            _sink(bytes);
-        } else {
-            _buf ~= bytes;
-        }
+        if (_sink is null)
+            throw new DarkArchiveException("TarWriter: no output target configured");
+        _sink(bytes);
     }
 
     private static void computeChecksum(ref ubyte[TAR_BLOCK_SIZE] header) {
@@ -282,12 +264,17 @@ version(unittest) {
 
     @("tar write: round-trip with addBuffer")
     unittest {
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarw-roundtrip.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
             .addBuffer("sub/nested.txt", cast(const(ubyte)[]) "Nested content");
+        writer.finish();
 
-        auto reader = TarReader(writer.data);
+        auto reader = TarReader(tmpPath);
         bool foundHello, foundNested;
         foreach (entry; reader.entries) {
             if (entry.pathname == "hello.txt") {
@@ -304,9 +291,15 @@ version(unittest) {
 
     @("tar write: addDirectory")
     unittest {
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarw-dir.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addDirectory("mydir");
-        auto reader = TarReader(writer.data);
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries)
             if (entry.pathname == "mydir/")
                 entry.isDir.shouldBeTrue;
@@ -314,9 +307,15 @@ version(unittest) {
 
     @("tar write: addSymlink")
     unittest {
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarw-symlink.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addSymlink("link.txt", "target.txt");
-        auto reader = TarReader(writer.data);
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "link.txt") {
                 entry.isSymlink.shouldBeTrue;
@@ -328,10 +327,16 @@ version(unittest) {
     @("tar write: long UTF-8 pathname via pax extended header")
     unittest {
         import std.array : replicate;
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarw-pax-utf8.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
         auto longName = "深层目录/" ~ "子目录/".replicate(20) ~ "文件.txt";
-        auto writer = TarWriter.create();
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer(longName, cast(const(ubyte)[]) "pax content");
-        auto reader = TarReader(writer.data);
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == longName) {
                 reader.readText().shouldEqual("pax content");
@@ -343,12 +348,18 @@ version(unittest) {
 
     @("tar write: method chaining")
     unittest {
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarw-chaining.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
         writer
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
             .addDirectory("dir");
-        auto reader = TarReader(writer.data);
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(3);
@@ -357,14 +368,34 @@ version(unittest) {
     @("tar.gz write: round-trip via gzipCompress + gunzip")
     unittest {
         import darkarchive.gzip : gunzip;
-        auto writer = TarWriter.create();
+        import std.file : exists, remove, read, write;
+
+        auto tarTmpPath = "test-data/test-tarw-gz-roundtrip.tar";
+        auto gzTmpPath = "test-data/test-tarw-gz-roundtrip.tar.gz";
+        scope(exit) {
+            if (exists(tarTmpPath)) remove(tarTmpPath);
+            if (exists(gzTmpPath)) remove(gzTmpPath);
+        }
+
+        auto writer = TarWriter.createToFile(tarTmpPath);
         writer
             .addBuffer("file-a.txt", cast(const(ubyte)[]) "Content A")
             .addBuffer("file-b.txt", cast(const(ubyte)[]) "Content B");
-        auto gzData = gzipCompress(writer.data);
+        writer.finish();
+
+        auto tarData = cast(const(ubyte)[]) read(tarTmpPath);
+        auto gzData = gzipCompress(tarData);
         assert(gzData.length > 0);
-        auto tarData = gunzip(gzData);
-        auto reader = TarReader(tarData);
+        write(gzTmpPath, gzData);
+
+        // Decompress and read back
+        auto decompressed = gunzip(cast(const(ubyte)[]) read(gzTmpPath));
+        // Write decompressed tar to a file for TarReader
+        auto tarTmpPath2 = "test-data/test-tarw-gz-roundtrip-dec.tar";
+        scope(exit) if (exists(tarTmpPath2)) remove(tarTmpPath2);
+        write(tarTmpPath2, decompressed);
+
+        auto reader = TarReader(tarTmpPath2);
         int count;
         foreach (entry; reader.entries) {
             count++;
@@ -378,9 +409,15 @@ version(unittest) {
 
     @("tar write: single file, verify content")
     unittest {
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarw-single.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "tar file content");
-        auto reader = TarReader(writer.data);
+        writer.finish();
+
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
                 reader.readText().shouldEqual("tar file content");
@@ -392,18 +429,24 @@ version(unittest) {
 
     @("tar interop: written tar.gz readable by system tar")
     unittest {
-        import darkarchive.gzip : gunzip;
-        import std.file : write, remove, exists;
+        import std.file : write, remove, exists, read;
         import std.process : execute;
 
-        auto outPath = "test-data/test-d-to-tar.tar.gz";
-        scope(exit) if (exists(outPath)) remove(outPath);
+        auto tarTmpPath = "test-data/test-tarw-interop.tar";
+        auto outPath = "test-data/test-tarw-interop.tar.gz";
+        scope(exit) {
+            if (exists(tarTmpPath)) remove(tarTmpPath);
+            if (exists(outPath)) remove(outPath);
+        }
 
-        auto writer = TarWriter.create();
+        auto writer = TarWriter.createToFile(tarTmpPath);
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello from D tar!\n")
             .addDirectory("mydir");
-        auto gzData = gzipCompress(writer.data);
+        writer.finish();
+
+        auto tarData = cast(const(ubyte)[]) read(tarTmpPath);
+        auto gzData = gzipCompress(tarData);
         write(outPath, gzData);
 
         auto result = execute(["tar", "tzf", outPath]);

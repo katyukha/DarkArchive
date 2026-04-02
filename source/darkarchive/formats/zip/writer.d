@@ -10,27 +10,15 @@ import std.conv : octal;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;
 
-/// Writes a ZIP archive to a memory buffer or directly to a file.
+/// Writes a ZIP archive directly to a file.
 struct ZipWriter {
     private {
-        // Memory mode
-        ubyte[] _buf;
-        // File mode
         import std.stdio : File;
         File* _file;
         ulong _filePos;  // track position for central directory offsets
         // Shared state
         LocalEntryInfo[] _localEntries;
         bool _finished;
-    }
-
-    /// Create a memory-backed writer.
-    static ZipWriter create() {
-        ZipWriter w;
-        w._buf = [];
-        w._localEntries = [];
-        w._finished = false;
-        return w;
     }
 
     /// Create a file-backed writer (streaming, constant memory).
@@ -160,12 +148,6 @@ struct ZipWriter {
             _file.close();
             _file = null;
         }
-    }
-
-    /// Get the written archive data. Calls finish() if not already done.
-    const(ubyte)[] data() {
-        if (!_finished) finish();
-        return _buf;
     }
 
     // -- Private implementation --
@@ -328,21 +310,19 @@ struct ZipWriter {
         output(bytes[]);
     }
 
-    /// Write bytes to output — either memory buffer or file.
+    /// Write bytes to output file.
     private void output(const(ubyte)[] bytes) {
-        if (_file !is null) {
-            _file.rawWrite(bytes);
-            _filePos += bytes.length;
-        } else {
-            _buf ~= bytes;
-        }
+        if (_file is null)
+            throw new DarkArchiveException("ZIP: no output file — use createToFile()");
+        _file.rawWrite(bytes);
+        _filePos += bytes.length;
     }
 
     /// Current output position.
     private ulong outputPos() {
-        if (_file !is null)
-            return _filePos;
-        return _buf.length;
+        if (_file is null)
+            throw new DarkArchiveException("ZIP: no output file — use createToFile()");
+        return _filePos;
     }
 }
 
@@ -415,14 +395,19 @@ version(unittest) {
     /// Write zip round-trip with addBuffer + addDirectory
     @("zip write: round-trip with addBuffer + addDirectory")
     unittest {
-        auto writer = ZipWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-zip-wrt-roundtrip.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
             .addBuffer("data/nested.txt", cast(const(ubyte)[]) "Nested content")
             .addDirectory("emptydir");
+        writer.finish();
 
-        auto zipData = writer.data;
-        auto reader = ZipReader(zipData);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
 
         bool foundHello, foundNested, foundDir;
         size_t i;
@@ -447,14 +432,20 @@ version(unittest) {
     /// Streaming write with addStream
     @("zip write: addStream streaming round-trip")
     unittest {
-        auto writer = ZipWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-zip-wrt-stream.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer.addStream("streamed.txt", (scope sink) {
             sink(cast(const(ubyte)[]) "Streamed content ");
             sink(cast(const(ubyte)[]) "chunk1");
             sink(cast(const(ubyte)[]) "chunk2");
         });
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         size_t i;
         foreach (entry; reader.entries) {
             if (entry.pathname == "streamed.txt")
@@ -466,27 +457,39 @@ version(unittest) {
     /// Method chaining
     @("zip write: method chaining")
     unittest {
-        auto writer = ZipWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-zip-wrt-chaining.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
             .addBuffer("c.txt", cast(const(ubyte)[]) "C");
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(3);
     }
 
     /// Large entry — 32KB data
     @("zip write: large entry multi-chunk")
     unittest {
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-zip-wrt-large.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
         auto largeData = new ubyte[](32768);
         foreach (i, ref b; largeData)
             b = cast(ubyte)(i % 256);
 
-        auto writer = ZipWriter.create();
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer.addBuffer("large.bin", largeData);
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         size_t i;
         foreach (entry; reader.entries) {
             if (entry.pathname == "large.bin") {
@@ -501,12 +504,18 @@ version(unittest) {
     /// Entry properties
     @("zip write: entry properties (isFile, isDir, size)")
     unittest {
-        auto writer = ZipWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-zip-wrt-props.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer
             .addBuffer("file.txt", cast(const(ubyte)[]) "content")
             .addDirectory("mydir");
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "file.txt") {
                 entry.isFile.shouldBeTrue;
@@ -523,13 +532,18 @@ version(unittest) {
     @("zip write: UTF-8 filenames round-trip")
     unittest {
         import std.algorithm : canFind;
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-zip-wrt-utf8.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
-        auto writer = ZipWriter.create();
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer
             .addBuffer("café.txt", cast(const(ubyte)[]) "coffee")
             .addBuffer("日本語.txt", cast(const(ubyte)[]) "japanese");
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         string[] names;
         foreach (entry; reader.entries)
             names ~= entry.pathname;
@@ -541,20 +555,17 @@ version(unittest) {
     /// Written ZIP is readable by ZipReader from file
     @("zip write: write to file, read back")
     unittest {
-        import std.file : write, remove, exists;
+        import std.file : exists, remove;
 
-        auto outPath = "test-data/test-writer-roundtrip.zip";
+        auto tmpPath = "test-data/test-zip-wrt-file-readback.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
-        auto writer = ZipWriter.create();
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "file content");
+        writer.finish();
 
-        write(outPath, writer.data);
-
-        auto reader = ZipReader(outPath);
-        scope(exit) {
-            reader.close();
-            if (exists(outPath)) remove(outPath);
-        }
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
 
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("file content");
@@ -567,19 +578,18 @@ version(unittest) {
     /// Written ZIP is readable by Python's zipfile
     @("zip interop: written ZIP readable by Python")
     unittest {
-        import std.file : write, remove, exists;
+        import std.file : exists, remove;
         import std.process : execute;
 
-        auto outPath = "test-data/test-d-to-python.zip";
+        auto outPath = "test-data/test-zip-wrt-python-interop.zip";
         scope(exit) if (exists(outPath)) remove(outPath);
 
-        auto writer = ZipWriter.create();
+        auto writer = ZipWriter.createToFile(outPath);
         writer
             .addBuffer("greeting.txt", cast(const(ubyte)[]) "Hello from D!\n")
             .addBuffer("data/info.txt", cast(const(ubyte)[]) "D archive\n")
             .addDirectory("emptydir");
-
-        write(outPath, writer.data);
+        writer.finish();
 
         // Verify with Python
         auto result = execute(["python3", "-c", `
@@ -605,10 +615,14 @@ except Exception as e:
     unittest {
         import darkarchive.exception : DarkArchiveException;
         import std.array : replicate;
+        import std.file : exists, remove;
+
+        auto tmpPath = "test-data/test-zip-wrt-longname.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
         auto longName = "a".replicate(65536); // one byte over ushort.max
 
-        auto writer = ZipWriter.create();
+        auto writer = ZipWriter.createToFile(tmpPath);
         bool caught;
         try {
             writer.addBuffer(longName, cast(const(ubyte)[]) "x");
@@ -621,13 +635,17 @@ except Exception as e:
     /// ZIP symlink round-trip: write symlink, read back
     @("zip write: symlink round-trip")
     unittest {
-        import darkarchive.formats.zip.reader : ZipReader;
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-zip-wrt-symlink.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
-        auto writer = ZipWriter.create();
+        auto writer = ZipWriter.createToFile(tmpPath);
         writer.addBuffer("target.txt", cast(const(ubyte)[]) "target content");
         writer.addSymlink("link.txt", "target.txt");
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(2);
 
         bool foundTarget, foundLink;

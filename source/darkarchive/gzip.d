@@ -70,10 +70,14 @@ version(unittest) {
     /// Read tar.gz — decompress then parse tar
     @("gzip+tar read: tar.gz iterate and verify")
     unittest {
-        import std.file : read;
+        import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test.tar.gz");
         auto tarData = gunzip(gzData);
-        auto reader = TarReader(tarData);
+        // Write decompressed tar to temp file for TarReader
+        auto tmpPath = "test-data/test-gzip-tar-iterate.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, tarData);
+        auto reader = TarReader(tmpPath);
 
         string[] names;
         foreach (entry; reader.entries) {
@@ -91,10 +95,14 @@ version(unittest) {
     /// Empty tar.gz — zero entries
     @("gzip+tar read: empty archive, zero entries")
     unittest {
-        import std.file : read;
+        import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-empty.tar.gz");
         auto tarData = gunzip(gzData);
-        auto reader = TarReader(tarData);
+        // Write decompressed tar to temp file for TarReader
+        auto tmpPath = "test-data/test-gzip-empty-archive.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, tarData);
+        auto reader = TarReader(tmpPath);
 
         int count;
         foreach (entry; reader.entries) {
@@ -106,10 +114,14 @@ version(unittest) {
     /// Large entry from external tar.gz (128KB)
     @("gzip+tar read: 128KB file, multi-chunk")
     unittest {
-        import std.file : read;
+        import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-large-entry.tar.gz");
         auto tarData = gunzip(gzData);
-        auto reader = TarReader(tarData);
+        // Write decompressed tar to temp file for TarReader
+        auto tmpPath = "test-data/test-gzip-large-entry.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, tarData);
+        auto reader = TarReader(tmpPath);
 
         foreach (entry; reader.entries) {
             if (entry.pathname == "large-128k.bin") {
@@ -202,18 +214,22 @@ version(unittest) {
         import darkarchive.formats.tar.writer : TarWriter, gzipCompress;
         import darkarchive.datasource : GzipSequentialReader;
         import core.memory : GC;
+        import std.file : write, read, remove, exists;
 
-        // Create tar.gz with many entries totaling ~1MB
-        auto tw = TarWriter.create();
+        // Create tar with many entries totaling ~1MB via temp file
+        auto tarTmpPath = "test-data/test-mem-consistency-inner.tar";
+        scope(exit) if (exists(tarTmpPath)) remove(tarTmpPath);
+        auto tw = TarWriter.createToFile(tarTmpPath);
         auto chunk = new ubyte[](4096); // 4KB per entry
         foreach (i; 0 .. 256) { // 256 * 4KB = 1MB total
             import std.format : format;
             tw.addBuffer("entry_%04d.bin".format(i), chunk);
         }
-        auto gzData = gzipCompress(tw.data);
+        tw.finish();
+        auto tarBytes = cast(const(ubyte)[]) read(tarTmpPath);
+        auto gzData = gzipCompress(tarBytes);
 
-        // Write to temp file
-        import std.file : write, remove, exists;
+        // Write gzip to temp file
         auto tmpPath = "test-data/test-mem-consistency.tar.gz";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, gzData);

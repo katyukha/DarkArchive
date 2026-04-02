@@ -26,13 +26,6 @@ struct TarReader {
 
     @disable this();
 
-    /// Open TAR from a byte buffer.
-    this(const(ubyte)[] data) {
-        auto ds = new DataSource();
-        *ds = DataSource.fromMemory(data);
-        _stream = new DataSourceSequentialReader(ds);
-    }
-
     /// Open TAR from a file path (does not load full file into memory).
     this(string path) {
         auto ds = new DataSource();
@@ -486,10 +479,14 @@ version(unittest) {
 
     @("tar security: non-tar data does not crash")
     unittest {
+        import std.file : exists, remove, write;
+        auto tmpPath = "test-data/test-tarr-garbage.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto garbage = cast(const(ubyte)[]) "this is not a tar file";
         auto padded = new ubyte[](1024);
         padded[0 .. garbage.length] = garbage[];
-        auto reader = TarReader(padded);
+        write(tmpPath, padded);
+        auto reader = TarReader(tmpPath);
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(0);
@@ -498,11 +495,18 @@ version(unittest) {
     @("tar security: truncated archive does not crash")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
-        auto writer = TarWriter.create();
+        import std.file : exists, remove, read, write;
+        auto tmpPath = "test-data/test-tarr-trunc-src.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "some content here");
-        auto fullData = writer.data;
+        writer.finish();
+        auto fullData = cast(ubyte[]) read(tmpPath);
         auto truncated = fullData[0 .. 512 + 5];
-        auto reader = TarReader(truncated);
+        auto corruptPath = "test-data/test-tarr-trunc.tar";
+        scope(exit) if (exists(corruptPath)) remove(corruptPath);
+        write(corruptPath, truncated);
+        auto reader = TarReader(corruptPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
                 bool caught;
@@ -538,9 +542,13 @@ version(unittest) {
 
     @("tar security: garbage header rejected by checksum")
     unittest {
+        import std.file : exists, remove, write;
+        auto tmpPath = "test-data/test-tarr-badchecksum.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
         ubyte[512] header;
         foreach (i, ref b; header) b = cast(ubyte)((i * 37 + 13) & 0xFF);
-        auto reader = TarReader(header[]);
+        write(tmpPath, header[]);
+        auto reader = TarReader(tmpPath);
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(0);
@@ -553,11 +561,15 @@ version(unittest) {
     @("tar format: data size exactly 512 bytes, no padding")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarr-exact512.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto data = new ubyte[](512);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
-        auto writer = TarWriter.create();
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("exact512.bin", data);
-        auto reader = TarReader(writer.data);
+        writer.finish();
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "exact512.bin") {
                 entry.size.shouldEqual(512);
@@ -572,11 +584,15 @@ version(unittest) {
     @("tar format: data size 513 bytes, needs 511 padding")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarr-over512.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto data = new ubyte[](513);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
-        auto writer = TarWriter.create();
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("over512.bin", data);
-        auto reader = TarReader(writer.data);
+        writer.finish();
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "over512.bin") {
                 entry.size.shouldEqual(513);
@@ -590,9 +606,13 @@ version(unittest) {
     @("tar format: single byte entry")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarr-onebyte.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("one.bin", [cast(ubyte) 0x42]);
-        auto reader = TarReader(writer.data);
+        writer.finish();
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "one.bin") {
                 entry.size.shouldEqual(1);
@@ -614,9 +634,13 @@ version(unittest) {
     @("tar format: empty filename does not crash")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarr-emptyname.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("", cast(const(ubyte)[]) "no name");
-        auto reader = TarReader(writer.data);
+        writer.finish();
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries)
             assert(entry.pathname !is null);
     }
@@ -634,9 +658,13 @@ version(unittest) {
     @("tar security: huge size field does not OOB")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
-        auto writer = TarWriter.create();
+        import std.file : exists, remove, read, write;
+        auto tmpPath = "test-data/test-tarr-hugesize-src.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("small.txt", cast(const(ubyte)[]) "tiny");
-        auto data = writer.data.dup;
+        writer.finish();
+        auto data = cast(ubyte[]) read(tmpPath);
         data[124 .. 136] = cast(ubyte[12]) "77777777777\0";
         uint sum = 0;
         foreach (i; 0 .. 512) {
@@ -646,7 +674,10 @@ version(unittest) {
         import std.format : format;
         auto checksumStr = format!"%06o\0 "(sum);
         data[148 .. 156] = cast(ubyte[8]) checksumStr[0 .. 8];
-        auto reader = TarReader(cast(const(ubyte)[]) data);
+        auto corruptPath = "test-data/test-tarr-hugesize.tar";
+        scope(exit) if (exists(corruptPath)) remove(corruptPath);
+        write(corruptPath, data);
+        auto reader = TarReader(corruptPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "small.txt") {
                 bool caught;
@@ -659,9 +690,13 @@ version(unittest) {
     @("tar security: entry with zero size does not crash readData")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
-        auto writer = TarWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = "test-data/test-tarr-zerosize.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = TarWriter.createToFile(tmpPath);
         writer.addBuffer("zero.txt", cast(const(ubyte)[]) "");
-        auto reader = TarReader(writer.data);
+        writer.finish();
+        auto reader = TarReader(tmpPath);
         foreach (entry; reader.entries) {
             if (entry.pathname == "zero.txt") {
                 auto d = reader.readData();
@@ -673,16 +708,23 @@ version(unittest) {
     @("tar security: corrupted header mid-archive throws")
     unittest {
         import darkarchive.formats.tar.writer : TarWriter;
-        auto writer = TarWriter.create();
+        import std.file : exists, remove, read, write;
+        auto tmpPath = "test-data/test-tarr-corrupt-src.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = TarWriter.createToFile(tmpPath);
         writer
             .addBuffer("file1.txt", cast(const(ubyte)[]) "content 1")
             .addBuffer("file2.txt", cast(const(ubyte)[]) "content 2");
-        auto data = writer.data.dup;
+        writer.finish();
+        auto data = cast(ubyte[]) read(tmpPath);
         if (data.length > 1024 + 156) {
             data[1024 + 148] = 0xFF;
             data[1024 + 149] = 0xFF;
         }
-        auto reader = TarReader(cast(const(ubyte)[]) data);
+        auto corruptPath = "test-data/test-tarr-corrupt-mid.tar";
+        scope(exit) if (exists(corruptPath)) remove(corruptPath);
+        write(corruptPath, data);
+        auto reader = TarReader(corruptPath);
         int count;
         foreach (entry; reader.entries) count++;
         // First entry is intact, second has corrupted checksum → iteration
