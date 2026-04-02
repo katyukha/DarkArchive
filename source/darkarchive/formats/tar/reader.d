@@ -80,14 +80,15 @@ struct TarReader {
         if (_dataConsumed)
             return; // already read or skipped
 
-        // Read from stream in chunks
+        // Single allocation, reused for all chunks — avoids GC pressure
+        auto buf = new ubyte[](chunkSize);
         size_t remaining = _currentDataSize;
         while (remaining > 0) {
             auto toRead = remaining > chunkSize ? chunkSize : remaining;
             try {
-                auto chunk = _stream.read(toRead);
-                sink(chunk);
-                remaining -= chunk.length;
+                _stream.readInto(buf[0 .. toRead]);
+                sink(buf[0 .. toRead]);
+                remaining -= toRead;
             } catch (DarkArchiveException) {
                 break;
             }

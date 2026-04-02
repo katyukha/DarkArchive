@@ -715,11 +715,20 @@ struct DarkArchiveWriter {
 
     /// ditto
     ref DarkArchiveWriter add(string sourcePath, string archiveName = null) return {
-        import std.file : read;
+        import std.file : getSize;
+        import std.stdio : File;
         if (archiveName is null)
             archiveName = Path(sourcePath).baseName;
-        auto data = cast(const(ubyte)[]) read(sourcePath);
-        addBuffer(archiveName, data);
+        auto fileSize = getSize(sourcePath);
+        auto f = File(sourcePath, "rb");
+        addStream(archiveName, (scope sink) {
+            ubyte[8192] buf;
+            while (true) {
+                auto got = f.rawRead(buf[]);
+                if (got.length == 0) break;
+                sink(got);
+            }
+        }, fileSize);
         return this;
     }
 
@@ -2923,6 +2932,344 @@ version(unittest) {
             }
             count.shouldEqual(2);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Streaming memory tests — verify constant memory on all layers
+    // -------------------------------------------------------------------
+
+    /// addStream with known size must NOT buffer the full entry in memory.
+    /// TAR format: header needs size upfront — with known size we can write
+    /// header then stream data directly without buffering.
+    @("streaming: TAR addStream with known size does not buffer full entry")
+    unittest {
+        import std.file : exists, remove, getSize;
+        import core.memory : GC;
+
+        auto outPath = "test-data/mem-addstream-tar.tar";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        enum ENTRY_SIZE = 4 * 1024 * 1024; // 4MB entry
+        auto chunk = new ubyte[](8192);
+        foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
+            writer.addStream("large.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE);
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        assert(growth < 2 * 1024 * 1024,
+            "TAR addStream(known size): memory grew by " ~ formatMemSize(growth)
+            ~ " — should stream without buffering");
+        assert(getSize(outPath) > ENTRY_SIZE);
+    }
+
+    /// addStream with known size must NOT buffer the full entry — ZIP format.
+    /// ZIP can use data descriptors (bit 3) to defer CRC32/sizes after data,
+    /// enabling true streaming with incremental CRC32 + deflate.
+    @("streaming: ZIP addStream with known size does not buffer full entry")
+    unittest {
+        import std.file : exists, remove, getSize;
+        import core.memory : GC;
+
+        auto outPath = "test-data/mem-addstream-zip.zip";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        enum ENTRY_SIZE = 4 * 1024 * 1024; // 4MB entry
+        auto chunk = new ubyte[](8192);
+        foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.zip);
+            writer.addStream("large.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE);
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        assert(growth < 2 * 1024 * 1024,
+            "ZIP addStream(known size): memory grew by " ~ formatMemSize(growth)
+            ~ " — should stream without buffering");
+        assert(getSize(outPath) > 0);
+    }
+
+    /// add() from disk must NOT read the entire file into memory.
+    /// Should stream file chunks to the archive writer.
+    @("streaming: add() from disk does not load full file into memory")
+    unittest {
+        import std.file : exists, remove, getSize;
+        import std.stdio : File;
+        import core.memory : GC;
+
+        // Create a 4MB source file
+        auto srcPath = "test-data/mem-add-source.bin";
+        auto outPath = "test-data/mem-add-output.tar";
+        scope(exit) {
+            if (exists(srcPath)) remove(srcPath);
+            if (exists(outPath)) remove(outPath);
+        }
+
+        {
+            auto f = File(srcPath, "wb");
+            auto chunk = new ubyte[](8192);
+            foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
+            foreach (_; 0 .. 512) // 512 * 8KB = 4MB
+                f.rawWrite(chunk);
+        }
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
+            writer.add(srcPath, "large.bin");
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        assert(growth < 2 * 1024 * 1024,
+            "add() from disk: memory grew by " ~ formatMemSize(growth)
+            ~ " — should stream file without loading into memory");
+        assert(getSize(outPath) > 4 * 1024 * 1024);
+    }
+
+    /// Full pipeline: write large entry then read it back chunked.
+    /// Total memory must stay bounded throughout — no single point
+    /// buffers the full 4MB entry.
+    @("streaming: full write+read pipeline stays constant memory (TAR)")
+    unittest {
+        import std.file : exists, remove;
+        import core.memory : GC;
+
+        auto outPath = "test-data/mem-pipeline-tar.tar";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        enum ENTRY_SIZE = 4 * 1024 * 1024;
+        auto chunk = new ubyte[](8192);
+        foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
+
+        // Write
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
+            writer.addStream("pipeline.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE);
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        // Read back chunked
+        size_t totalRead;
+        {
+            auto reader = DarkArchiveReader(outPath);
+            scope(exit) reader.close();
+            reader.processEntries(["pipeline.bin"],
+                (const ref entry, scope dataReader) {
+                    dataReader.readChunks((const(ubyte)[] c) {
+                        totalRead += c.length;
+                    });
+                });
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        totalRead.shouldEqual(ENTRY_SIZE);
+        assert(growth < 2 * 1024 * 1024,
+            "read pipeline: memory grew by " ~ formatMemSize(growth)
+            ~ " — chunked read should not buffer full entry");
+    }
+
+    /// Full pipeline for ZIP: write+read large entry with constant memory
+    @("streaming: full write+read pipeline stays constant memory (ZIP)")
+    unittest {
+        import std.file : exists, remove;
+        import core.memory : GC;
+
+        auto outPath = "test-data/mem-pipeline-zip.zip";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        enum ENTRY_SIZE = 4 * 1024 * 1024;
+        auto chunk = new ubyte[](8192);
+        foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
+
+        // Write
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.zip);
+            writer.addStream("pipeline.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE);
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        // Read back chunked
+        size_t totalRead;
+        {
+            auto reader = DarkArchiveReader(outPath);
+            scope(exit) reader.close();
+            reader.processEntries(["pipeline.bin"],
+                (const ref entry, scope dataReader) {
+                    dataReader.readChunks((const(ubyte)[] c) {
+                        totalRead += c.length;
+                    });
+                });
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        totalRead.shouldEqual(ENTRY_SIZE);
+        assert(growth < 2 * 1024 * 1024,
+            "ZIP read pipeline: memory grew by " ~ formatMemSize(growth)
+            ~ " — chunked read should not buffer full entry");
+    }
+
+    /// Full pipeline for TAR.GZ: write+read large entry with constant memory
+    @("streaming: full write+read pipeline stays constant memory (TAR.GZ)")
+    unittest {
+        import std.file : exists, remove;
+        import core.memory : GC;
+
+        auto outPath = "test-data/mem-pipeline-targz.tar.gz";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        enum ENTRY_SIZE = 4 * 1024 * 1024;
+        auto chunk = new ubyte[](8192);
+        foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
+
+        // Write
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tarGz);
+            writer.addStream("pipeline.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE);
+            writer.finish();
+        }
+
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        // Read back chunked
+        size_t totalRead;
+        {
+            auto reader = DarkArchiveReader(outPath);
+            scope(exit) reader.close();
+            reader.processEntries(["pipeline.bin"],
+                (const ref entry, scope dataReader) {
+                    dataReader.readChunks((const(ubyte)[] c) {
+                        totalRead += c.length;
+                    });
+                });
+        }
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+
+        totalRead.shouldEqual(ENTRY_SIZE);
+        assert(growth < 2 * 1024 * 1024,
+            "TAR.GZ read pipeline: memory grew by " ~ formatMemSize(growth)
+            ~ " — chunked read should not buffer full entry");
+    }
+
+    /// addStream round-trip: data written via streaming must be readable and correct
+    @("streaming: addStream round-trip data integrity (TAR)")
+    unittest {
+        import std.file : exists, remove;
+
+        auto outPath = "test-data/stream-roundtrip-tar.tar";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        enum ENTRY_SIZE = 32768; // 32KB — small enough to verify content
+        auto sourceData = new ubyte[](ENTRY_SIZE);
+        foreach (i, ref b; sourceData) b = cast(ubyte)(i & 0xFF);
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
+            writer.addStream("data.bin", (scope sink) {
+                // Send in 4KB chunks
+                foreach (off; 0 .. ENTRY_SIZE / 4096)
+                    sink(sourceData[off * 4096 .. (off + 1) * 4096]);
+            }, ENTRY_SIZE);
+            writer.finish();
+        }
+
+        // Read back and verify
+        auto reader = DarkArchiveReader(outPath);
+        scope(exit) reader.close();
+        ubyte[] readBack;
+        reader.processEntries(["data.bin"],
+            (const ref entry, scope dataReader) {
+                readBack = dataReader.readAll();
+            });
+
+        readBack.length.shouldEqual(ENTRY_SIZE);
+        readBack.shouldEqual(sourceData);
+    }
+
+    /// addStream round-trip data integrity for ZIP
+    @("streaming: addStream round-trip data integrity (ZIP)")
+    unittest {
+        import std.file : exists, remove;
+
+        auto outPath = "test-data/stream-roundtrip-zip.zip";
+        scope(exit) if (exists(outPath)) remove(outPath);
+
+        enum ENTRY_SIZE = 32768;
+        auto sourceData = new ubyte[](ENTRY_SIZE);
+        foreach (i, ref b; sourceData) b = cast(ubyte)(i & 0xFF);
+
+        {
+            auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.zip);
+            writer.addStream("data.bin", (scope sink) {
+                foreach (off; 0 .. ENTRY_SIZE / 4096)
+                    sink(sourceData[off * 4096 .. (off + 1) * 4096]);
+            }, ENTRY_SIZE);
+            writer.finish();
+        }
+
+        auto reader = DarkArchiveReader(outPath);
+        scope(exit) reader.close();
+        ubyte[] readBack;
+        reader.processEntries(["data.bin"],
+            (const ref entry, scope dataReader) {
+                readBack = dataReader.readAll();
+            });
+
+        readBack.length.shouldEqual(ENTRY_SIZE);
+        readBack.shouldEqual(sourceData);
     }
 }
 

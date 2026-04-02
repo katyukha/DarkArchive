@@ -91,24 +91,108 @@ struct ZipWriter {
         return this;
     }
 
-    /// Add from a streaming source. Uses data descriptors since size is unknown upfront.
+    /// Add from a streaming source. Streams data directly to the archive
+    /// using incremental CRC32 + deflate + ZIP data descriptors (bit 3).
+    /// Constant memory usage regardless of entry size.
     ref ZipWriter addStream(string archiveName,
                               scope void delegate(scope void delegate(const(ubyte)[])) reader,
                               long size = -1,
                               uint permissions = octal!644) return {
-        import std.digest.crc : CRC32;
-        import std.array : appender;
-
-        // Collect all data (we need CRC32 and sizes for the data descriptor)
-        auto uncompBuf = appender!(ubyte[])();
-        reader((const(ubyte)[] chunk) {
-            uncompBuf ~= chunk;
-        });
-        auto uncompData = uncompBuf[];
-
-        // Now treat it like addBuffer
-        addBuffer(archiveName, uncompData, permissions);
+        writeStreamingEntry(archiveName, reader, permissions);
         return this;
+    }
+
+    private void writeStreamingEntry(string archiveName,
+                                      scope void delegate(scope void delegate(const(ubyte)[])) reader,
+                                      uint permissions) {
+        import etc.c.zlib;
+        import std.digest.crc : CRC32;
+
+        auto localOffset = outputPos();
+        ushort flags = ZIP_FLAG_UTF8 | ZIP_FLAG_DATA_DESCRIPTOR;
+        auto nameBytes = cast(const(ubyte)[]) archiveName;
+
+        if (nameBytes.length > ushort.max)
+            throw new DarkArchiveException("ZIP: filename too long (max 65535 bytes)");
+
+        // Write local file header with zeros for CRC/sizes (data descriptor follows)
+        appendLE!uint(ZIP_LOCAL_FILE_HEADER_SIG);
+        appendLE!ushort(ZIP_VERSION_NEEDED_DEFAULT);
+        appendLE!ushort(flags);
+        appendLE!ushort(ZIP_METHOD_DEFLATE);
+        appendLE!ushort(0); // mod time
+        appendLE!ushort(0); // mod date
+        appendLE!uint(0);   // CRC32 — filled in data descriptor
+        appendLE!uint(0);   // compressed size — filled in data descriptor
+        appendLE!uint(0);   // uncompressed size — filled in data descriptor
+        appendLE!ushort(cast(ushort) nameBytes.length);
+        appendLE!ushort(0); // extra field length
+        output(nameBytes);
+
+        // Set up incremental deflate + CRC32
+        z_stream zs;
+        auto ret = deflateInit2(&zs, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+        if (ret != Z_OK)
+            throw new DarkArchiveException("ZIP: deflateInit2 failed");
+
+        CRC32 crc;
+        ulong uncompressedSize;
+        auto compStart = outputPos();
+        ubyte[8192] outBuf;
+
+        // Flush compressed output helper
+        void flushDeflate(int flush) {
+            while (true) {
+                zs.next_out = outBuf.ptr;
+                zs.avail_out = cast(uint) outBuf.length;
+                ret = deflate(&zs, flush);
+                auto produced = outBuf.length - zs.avail_out;
+                if (produced > 0)
+                    output(outBuf[0 .. produced]);
+                if (ret == Z_STREAM_END || zs.avail_out > 0)
+                    break;
+                if (ret != Z_OK && ret != Z_BUF_ERROR)
+                    throw new DarkArchiveException("ZIP: deflate failed");
+            }
+        }
+
+        // Stream data: compute CRC32 + deflate incrementally
+        reader((const(ubyte)[] chunk) {
+            crc.put(chunk);
+            uncompressedSize += chunk.length;
+
+            zs.next_in = cast(ubyte*) chunk.ptr;
+            zs.avail_in = cast(uint) chunk.length;
+            flushDeflate(Z_NO_FLUSH);
+        });
+
+        // Finish deflate
+        zs.next_in = null;
+        zs.avail_in = 0;
+        flushDeflate(Z_FINISH);
+        deflateEnd(&zs);
+
+        auto compressedSize = outputPos() - compStart;
+
+        auto crcDigest = crc.finish();
+        uint crcVal = (cast(uint) crcDigest[0])
+                    | (cast(uint) crcDigest[1] << 8)
+                    | (cast(uint) crcDigest[2] << 16)
+                    | (cast(uint) crcDigest[3] << 24);
+
+        // Write data descriptor (with signature)
+        appendLE!uint(ZIP_DATA_DESCRIPTOR_SIG);
+        appendLE!uint(crcVal);
+        appendLE!uint(cast(uint) compressedSize);
+        appendLE!uint(cast(uint) uncompressedSize);
+
+        // Record for central directory
+        _localEntries ~= LocalEntryInfo(
+            archiveName, ZIP_METHOD_DEFLATE, crcVal,
+            compressedSize, uncompressedSize,
+            localOffset, flags, ZIP_VERSION_NEEDED_DEFAULT,
+            permissions, false, false, []
+        );
     }
 
     /// Close writer (for file mode).

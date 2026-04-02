@@ -72,14 +72,41 @@ struct TarWriter {
     }
 
     /// Add from a streaming source.
+    /// When size is known (>= 0), data is streamed directly to the archive
+    /// without buffering — constant memory usage for any entry size.
+    /// When size is unknown (-1), data must be buffered first because the
+    /// TAR header requires the size before data.
     ref TarWriter addStream(string archiveName,
                               scope void delegate(scope void delegate(const(ubyte)[])) reader,
                               long size = -1,
                               uint permissions = octal!644) return {
-        import std.array : appender;
-        auto buf = appender!(ubyte[])();
-        reader((const(ubyte)[] chunk) { buf ~= chunk; });
-        addBuffer(archiveName, buf[], permissions);
+        if (size >= 0) {
+            // Known size: write header, then stream data directly
+            auto usize = cast(ulong) size;
+            auto paxHandlesSize = writePaxIfNeeded(archiveName, usize);
+            writeHeader(archiveName, '0',
+                paxHandlesSize ? 0 : usize, permissions, null);
+
+            // Stream data chunks directly to output
+            size_t totalWritten;
+            reader((const(ubyte)[] chunk) {
+                output(chunk);
+                totalWritten += chunk.length;
+            });
+
+            // Pad to 512-byte boundary
+            auto remainder = totalWritten % TAR_BLOCK_SIZE;
+            if (remainder > 0) {
+                ubyte[TAR_BLOCK_SIZE] padding = 0;
+                output(padding[0 .. TAR_BLOCK_SIZE - remainder]);
+            }
+        } else {
+            // Unknown size: must buffer to determine size for header
+            import std.array : appender;
+            auto buf = appender!(ubyte[])();
+            reader((const(ubyte)[] chunk) { buf ~= chunk; });
+            addBuffer(archiveName, buf[], permissions);
+        }
         return this;
     }
 
