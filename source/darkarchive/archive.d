@@ -27,14 +27,14 @@ enum DarkArchiveFormat {
 
 /// Extract behavior flags.
 ///
-/// By default, extraction rejects path traversal, applies safe permissions
-/// (rwx only, no setuid/setgid/sticky), and skips symlinks.
+/// By default, extraction rejects path traversal and skips symlinks.
+/// Permissions are always applied safely (execute bit preserved, setuid/
+/// setgid/sticky stripped, group/other write capped).
 enum DarkExtractFlags {
     none        = 0,
     securePaths = 1,     /// Reject ".." path components and absolute paths
     symlinks    = 2,     /// Extract symlinks (off by default — symlinks are skipped)
-    safePerm    = 4,     /// Apply archive permissions with dangerous bits stripped (setuid/setgid/sticky removed)
-    defaults    = securePaths | safePerm,
+    defaults    = securePaths,
 }
 
 
@@ -396,8 +396,7 @@ struct DarkArchiveReader {
 
     /// Extract with entry preprocessing/filtering delegate.
     ///
-    /// The delegate receives an `ExtractParams` ref with modifiable fields:
-    /// `destPath`, `permissions`, `uid`, `gid`, `uname`, `gname`.
+    /// The delegate receives an `ExtractParams` ref with modifiable `destPath`.
     /// Original entry metadata is read-only via `params.sourceEntry`.
     ///
     /// Return `false` from the delegate to skip the entry.
@@ -417,13 +416,10 @@ struct DarkArchiveReader {
         auto destStr = destination.toString();
 
         foreach (entry; entries()) {
-            // Build ExtractParams from entry
             ExtractParams params;
             params.destPath = entry.pathname;
             params.sourceEntry = &entry;
 
-            // Delegate runs BEFORE security checks.
-            // Security is the final gatekeeper — catches anything delegate introduces.
             if (preprocess !is null) {
                 if (!preprocess(params)) {
                     skipData();
@@ -433,7 +429,6 @@ struct DarkArchiveReader {
 
             auto entryPath = params.destPath;
 
-            // Security: reject absolute paths and ".." path components
             if (flags & DarkExtractFlags.securePaths) {
                 if (entryPath.length > 0 && entryPath[0] == '/')
                     throw new DarkArchiveException(
@@ -455,8 +450,6 @@ struct DarkArchiveReader {
 
             if (entry.isDir) {
                 mkdirRecurse(fullPath.toString());
-                if (flags & DarkExtractFlags.safePerm)
-                    applyPermissions(fullPath.toString(), entry.permissions);
                 skipData();
             } else if (entry.isSymlink) {
                 if (!(flags & DarkExtractFlags.symlinks)) {
@@ -466,7 +459,6 @@ struct DarkArchiveReader {
 
                 auto target = entry.symlinkTarget;
 
-                // Absolute symlink targets are ALWAYS rejected unconditionally
                 if (target.length > 0 && target[0] == '/')
                     throw new DarkArchiveException(
                         "Refusing to create symlink with absolute target: " ~ target);
@@ -498,23 +490,21 @@ struct DarkArchiveReader {
                 }
 
                 writeEntryToFile(fullPath.toString());
-
-                // Apply safe permissions (rwx only, strip setuid/setgid/sticky)
-                if (flags & DarkExtractFlags.safePerm) {
-                    applyPermissions(fullPath.toString(), entry.permissions);
-                }
+                applyPermissions(fullPath.toString(), entry.permissions);
             }
         }
     }
 
-    /// Apply archive permissions to an extracted file, stripping dangerous
-    /// bits (setuid 04000, setgid 02000, sticky 01000).
+    /// Apply archive permissions to an extracted file/directory.
+    /// Strips: setuid (04000), setgid (02000), sticky (01000).
+    /// Caps: group-write (0020) and other-write (0002) removed
+    /// (equivalent to umask 022 — prevents world-writable files).
     private static void applyPermissions(string path, uint archivePerms) {
         version(Posix) {
             if (archivePerms == 0) return; // no permissions stored
-            // Keep only rwxrwxrwx (lower 9 bits), strip setuid/setgid/sticky
-            auto safeBits = archivePerms & octal!777;
-            if (safeBits == 0) return; // don't apply empty permissions
+            auto safeBits = archivePerms & octal!777;  // strip setuid/setgid/sticky
+            safeBits &= ~octal!22;                      // strip group-write and other-write
+            if (safeBits == 0) return;
             import std.file : setAttributes;
             try {
                 setAttributes(path, safeBits);
@@ -2463,29 +2453,50 @@ version(unittest) {
         assert(!(attrs2 & octal!2000), "setgid must be stripped");
     }
 
-    /// extractTo with safePerm disabled — OS defaults, no permission applied
-    version(Posix) @("extractTo: safePerm disabled uses OS defaults")
+    /// extractTo caps group/other write bits (prevents world-writable files)
+    version(Posix) @("extractTo: caps group/other write bits")
     unittest {
         import std.file : exists, rmdirRecurse, getAttributes;
         import std.conv : octal;
         import darkarchive.formats.tar : TarWriter;
 
         auto tw = TarWriter.create();
-        tw.addBuffer("exec.sh", cast(const(ubyte)[]) "#!/bin/sh",
-            octal!755);
+        tw.addBuffer("world-writable.txt", cast(const(ubyte)[]) "data",
+            octal!666);
+        tw.addBuffer("full-perm.sh", cast(const(ubyte)[]) "#!/bin/sh",
+            octal!777);
+        tw.addBuffer("normal.txt", cast(const(ubyte)[]) "data",
+            octal!644);
+        tw.addBuffer("owner-only.sh", cast(const(ubyte)[]) "#!/bin/sh",
+            octal!700);
 
-        auto extractDir = Path(testDataDir, "perm-disabled-test");
+        auto extractDir = Path(testDataDir, "perm-cap-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
 
         auto reader = DarkArchiveReader(tw.data);
-        // Disable safePerm — file gets OS default permissions (umask)
-        reader.extractTo(extractDir,
-            DarkExtractFlags.securePaths & ~DarkExtractFlags.safePerm);
+        reader.extractTo(extractDir);
 
-        // With safePerm disabled and typical umask (022), file should NOT
-        // have execute bit (created via std.file.write which uses 0666 & ~umask)
-        auto attrs = getAttributes((extractDir ~ "exec.sh").toString);
-        assert(!(attrs & octal!100),
-            "with safePerm disabled, execute bit should not be set");
+        // 0o666 → 0o644 (group/other write stripped)
+        auto a1 = getAttributes((extractDir ~ "world-writable.txt").toString);
+        assert(!(a1 & octal!20), "group-write must be stripped from 0o666");
+        assert(!(a1 & octal!2), "other-write must be stripped from 0o666");
+        assert(a1 & octal!400, "owner-read must be preserved");
+
+        // 0o777 → 0o755 (group/other write stripped, execute preserved)
+        auto a2 = getAttributes((extractDir ~ "full-perm.sh").toString);
+        assert(a2 & octal!100, "owner-execute preserved");
+        assert(a2 & octal!10, "group-execute preserved");
+        assert(!(a2 & octal!20), "group-write must be stripped from 0o777");
+        assert(!(a2 & octal!2), "other-write must be stripped from 0o777");
+
+        // 0o644 → 0o644 (already safe, unchanged)
+        auto a3 = getAttributes((extractDir ~ "normal.txt").toString);
+        assert(a3 & octal!400, "owner-read preserved");
+        assert(!(a3 & octal!100), "no execute on normal file");
+
+        // 0o700 → 0o700 (no group/other bits to strip)
+        auto a4 = getAttributes((extractDir ~ "owner-only.sh").toString);
+        assert(a4 & octal!100, "owner-execute preserved");
+        assert(!(a4 & octal!40), "no group-read");
     }
 }
