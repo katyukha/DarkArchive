@@ -27,15 +27,14 @@ enum DarkArchiveFormat {
 
 /// Extract behavior flags.
 ///
-/// By default, extraction rejects path traversal and skips symlinks.
-/// Files are created with OS default permissions (umask) — archive
-/// permissions are intentionally not applied for security reasons.
-/// Use `processEntries` for full control over permissions and metadata.
+/// By default, extraction rejects path traversal, applies safe permissions
+/// (rwx only, no setuid/setgid/sticky), and skips symlinks.
 enum DarkExtractFlags {
     none        = 0,
     securePaths = 1,     /// Reject ".." path components and absolute paths
     symlinks    = 2,     /// Extract symlinks (off by default — symlinks are skipped)
-    defaults    = securePaths,
+    safePerm    = 4,     /// Apply archive permissions with dangerous bits stripped (setuid/setgid/sticky removed)
+    defaults    = securePaths | safePerm,
 }
 
 
@@ -456,6 +455,8 @@ struct DarkArchiveReader {
 
             if (entry.isDir) {
                 mkdirRecurse(fullPath.toString());
+                if (flags & DarkExtractFlags.safePerm)
+                    applyPermissions(fullPath.toString(), entry.permissions);
                 skipData();
             } else if (entry.isSymlink) {
                 if (!(flags & DarkExtractFlags.symlinks)) {
@@ -497,8 +498,31 @@ struct DarkArchiveReader {
                 }
 
                 writeEntryToFile(fullPath.toString());
+
+                // Apply safe permissions (rwx only, strip setuid/setgid/sticky)
+                if (flags & DarkExtractFlags.safePerm) {
+                    applyPermissions(fullPath.toString(), entry.permissions);
+                }
             }
         }
+    }
+
+    /// Apply archive permissions to an extracted file, stripping dangerous
+    /// bits (setuid 04000, setgid 02000, sticky 01000).
+    private static void applyPermissions(string path, uint archivePerms) {
+        version(Posix) {
+            if (archivePerms == 0) return; // no permissions stored
+            // Keep only rwxrwxrwx (lower 9 bits), strip setuid/setgid/sticky
+            auto safeBits = archivePerms & octal!777;
+            if (safeBits == 0) return; // don't apply empty permissions
+            import std.file : setAttributes;
+            try {
+                setAttributes(path, safeBits);
+            } catch (Exception) {
+                // Best effort — don't fail extraction if chmod fails
+            }
+        }
+        // On Windows: no-op (Windows doesn't use POSIX permission bits)
     }
 
     /// Write current entry's data to a file in chunks.
@@ -2374,5 +2398,94 @@ version(unittest) {
             }
             threw.shouldBeTrue;
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Permission tests
+    // -------------------------------------------------------------------
+
+    /// extractTo preserves safe permission bits (rwx) by default
+    version(Posix) @("extractTo: preserves execute permission by default")
+    unittest {
+        import std.file : exists, rmdirRecurse, getAttributes;
+        import std.conv : octal;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("script.sh", cast(const(ubyte)[]) "#!/bin/sh\necho hello",
+            octal!755);
+        tw.addBuffer("data.txt", cast(const(ubyte)[]) "just data",
+            octal!644);
+
+        auto extractDir = Path(testDataDir, "perm-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tw.data);
+        reader.extractTo(extractDir);
+
+        // script.sh should have execute bit
+        auto scriptAttrs = getAttributes((extractDir ~ "script.sh").toString);
+        assert(scriptAttrs & octal!100, "script.sh should have owner execute bit");
+
+        // data.txt should NOT have execute bit
+        auto dataAttrs = getAttributes((extractDir ~ "data.txt").toString);
+        assert(!(dataAttrs & octal!100), "data.txt should not have execute bit");
+    }
+
+    /// extractTo strips dangerous bits (setuid, setgid, sticky)
+    version(Posix) @("extractTo: strips setuid/setgid/sticky bits")
+    unittest {
+        import std.file : exists, rmdirRecurse, getAttributes;
+        import std.conv : octal;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        // setuid (04755) — dangerous
+        tw.addBuffer("setuid.sh", cast(const(ubyte)[]) "#!/bin/sh",
+            octal!4755);
+        // setgid (02755) — dangerous
+        tw.addBuffer("setgid.sh", cast(const(ubyte)[]) "#!/bin/sh",
+            octal!2755);
+
+        auto extractDir = Path(testDataDir, "perm-dangerous-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tw.data);
+        reader.extractTo(extractDir);
+
+        // Execute bit should be preserved, but setuid/setgid stripped
+        auto attrs1 = getAttributes((extractDir ~ "setuid.sh").toString);
+        assert(attrs1 & octal!100, "should have execute bit");
+        assert(!(attrs1 & octal!4000), "setuid must be stripped");
+
+        auto attrs2 = getAttributes((extractDir ~ "setgid.sh").toString);
+        assert(attrs2 & octal!100, "should have execute bit");
+        assert(!(attrs2 & octal!2000), "setgid must be stripped");
+    }
+
+    /// extractTo with safePerm disabled — OS defaults, no permission applied
+    version(Posix) @("extractTo: safePerm disabled uses OS defaults")
+    unittest {
+        import std.file : exists, rmdirRecurse, getAttributes;
+        import std.conv : octal;
+        import darkarchive.formats.tar : TarWriter;
+
+        auto tw = TarWriter.create();
+        tw.addBuffer("exec.sh", cast(const(ubyte)[]) "#!/bin/sh",
+            octal!755);
+
+        auto extractDir = Path(testDataDir, "perm-disabled-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tw.data);
+        // Disable safePerm — file gets OS default permissions (umask)
+        reader.extractTo(extractDir,
+            DarkExtractFlags.securePaths & ~DarkExtractFlags.safePerm);
+
+        // With safePerm disabled and typical umask (022), file should NOT
+        // have execute bit (created via std.file.write which uses 0666 & ~umask)
+        auto attrs = getAttributes((extractDir ~ "exec.sh").toString);
+        assert(!(attrs & octal!100),
+            "with safePerm disabled, execute bit should not be set");
     }
 }
