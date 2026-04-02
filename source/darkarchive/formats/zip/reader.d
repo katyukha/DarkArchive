@@ -24,15 +24,10 @@ struct ZipReader {
 
     @disable this();
 
-    /// Open ZIP from a byte buffer.
-    this(const(ubyte)[] data) {
-        _ds = DataSource.fromMemory(data);
-        parseCentralDirectory();
-    }
-
     /// Open ZIP from a file path (does not load full file into memory).
     this(string path) {
         _ds = DataSource.fromFile(path);
+        scope(failure) _ds.close();
         parseCentralDirectory();
     }
 
@@ -704,16 +699,21 @@ version(unittest) {
     @("zip write [zipper compat]: add files from disk, read back")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        import std.file : read;
+        import std.file : read, exists, remove;
 
         auto addonsContent = cast(string) read(testDataDir ~ "/addons-list.txt");
 
-        auto writer = ZipWriter.create();
+        auto tmpPath = testDataDir ~ "/test-zipr-addfiles.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addDirectory("test-data");
         writer.addBuffer("test-data/addons-list.txt",
             cast(const(ubyte)[]) addonsContent);
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         bool foundDir, foundFile;
         size_t i;
         foreach (entry; reader.entries) {
@@ -733,15 +733,20 @@ version(unittest) {
     @("zip write [zipper compat]: large file round-trip")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        import std.file : read;
+        import std.file : read, exists, remove;
 
         auto logContent = cast(const(ubyte)[]) read(testDataDir ~ "/odoo.test.2.log");
         assert(logContent.length > 100_000);
 
-        auto writer = ZipWriter.create();
+        auto tmpPath = testDataDir ~ "/test-zipr-largefile.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("odoo.test.2.log", logContent);
+        writer.finish();
 
-        auto reader = ZipReader(writer.data);
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(1);
         auto readBack = reader.readData(0);
         readBack.length.shouldEqual(logContent.length);
@@ -763,20 +768,26 @@ version(unittest) {
 
     @("zip security: truncated archive throws gracefully")
     unittest {
-        import std.file : read;
-        auto fullData = cast(const(ubyte)[]) read(testDataDir ~ "/test-zip.zip");
+        import std.file : read, write, exists, remove;
+        auto fullData = cast(ubyte[]) read(testDataDir ~ "/test-zip.zip");
         auto truncated = fullData[0 .. fullData.length / 2];
+        auto truncPath = testDataDir ~ "/test-zipr-truncated.zip";
+        scope(exit) if (exists(truncPath)) remove(truncPath);
+        write(truncPath, truncated);
         bool caught;
-        try { auto reader = ZipReader(truncated); }
+        try { auto reader = ZipReader(truncPath); }
         catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
     }
 
     @("zip security: non-zip data throws")
     unittest {
-        auto garbage = cast(const(ubyte)[]) "this is not a zip file at all";
+        import std.file : write, exists, remove;
+        auto garbagePath = testDataDir ~ "/test-zipr-garbage.zip";
+        scope(exit) if (exists(garbagePath)) remove(garbagePath);
+        write(garbagePath, "this is not a zip file at all");
         bool caught;
-        try { auto reader = ZipReader(garbage); }
+        try { auto reader = ZipReader(garbagePath); }
         catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
     }
@@ -784,11 +795,22 @@ version(unittest) {
     @("zip security: corrupted local header signature throws on readData")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto writer = ZipWriter.create();
+        import std.file : read, write, exists, remove;
+        auto tmpPath = testDataDir ~ "/test-zipr-corrupthdr.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "hello");
-        auto data = writer.data.dup;
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
         data[0] = 0xFF; data[1] = 0xFF;
-        auto reader = ZipReader(cast(const(ubyte)[]) data);
+        auto corruptPath = testDataDir ~ "/test-zipr-corrupthdr-bad.zip";
+        scope(exit) if (exists(corruptPath)) remove(corruptPath);
+        write(corruptPath, data);
+
+        auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
         bool caught;
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }
@@ -798,12 +820,23 @@ version(unittest) {
     @("zip security: CRC32 mismatch detected on read")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto writer = ZipWriter.create();
+        import std.file : read, write, exists, remove;
+        auto tmpPath = testDataDir ~ "/test-zipr-crc.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "original content");
-        auto data = writer.data.dup;
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
         auto corruptPos = 30 + 8 + 5;
         if (corruptPos < data.length) data[corruptPos] ^= 0xFF;
-        auto reader = ZipReader(cast(const(ubyte)[]) data);
+        auto corruptPath = testDataDir ~ "/test-zipr-crc-bad.zip";
+        scope(exit) if (exists(corruptPath)) remove(corruptPath);
+        write(corruptPath, data);
+
+        auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
         bool caught;
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }
@@ -813,9 +846,16 @@ version(unittest) {
     @("zip security: empty filename entry does not crash")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto writer = ZipWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = testDataDir ~ "/test-zipr-emptyname.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("", cast(const(ubyte)[]) "empty name");
-        auto reader = ZipReader(writer.data);
+        writer.finish();
+
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         foreach (entry; reader.entries)
             assert(entry.pathname !is null);
     }
@@ -827,9 +867,16 @@ version(unittest) {
     @("zip format: store method round-trip")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto writer = ZipWriter.create();
+        import std.file : exists, remove;
+        auto tmpPath = testDataDir ~ "/test-zipr-store.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("tiny.txt", cast(const(ubyte)[]) "hi");
-        auto reader = ZipReader(writer.data);
+        writer.finish();
+
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         foreach (i, ref ci; reader._entries)
             if (ci.filename == "tiny.txt")
                 reader.readText(i).shouldEqual("hi");
@@ -838,8 +885,15 @@ version(unittest) {
     @("zip format: empty archive round-trip")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto writer = ZipWriter.create();
-        auto reader = ZipReader(writer.data);
+        import std.file : exists, remove;
+        auto tmpPath = testDataDir ~ "/test-zipr-empty.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
+        writer.finish();
+
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(0);
     }
 
@@ -872,12 +926,26 @@ version(unittest) {
     @("zip format: nested ZIP does not crash")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto inner = ZipWriter.create();
+        import std.file : read, exists, remove;
+        auto innerPath = testDataDir ~ "/test-zipr-nested-inner.zip";
+        scope(exit) if (exists(innerPath)) remove(innerPath);
+        auto inner = ZipWriter.createToFile(innerPath);
+        scope(exit) inner.close();
         inner.addBuffer("inner.txt", cast(const(ubyte)[]) "inner");
-        auto outer = ZipWriter.create();
-        outer.addBuffer("nested.zip", inner.data);
+        inner.finish();
+
+        auto innerData = cast(const(ubyte)[]) read(innerPath);
+        auto outerPath = testDataDir ~ "/test-zipr-nested-outer.zip";
+        scope(exit) if (exists(outerPath)) remove(outerPath);
+
+        auto outer = ZipWriter.createToFile(outerPath);
+        scope(exit) outer.close();
+        outer.addBuffer("nested.zip", innerData);
         outer.addBuffer("outer.txt", cast(const(ubyte)[]) "outer");
-        auto reader = ZipReader(outer.data);
+        outer.finish();
+
+        auto reader = ZipReader(outerPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(2);
     }
 
@@ -974,15 +1042,26 @@ version(unittest) {
     @("zip security: absurd entry count capped by central dir size")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto writer = ZipWriter.create();
+        import std.file : read, write, exists, remove;
+        auto tmpPath = testDataDir ~ "/test-zipr-absurdcount.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
-        auto data = writer.data.dup;
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
         // Patch EOCD entry count to 0xFFFF (absurd)
         auto eocdPos = data.length - 22;
         data[eocdPos + 10] = 0xFF; data[eocdPos + 11] = 0xFF;
         data[eocdPos + 8] = 0xFF; data[eocdPos + 9] = 0xFF;
+        auto patchedPath = testDataDir ~ "/test-zipr-absurdcount-patched.zip";
+        scope(exit) if (exists(patchedPath)) remove(patchedPath);
+        write(patchedPath, data);
+
         // Reader should cap totalEntries to centralDirSize/46 (~1 entry)
-        auto reader = ZipReader(cast(const(ubyte)[]) data);
+        auto reader = ZipReader(patchedPath);
+        scope(exit) reader.close();
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("x");
     }
@@ -990,11 +1069,22 @@ version(unittest) {
     @("zip security: overflow in dataStart calculation throws")
     unittest {
         import darkarchive.formats.zip.writer : ZipWriter;
-        auto writer = ZipWriter.create();
+        import std.file : read, write, exists, remove;
+        auto tmpPath = testDataDir ~ "/test-zipr-overflow.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
         writer.addBuffer("a.txt", cast(const(ubyte)[]) "data");
-        auto data = writer.data.dup;
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
         data[26] = 0xFF; data[27] = 0xFF;
-        auto reader = ZipReader(cast(const(ubyte)[]) data);
+        auto corruptPath = testDataDir ~ "/test-zipr-overflow-bad.zip";
+        scope(exit) if (exists(corruptPath)) remove(corruptPath);
+        write(corruptPath, data);
+
+        auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
         bool caught;
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }

@@ -5,23 +5,12 @@ module darkarchive.datasource;
 
 import darkarchive.exception : DarkArchiveException;
 
-/// Read-only data source. Backed by either a memory buffer or a file.
+/// Read-only data source backed by a file.
 struct DataSource {
     private {
-        // Memory-backed
-        const(ubyte)[] _memData;
-
-        // File-backed
         import std.stdio : File;
         File* _file;
         ulong _fileSize;
-    }
-
-    /// Create from memory buffer.
-    static DataSource fromMemory(const(ubyte)[] data) {
-        DataSource ds;
-        ds._memData = data;
-        return ds;
     }
 
     /// Create from file path (does not load file into memory).
@@ -44,28 +33,20 @@ struct DataSource {
 
     /// Total size of the data source.
     ulong length() const {
-        if (_file !is null)
-            return _fileSize;
-        return _memData.length;
+        return _fileSize;
     }
 
     /// Read a slice of bytes at the given offset.
-    /// For memory: returns a slice (zero-copy).
-    /// For file: reads into a new buffer.
     const(ubyte)[] readSlice(ulong offset, ulong len) {
         if (offset + len > length)
             throw new DarkArchiveException("DataSource: read past end of data");
 
-        if (_file !is null) {
-            _file.seek(offset);
-            auto buf = new ubyte[](cast(size_t) len);
-            auto got = _file.rawRead(buf);
-            if (got.length != len)
-                throw new DarkArchiveException("DataSource: short read from file");
-            return got;
-        }
-
-        return _memData[cast(size_t) offset .. cast(size_t)(offset + len)];
+        _file.seek(offset);
+        auto buf = new ubyte[](cast(size_t) len);
+        auto got = _file.rawRead(buf);
+        if (got.length != len)
+            throw new DarkArchiveException("DataSource: short read from file");
+        return got;
     }
 
     /// Read a little-endian integer at the given offset.
@@ -85,38 +66,28 @@ struct DataSource {
         auto sigBytes = nativeToLittleEndian(signature);
         auto searchStart = startPos >= maxSearch ? startPos - maxSearch : 0;
 
-        if (_file !is null) {
-            // File-backed: read in chunks from end
-            enum CHUNK = 4096;
-            auto buf = new ubyte[](CHUNK + 4); // overlap for cross-boundary signatures
+        // File-backed: read in chunks from end
+        enum CHUNK = 4096;
+        auto buf = new ubyte[](CHUNK + 4); // overlap for cross-boundary signatures
 
-            for (long pos = cast(long) startPos; pos >= cast(long) searchStart; pos -= CHUNK) {
-                auto readStart = pos >= CHUNK ? pos - CHUNK : 0;
-                auto readLen = cast(size_t)(pos + 4 - readStart);
-                if (readLen > buf.length) readLen = buf.length;
+        for (long pos = cast(long) startPos; pos >= cast(long) searchStart; pos -= CHUNK) {
+            auto readStart = pos >= CHUNK ? pos - CHUNK : 0;
+            auto readLen = cast(size_t)(pos + 4 - readStart);
+            if (readLen > buf.length) readLen = buf.length;
 
-                _file.seek(readStart);
-                auto got = _file.rawRead(buf[0 .. readLen]);
+            _file.seek(readStart);
+            auto got = _file.rawRead(buf[0 .. readLen]);
 
-                // Search backward in this chunk
-                for (long i = cast(long) got.length - 4; i >= 0; i--) {
-                    if (got[i .. i + 4] == sigBytes) {
-                        auto foundOffset = readStart + i;
-                        if (foundOffset <= startPos)
-                            return cast(long) foundOffset;
-                    }
+            // Search backward in this chunk
+            for (long i = cast(long) got.length - 4; i >= 0; i--) {
+                if (got[i .. i + 4] == sigBytes) {
+                    auto foundOffset = readStart + i;
+                    if (foundOffset <= startPos)
+                        return cast(long) foundOffset;
                 }
-
-                if (readStart == 0) break;
             }
-            return -1;
-        }
 
-        // Memory-backed: simple scan
-        for (long i = cast(long) startPos; i >= cast(long) searchStart; i--) {
-            if (i + 4 <= _memData.length &&
-                _memData[cast(size_t) i .. cast(size_t)(i + 4)] == sigBytes)
-                return i;
+            if (readStart == 0) break;
         }
         return -1;
     }
@@ -128,8 +99,19 @@ struct DataSource {
 /// Unlike DataSource, this is a class for polymorphic dispatch.
 class SequentialReader {
     /// Read exactly `len` bytes at the current position. Advances position.
+    /// Allocates a new buffer each call — prefer readInto for hot paths.
     ubyte[] read(size_t len) {
         assert(false, "not implemented");
+    }
+
+    /// Read into a caller-provided buffer. Returns bytes actually read.
+    /// Zero-allocation on the hot path — use in readDataChunked.
+    size_t readInto(ubyte[] buf) {
+        // Default implementation: delegate to read() + copy.
+        // Subclasses override for zero-copy.
+        auto data = read(buf.length);
+        buf[0 .. data.length] = data[];
+        return data.length;
     }
 
     /// Skip `len` bytes (advance position without reading).
@@ -165,6 +147,16 @@ class DataSourceSequentialReader : SequentialReader {
         return result;
     }
 
+    override size_t readInto(ubyte[] buf) {
+        auto len = buf.length;
+        if (_pos + len > _ds.length)
+            throw new DarkArchiveException("TAR: unexpected end of data");
+        auto slice = _ds.readSlice(_pos, len);
+        buf[0 .. len] = slice[0 .. len];
+        _pos += len;
+        return len;
+    }
+
     override void skip(size_t len) {
         _pos += len;
         if (_pos > _ds.length)
@@ -182,113 +174,158 @@ class DataSourceSequentialReader : SequentialReader {
 }
 
 /// SequentialReader backed by streaming gzip decompression of a file.
-/// Decompresses on the fly in chunks — never holds the full decompressed
-/// data in memory. Peak memory: ~8MB (4MB compressed read buffer + 4MB
-/// decompressed output buffer).
+/// Uses C zlib directly for bounded memory — decompresses into a fixed-size
+/// ring buffer, never accumulating more than DECOMP_BUF_SIZE of decompressed
+/// data regardless of compression ratio. Peak memory: ~576KB
+/// (512KB decomp buffer + 64KB compressed read buffer).
 class GzipSequentialReader : SequentialReader {
     private {
         import std.stdio : File;
-        import std.zlib : UnCompress, HeaderFormat;
+        import etc.c.zlib;
 
         File _file;
-        UnCompress _inflater;
-        ubyte[] _decompBuf;  // buffered decompressed data
-        ubyte[] _readBuf;    // reusable compressed read buffer (heap)
+        z_stream _zs;
+        bool _zsInit;
+
+        // Fixed-size decompression buffer (ring-style: compact when half consumed)
+        ubyte[] _decompBuf;
         size_t _decompPos;   // read position within _decompBuf
+        size_t _decompLen;   // valid bytes in _decompBuf (from start)
+
+        ubyte[] _readBuf;    // reusable compressed read buffer
         bool _fileEOF;
         bool _inflateEOF;
-        enum CHUNK_SIZE = 4 * 1024 * 1024; // 4MB compressed read chunks
+
+        enum COMP_CHUNK = 64 * 1024;      // 64KB compressed read chunks
+        enum DECOMP_BUF_SIZE = 512 * 1024; // 512KB decompressed buffer
+        enum COMPACT_THRESHOLD = 256 * 1024; // compact when 256KB consumed
     }
 
     this(string gzipPath) {
         _file = File(gzipPath, "rb");
-        _inflater = new UnCompress(HeaderFormat.gzip);
-        _decompBuf = [];
+        _decompBuf = new ubyte[](DECOMP_BUF_SIZE);
+        _readBuf = new ubyte[](COMP_CHUNK);
         _decompPos = 0;
+        _decompLen = 0;
         _fileEOF = false;
         _inflateEOF = false;
+
+        // Initialize C zlib for gzip format (windowBits = 15 + 16 for gzip)
+        _zs = z_stream.init;
+        auto ret = inflateInit2(&_zs, 15 + 16);
+        if (ret != Z_OK)
+            throw new DarkArchiveException("GZIP: inflateInit2 failed");
+        _zsInit = true;
     }
 
     override ubyte[] read(size_t len) {
         ensureAvailable(len);
-        if (_decompPos + len > _decompBuf.length)
+        if (available < len)
             throw new DarkArchiveException("GZIP: unexpected end of compressed data");
         auto result = _decompBuf[_decompPos .. _decompPos + len].dup;
         _decompPos += len;
-        compactBuffer();
+        compact();
         return result;
     }
 
+    override size_t readInto(ubyte[] buf) {
+        auto len = buf.length;
+        ensureAvailable(len);
+        if (available < len)
+            throw new DarkArchiveException("GZIP: unexpected end of compressed data");
+        buf[0 .. len] = _decompBuf[_decompPos .. _decompPos + len];
+        _decompPos += len;
+        compact();
+        return len;
+    }
+
     override void skip(size_t len) {
-        // For large skips, decompress and discard in chunks
         while (len > 0) {
-            auto available = _decompBuf.length - _decompPos;
             if (available == 0) {
                 if (!decompressMore())
-                    return; // EOF
+                    return;
                 continue;
             }
             auto toSkip = len > available ? available : len;
             _decompPos += toSkip;
             len -= toSkip;
-            compactBuffer();
         }
+        compact();
     }
 
     override bool empty() {
-        if (_decompPos < _decompBuf.length) return false;
+        if (available > 0) return false;
         if (_inflateEOF) return true;
         return !decompressMore();
     }
 
     override void close() {
+        if (_zsInit) {
+            inflateEnd(&_zs);
+            _zsInit = false;
+        }
         _file.close();
+        _decompBuf = null;
+        _readBuf = null;
+    }
+
+    private @property size_t available() const {
+        return _decompLen - _decompPos;
     }
 
     private void ensureAvailable(size_t needed) {
-        while (_decompBuf.length - _decompPos < needed) {
+        while (available < needed) {
             if (!decompressMore())
-                return; // can't get more
+                return;
         }
     }
 
     private bool decompressMore() {
         if (_inflateEOF) return false;
 
-        // Heap-allocated read buffer (stack would overflow on Windows
-        // where default stack size is 1MB)
-        if (_readBuf is null)
-            _readBuf = new ubyte[](CHUNK_SIZE);
-        auto readBuf = _readBuf;
-        while (true) {
-            if (_fileEOF) {
-                auto tail = cast(ubyte[]) _inflater.flush();
-                if (tail.length > 0) {
-                    _decompBuf ~= tail;
-                }
-                _inflateEOF = true;
-                return _decompBuf.length - _decompPos > 0;
-            }
+        compact();
 
-            auto got = _file.rawRead(readBuf[]);
+        // Fill compressed input if zlib needs more
+        if (_zs.avail_in == 0 && !_fileEOF) {
+            auto got = _file.rawRead(_readBuf[]);
             if (got.length == 0) {
                 _fileEOF = true;
-                continue;
-            }
-
-            auto decompressed = cast(ubyte[]) _inflater.uncompress(got);
-            if (decompressed.length > 0) {
-                _decompBuf ~= decompressed;
-                return true;
+            } else {
+                _zs.next_in = cast(ubyte*) got.ptr;
+                _zs.avail_in = cast(uint) got.length;
             }
         }
+
+        // Decompress into the free space at end of _decompBuf
+        auto freeSpace = _decompBuf.length - _decompLen;
+        if (freeSpace == 0) return available > 0; // buffer full, need compact
+
+        _zs.next_out = cast(ubyte*) (_decompBuf.ptr + _decompLen);
+        _zs.avail_out = cast(uint) freeSpace;
+
+        auto ret = inflate(&_zs, Z_NO_FLUSH);
+
+        auto produced = freeSpace - _zs.avail_out;
+        _decompLen += produced;
+
+        if (ret == Z_STREAM_END) {
+            _inflateEOF = true;
+            return available > 0;
+        }
+        if (ret != Z_OK && ret != Z_BUF_ERROR)
+            throw new DarkArchiveException("GZIP: inflate failed");
+
+        return produced > 0 || available > 0;
     }
 
-    private void compactBuffer() {
-        // When we've consumed a significant portion, compact to free memory
-        if (_decompPos > CHUNK_SIZE) {
-            _decompBuf = _decompBuf[_decompPos .. $].dup;
+    /// Compact: shift unconsumed data to front of buffer.
+    private void compact() {
+        if (_decompPos >= COMPACT_THRESHOLD) {
+            auto rem = available;
+            if (rem > 0)
+                _decompBuf[0 .. rem] = _decompBuf[_decompPos .. _decompLen];
             _decompPos = 0;
+            _decompLen = rem;
         }
     }
 }
@@ -306,20 +343,24 @@ private {
 version(unittest) {
     import unit_threaded.assertions : shouldEqual, shouldBeTrue;
 
-    @("datasource: memory-backed read")
+    @("datasource: readSlice at offset")
     unittest {
-        auto data = cast(const(ubyte)[]) "Hello, World!";
-        auto ds = DataSource.fromMemory(data);
+        import std.file : write, remove;
+        enum path = "test-data/tmp-datasource-read.bin";
+        write(path, "Hello, World!");
+        scope(exit) remove(path);
+        auto ds = DataSource.fromFile(path);
+        scope(exit) ds.close();
         ds.length.shouldEqual(13);
         auto slice = ds.readSlice(7, 6);
         (cast(string) slice).shouldEqual("World!");
     }
 
-    @("datasource: file-backed read")
+    @("datasource: read ZIP magic bytes")
     unittest {
         auto ds = DataSource.fromFile("test-data/test-zip.zip");
+        scope(exit) ds.close();
         assert(ds.length > 0);
-        // Read first 2 bytes — should be "PK"
         auto sig = ds.readSlice(0, 2);
         sig[0].shouldEqual('P');
         sig[1].shouldEqual('K');
@@ -327,36 +368,34 @@ version(unittest) {
 
     @("datasource: readLE")
     unittest {
-        auto data = cast(const(ubyte)[]) [0x50, 0x4B, 0x03, 0x04, 0x00];
-        auto ds = DataSource.fromMemory(data);
+        import std.file : write, remove;
+        enum path = "test-data/tmp-datasource-readle.bin";
+        write(path, cast(const(ubyte)[]) [0x50, 0x4B, 0x03, 0x04, 0x00]);
+        scope(exit) remove(path);
+        auto ds = DataSource.fromFile(path);
+        scope(exit) ds.close();
         ds.readLE!uint(0).shouldEqual(0x04034b50);
     }
 
-    @("datasource: findBackward memory")
+    @("datasource: findBackward finds EOCD signature")
     unittest {
         import darkarchive.formats.zip.types : ZIP_END_OF_CENTRAL_DIR_SIG;
-        import std.file : read;
-        auto data = cast(const(ubyte)[]) read("test-data/test-zip.zip");
-        auto ds = DataSource.fromMemory(data);
+        auto ds = DataSource.fromFile("test-data/test-zip.zip");
+        scope(exit) ds.close();
         auto pos = ds.findBackward(ZIP_END_OF_CENTRAL_DIR_SIG,
             ds.length - 4, 22 + 65535);
         assert(pos >= 0, "should find EOCD signature");
     }
 
-    @("datasource: findBackward file")
-    unittest {
-        import darkarchive.formats.zip.types : ZIP_END_OF_CENTRAL_DIR_SIG;
-        auto ds = DataSource.fromFile("test-data/test-zip.zip");
-        auto pos = ds.findBackward(ZIP_END_OF_CENTRAL_DIR_SIG,
-            ds.length - 4, 22 + 65535);
-        assert(pos >= 0, "should find EOCD signature in file");
-    }
-
     @("datasource: out-of-bounds read throws")
     unittest {
+        import std.file : write, remove;
         import darkarchive.exception : DarkArchiveException;
-        auto data = cast(const(ubyte)[]) "short";
-        auto ds = DataSource.fromMemory(data);
+        enum path = "test-data/tmp-datasource-oob.bin";
+        write(path, "short");
+        scope(exit) remove(path);
+        auto ds = DataSource.fromFile(path);
+        scope(exit) ds.close();
         bool caught;
         try {
             ds.readSlice(0, 100);

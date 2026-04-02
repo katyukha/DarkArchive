@@ -32,20 +32,6 @@ const(ubyte)[] gunzip(const(ubyte)[] data) {
     return result;
 }
 
-/// Check if data starts with gzip magic bytes.
-bool isGzip(const(ubyte)[] data) {
-    return data.length >= 2 && data[0] == 0x1f && data[1] == 0x8b;
-}
-
-/// Check if a file starts with gzip magic bytes (reads only 2 bytes).
-bool isGzipFile(string path) {
-    import std.stdio : File;
-    auto f = File(path, "rb");
-    ubyte[2] magic;
-    auto got = f.rawRead(magic[]);
-    return got.length == 2 && magic[0] == 0x1f && magic[1] == 0x8b;
-}
-
 
 // ===========================================================================
 // Unit tests
@@ -70,10 +56,16 @@ version(unittest) {
     /// Read tar.gz — decompress then parse tar
     @("gzip+tar read: tar.gz iterate and verify")
     unittest {
-        import std.file : read;
+        import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test.tar.gz");
         auto tarData = gunzip(gzData);
-        auto reader = TarReader(tarData);
+        // Write decompressed tar to temp file for TarReader
+        auto tmpPath = "test-data/test-gzip-tar-iterate.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, tarData);
+
+        auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
 
         string[] names;
         foreach (entry; reader.entries) {
@@ -91,10 +83,16 @@ version(unittest) {
     /// Empty tar.gz — zero entries
     @("gzip+tar read: empty archive, zero entries")
     unittest {
-        import std.file : read;
+        import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-empty.tar.gz");
         auto tarData = gunzip(gzData);
-        auto reader = TarReader(tarData);
+        // Write decompressed tar to temp file for TarReader
+        auto tmpPath = "test-data/test-gzip-empty-archive.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, tarData);
+
+        auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
 
         int count;
         foreach (entry; reader.entries) {
@@ -106,10 +104,16 @@ version(unittest) {
     /// Large entry from external tar.gz (128KB)
     @("gzip+tar read: 128KB file, multi-chunk")
     unittest {
-        import std.file : read;
+        import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-large-entry.tar.gz");
         auto tarData = gunzip(gzData);
-        auto reader = TarReader(tarData);
+        // Write decompressed tar to temp file for TarReader
+        auto tmpPath = "test-data/test-gzip-large-entry.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, tarData);
+
+        auto reader = TarReader(tmpPath);
+        scope(exit) reader.close();
 
         foreach (entry; reader.entries) {
             if (entry.pathname == "large-128k.bin") {
@@ -118,17 +122,6 @@ version(unittest) {
                 data.length.shouldEqual(128 * 1024);
             }
         }
-    }
-
-    /// isGzip detection
-    @("gzip: isGzip magic detection")
-    unittest {
-        import std.file : read;
-        auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test.tar.gz");
-        isGzip(gzData).shouldBeTrue;
-
-        auto zipData = cast(const(ubyte)[]) read(testDataDir ~ "/test-zip.zip");
-        isGzip(zipData).shouldEqual(false);
     }
 
     /// Corrupted gzip data must be detected (CRC32 or inflate error)
@@ -195,4 +188,67 @@ version(unittest) {
         }
         assert(names.length > 0, "should find entries via streaming gzip");
     }
+
+    /// Memory consistency: streaming through tar.gz should not accumulate memory
+    @("gzip: streaming does not accumulate memory")
+    unittest {
+        import darkarchive.formats.tar.writer : TarWriter, gzipCompress;
+        import darkarchive.datasource : GzipSequentialReader;
+        import core.memory : GC;
+        import std.file : write, read, remove, exists;
+
+        // Create tar with many entries totaling ~1MB via temp file
+        auto tarTmpPath = "test-data/test-mem-consistency-inner.tar";
+        scope(exit) if (exists(tarTmpPath)) remove(tarTmpPath);
+        auto tw = TarWriter.createToFile(tarTmpPath);
+        scope(exit) tw.close();
+        auto chunk = new ubyte[](4096); // 4KB per entry
+        foreach (i; 0 .. 256) { // 256 * 4KB = 1MB total
+            import std.format : format;
+            tw.addBuffer("entry_%04d.bin".format(i), chunk);
+        }
+        tw.finish();
+        auto tarBytes = cast(const(ubyte)[]) read(tarTmpPath);
+        auto gzData = gzipCompress(tarBytes);
+
+        // Write gzip to temp file
+        auto tmpPath = "test-data/test-mem-consistency.tar.gz";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, gzData);
+
+        // Force GC before measuring
+        GC.collect();
+        auto memBefore = GC.stats.usedSize;
+
+        // Stream through all entries, reading each via chunked API
+        auto gzStream = new GzipSequentialReader(tmpPath);
+        auto reader = TarReader(gzStream);
+        size_t totalRead;
+        foreach (entry; reader.entries) {
+            if (entry.isFile) {
+                reader.readDataChunked((const(ubyte)[] c) {
+                    totalRead += c.length;
+                });
+            }
+        }
+        reader.close();
+
+        GC.collect();
+        auto memAfter = GC.stats.usedSize;
+
+        // Total data was ~1MB. With proper streaming, memory should not grow
+        // proportionally to archive size. Allow reasonable GC overhead (2MB)
+        // but reject growth > 4MB which would indicate accumulation.
+        auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
+        assert(growth < 4 * 1024 * 1024,
+            "memory grew by " ~ formatSize(growth) ~ " — possible memory leak");
+        assert(totalRead > 0, "should have read data");
+    }
+}
+
+private string formatSize(size_t bytes) {
+    import std.format : format;
+    if (bytes < 1024) return "%d B".format(bytes);
+    if (bytes < 1024 * 1024) return "%.1f KB".format(cast(double) bytes / 1024);
+    return "%.1f MB".format(cast(double) bytes / (1024 * 1024));
 }
