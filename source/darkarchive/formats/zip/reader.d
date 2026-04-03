@@ -549,14 +549,13 @@ private auto dosTimeToSysTime(ushort dosTime, ushort dosDate) {
 // ===========================================================================
 
 version(unittest) {
-    import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse,
-        shouldBeGreaterThan;
 
     private immutable testDataDir = "test-data";
 
     /// Read zip — iterate entries and verify content
     @("zip read: iterate entries and verify content")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-zip.zip");
         string[] names;
         foreach (entry; reader.entries) {
@@ -577,6 +576,7 @@ version(unittest) {
     /// UTF-8 filenames — no locale needed in pure D
     @("zip read: UTF-8 pathnames without locale")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import std.algorithm : canFind;
 
         auto reader = ZipReader(testDataDir ~ "/test-unicode.zip");
@@ -591,6 +591,7 @@ version(unittest) {
     /// Many entries — 150 files
     @("zip read: 150 files, no off-by-one")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-many-entries.zip");
         reader.length.shouldEqual(150);
 
@@ -605,6 +606,7 @@ version(unittest) {
     /// Deep path
     @("zip read: deeply nested directory structure")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-deep-path.zip");
         bool foundDeep;
         foreach (i, ref ci; reader._entries) {
@@ -619,6 +621,7 @@ version(unittest) {
     /// Entry type detection
     @("zip read: entry type detection (file vs directory)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-deep-path.zip");
         bool foundDir, foundFile;
         foreach (entry; reader.entries) {
@@ -642,6 +645,7 @@ version(unittest) {
 
     @("zip read [zipper compat]: analyze archive with symlinks")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/zipper-test.zip");
         reader.length.shouldEqual(7);
 
@@ -676,6 +680,7 @@ version(unittest) {
 
     @("zip read [zipper compat]: read file content")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/zipper-test.zip");
         foreach (i, ref ci; reader._entries) {
             if (ci.filename == "test-zip/test.txt")
@@ -687,6 +692,7 @@ version(unittest) {
 
     @("zip read [zipper compat]: symlink targets resolve correctly")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/zipper-test.zip");
         foreach (i, ref ci; reader._entries) {
             if (ci.filename == "test-zip/test-link-1.txt")
@@ -698,6 +704,7 @@ version(unittest) {
 
     @("zip write [zipper compat]: add files from disk, read back")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read, exists, remove;
 
@@ -732,6 +739,7 @@ version(unittest) {
 
     @("zip write [zipper compat]: large file round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read, exists, remove;
 
@@ -759,6 +767,7 @@ version(unittest) {
 
     @("zip security: readData with out-of-bounds index throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-zip.zip");
         bool caught;
         try { reader.readData(9999); }
@@ -768,6 +777,7 @@ version(unittest) {
 
     @("zip security: truncated archive throws gracefully")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import std.file : read, write, exists, remove;
         auto fullData = cast(ubyte[]) read(testDataDir ~ "/test-zip.zip");
         auto truncated = fullData[0 .. fullData.length / 2];
@@ -782,6 +792,7 @@ version(unittest) {
 
     @("zip security: non-zip data throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import std.file : write, exists, remove;
         auto garbagePath = testDataDir ~ "/test-zipr-garbage.zip";
         scope(exit) if (exists(garbagePath)) remove(garbagePath);
@@ -794,6 +805,7 @@ version(unittest) {
 
     @("zip security: corrupted local header signature throws on readData")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read, write, exists, remove;
         auto tmpPath = testDataDir ~ "/test-zipr-corrupthdr.zip";
@@ -819,6 +831,7 @@ version(unittest) {
 
     @("zip security: CRC32 mismatch detected on read")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read, write, exists, remove;
         auto tmpPath = testDataDir ~ "/test-zipr-crc.zip";
@@ -845,6 +858,7 @@ version(unittest) {
 
     @("zip security: empty filename entry does not crash")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : exists, remove;
         auto tmpPath = testDataDir ~ "/test-zipr-emptyname.zip";
@@ -866,6 +880,7 @@ version(unittest) {
 
     @("zip format: store method round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : exists, remove;
         auto tmpPath = testDataDir ~ "/test-zipr-store.zip";
@@ -884,6 +899,7 @@ version(unittest) {
 
     @("zip format: empty archive round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : exists, remove;
         auto tmpPath = testDataDir ~ "/test-zipr-empty.zip";
@@ -899,6 +915,7 @@ version(unittest) {
 
     @("zip interop: read Python-created ZIP")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-python.zip");
         bool foundHello, foundNested;
         foreach (i, ref ci; reader._entries) {
@@ -916,6 +933,7 @@ version(unittest) {
 
     @("zip format: EOCD with comment")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-comment.zip");
         reader.length.shouldBeGreaterThan(0);
         foreach (i, ref ci; reader._entries)
@@ -925,6 +943,7 @@ version(unittest) {
 
     @("zip format: nested ZIP does not crash")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read, exists, remove;
         auto innerPath = testDataDir ~ "/test-zipr-nested-inner.zip";
@@ -955,6 +974,7 @@ version(unittest) {
 
     @("zip format [libzip]: junk before ZIP (SFX)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-junk-before.zip");
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("content after junk\n");
@@ -962,6 +982,7 @@ version(unittest) {
 
     @("zip format [libzip]: junk after ZIP")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-junk-after.zip");
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("content before junk\n");
@@ -969,6 +990,7 @@ version(unittest) {
 
     @("zip format [libzip]: duplicate filenames")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-duplicate-names.zip");
         reader.length.shouldEqual(2);
         string[] contents;
@@ -985,6 +1007,7 @@ version(unittest) {
 
     @("zip format [libzip]: NUL byte in filename")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-nul-filename.zip");
         int count;
         foreach (entry; reader.entries) { count++; assert(entry.pathname !is null); }
@@ -993,6 +1016,7 @@ version(unittest) {
 
     @("zip format [libzip]: backslash paths")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-backslash.zip");
         bool foundForward;
         foreach (entry; reader.entries)
@@ -1002,6 +1026,7 @@ version(unittest) {
 
     @("zip format [libzip]: very long EOCD comment")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-long-comment.zip");
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("file in archive with long comment\n");
@@ -1009,6 +1034,7 @@ version(unittest) {
 
     @("zip format [libzip]: zero-length deflated entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-empty-deflated.zip");
         bool foundEmpty, foundNonEmpty;
         foreach (i, ref ci; reader._entries) {
@@ -1026,6 +1052,7 @@ version(unittest) {
 
     @("zip format [libzip]: skip entries without reading")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = ZipReader(testDataDir ~ "/test-zip.zip");
         assert(reader.length >= 3);
         auto lastIdx = reader.length - 1;
@@ -1041,6 +1068,7 @@ version(unittest) {
 
     @("zip security: absurd entry count capped by central dir size")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read, write, exists, remove;
         auto tmpPath = testDataDir ~ "/test-zipr-absurdcount.zip";
@@ -1068,6 +1096,7 @@ version(unittest) {
 
     @("zip security: overflow in dataStart calculation throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         import std.file : read, write, exists, remove;
         auto tmpPath = testDataDir ~ "/test-zipr-overflow.zip";

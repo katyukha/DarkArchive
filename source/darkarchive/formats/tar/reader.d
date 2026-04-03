@@ -407,13 +407,12 @@ private long unixTimeToStdTime(long unixTime) pure nothrow @nogc {
 // ===========================================================================
 
 version(unittest) {
-    import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse,
-        shouldBeGreaterThan;
 
     private immutable testDataDir = "test-data";
 
     @("tar read: symlink entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = TarReader(testDataDir ~ "/test-symlink.tar");
         bool foundLink, foundTarget;
         foreach (entry; reader.entries) {
@@ -433,6 +432,7 @@ version(unittest) {
 
     @("tar read: zero-byte files")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = TarReader(testDataDir ~ "/test-empty-files.tar");
         bool foundGitkeep, foundEmpty, foundNotempty;
         foreach (entry; reader.entries) {
@@ -459,6 +459,7 @@ version(unittest) {
 
     @("tar read: directory entries")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = TarReader(testDataDir ~ "/test-symlink.tar");
         bool foundDir;
         foreach (entry; reader.entries)
@@ -468,6 +469,7 @@ version(unittest) {
 
     @("tar read: permissions parsed")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto reader = TarReader(testDataDir ~ "/test-empty-files.tar");
         foreach (entry; reader.entries)
             if (entry.pathname == "./notempty.txt")
@@ -480,6 +482,7 @@ version(unittest) {
 
     @("tar security: non-tar data does not crash")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import std.file : exists, remove, write;
         auto tmpPath = "test-data/test-tarr-garbage.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -496,6 +499,7 @@ version(unittest) {
 
     @("tar security: truncated archive does not crash")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-trunc-src.tar";
@@ -524,6 +528,7 @@ version(unittest) {
 
     @("tar security: pax with zero-length record does not hang")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto malicious1 = cast(const(ubyte)[]) "0 path=evil\n";
         auto result1 = parsePaxData(malicious1);
         result1.length.shouldEqual(0); // "0" means zero-length record — nothing parsed
@@ -539,6 +544,7 @@ version(unittest) {
 
     @("tar security: octal overflow throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         auto normal = cast(const(ubyte)[]) "0000644\0";
         parseOctal(normal).shouldEqual(420);
         auto maxval = cast(const(ubyte)[]) "77777777777";
@@ -552,6 +558,7 @@ version(unittest) {
 
     @("tar security: garbage header rejected by checksum")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import std.file : exists, remove, write;
         auto tmpPath = "test-data/test-tarr-badchecksum.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -572,6 +579,7 @@ version(unittest) {
 
     @("tar format: data size exactly 512 bytes, no padding")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-exact512.tar";
@@ -599,6 +607,7 @@ version(unittest) {
 
     @("tar format: data size 513 bytes, needs 511 padding")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-over512.tar";
@@ -625,6 +634,7 @@ version(unittest) {
 
     @("tar format: single byte entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-onebyte.tar";
@@ -648,6 +658,7 @@ version(unittest) {
 
     @("tar format: GNU long filename does not crash, entries iterable")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         // GNU tar uses ././@LongLink pseudo-entries for names > 100 chars.
         // Our reader skips GNU extensions (only supports pax). Verify we
         // still iterate without crashing and produce at least one entry.
@@ -660,6 +671,7 @@ version(unittest) {
 
     @("tar format: empty filename produces empty string, not null")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-emptyname.tar";
@@ -687,6 +699,7 @@ version(unittest) {
 
     @("CVE: pax size attribute with absurd value")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         // Pax record declares length 30 but actual data is shorter —
         // parser must reject (recordLen > text.length) without crash.
         auto maliciousPax = cast(const(ubyte)[]) "30 size=99999999999999999999\n";
@@ -703,6 +716,7 @@ version(unittest) {
 
     @("tar security: huge size field does not OOB")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-hugesize-src.tar";
@@ -739,6 +753,7 @@ version(unittest) {
 
     @("tar security: entry with zero size does not crash readData")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-zerosize.tar";
@@ -760,6 +775,7 @@ version(unittest) {
 
     @("tar security: corrupted header mid-archive throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : TarWriter;
         import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-corrupt-src.tar";

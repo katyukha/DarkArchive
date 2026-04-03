@@ -38,7 +38,6 @@ const(ubyte)[] gunzip(const(ubyte)[] data) {
 // ===========================================================================
 
 version(unittest) {
-    import unit_threaded.assertions : shouldEqual, shouldBeTrue;
     import darkarchive.formats.tar.reader : TarReader;
 
     private immutable testDataDir = "test-data";
@@ -46,6 +45,7 @@ version(unittest) {
     /// Plain .gz — single compressed file
     @("gzip read: plain gzip single file")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : read;
         auto data = cast(const(ubyte)[]) read(testDataDir ~ "/test-single-file.gz");
         auto decompressed = gunzip(data);
@@ -56,6 +56,7 @@ version(unittest) {
     /// Read tar.gz — decompress then parse tar
     @("gzip+tar read: tar.gz iterate and verify")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test.tar.gz");
         auto tarData = gunzip(gzData);
@@ -83,6 +84,7 @@ version(unittest) {
     /// Empty tar.gz — zero entries
     @("gzip+tar read: empty archive, zero entries")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-empty.tar.gz");
         auto tarData = gunzip(gzData);
@@ -104,6 +106,7 @@ version(unittest) {
     /// Large entry from external tar.gz (128KB)
     @("gzip+tar read: 128KB file, multi-chunk")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : read, write, exists, remove;
         auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-large-entry.tar.gz");
         auto tarData = gunzip(gzData);
@@ -127,6 +130,7 @@ version(unittest) {
     /// Corrupted gzip data must be detected (CRC32 or inflate error)
     @("gzip security: corrupted data detected")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : read;
         import darkarchive.exception : DarkArchiveException;
 
@@ -148,6 +152,7 @@ version(unittest) {
     /// Invalid gzip magic bytes must throw
     @("gzip security: invalid magic throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.exception : DarkArchiveException;
 
         auto garbage = cast(const(ubyte)[]) "not gzip data at all!!";
@@ -163,6 +168,7 @@ version(unittest) {
     /// Truncated gzip (just header, no data) must throw
     @("gzip security: truncated gzip throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         ubyte[10] header = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xFF];
         bool caught;
         try {
@@ -176,6 +182,7 @@ version(unittest) {
     /// Streaming gzip decompression via GzipSequentialReader + TarReader
     @("gzip: streaming decompression via GzipSequentialReader")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.datasource : GzipSequentialReader;
 
         auto gzStream = new GzipSequentialReader(testDataDir ~ "/test.tar.gz");
@@ -192,6 +199,7 @@ version(unittest) {
     /// Memory consistency: streaming through tar.gz should not accumulate memory
     @("gzip: streaming does not accumulate memory")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.tar.writer : TarWriter, gzipCompress;
         import darkarchive.datasource : GzipSequentialReader;
         import core.memory : GC;

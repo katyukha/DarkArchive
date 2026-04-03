@@ -290,11 +290,11 @@ ubyte[] gzipCompress(const(ubyte)[] data) {
 // ===========================================================================
 
 version(unittest) {
-    import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
     import darkarchive.formats.tar.reader : TarReader;
 
     @("tar write: round-trip with addBuffer")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-roundtrip.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -324,6 +324,7 @@ version(unittest) {
 
     @("tar write: addDirectory")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-dir.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -342,6 +343,7 @@ version(unittest) {
 
     @("tar write: addSymlink")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-symlink.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -363,6 +365,7 @@ version(unittest) {
 
     @("tar write: long UTF-8 pathname via pax extended header")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.array : replicate;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-pax-utf8.tar";
@@ -387,6 +390,7 @@ version(unittest) {
 
     @("tar write: method chaining")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-chaining.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -408,6 +412,7 @@ version(unittest) {
 
     @("tar.gz write: round-trip via gzipCompress + gunzip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import darkarchive.gzip : gunzip;
         import std.file : exists, remove, read, write;
 
@@ -452,6 +457,7 @@ version(unittest) {
 
     @("tar write: single file, verify content")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-single.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -474,6 +480,7 @@ version(unittest) {
 
     @("tar interop: written tar.gz readable by system tar")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : write, remove, exists, read;
         import std.process : execute;
 
@@ -503,6 +510,7 @@ version(unittest) {
 
     @("tar write security: octal overflow in size field throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import darkarchive.exception : DarkArchiveException;
         ubyte[12] field;
         bool caught;
@@ -519,6 +527,7 @@ version(unittest) {
     /// addStream with known size must throw if too few bytes provided
     @("tar write security: addStream throws on size underflow")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import darkarchive.exception : DarkArchiveException;
 
@@ -541,6 +550,7 @@ version(unittest) {
     /// addStream with known size must throw if too many bytes provided
     @("tar write security: addStream throws on size overflow")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import darkarchive.exception : DarkArchiveException;
 
@@ -564,6 +574,7 @@ version(unittest) {
     /// File-backed writer round-trip
     @("tar write: file-backed streaming round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto outPath = "test-data/test-file-writer.tar";
@@ -591,6 +602,7 @@ version(unittest) {
     /// UTF-8 filenames round-trip (parity with ZIP writer UTF-8 test)
     @("tar write: UTF-8 filenames round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import std.algorithm : canFind;
 
@@ -619,6 +631,7 @@ version(unittest) {
     /// Many entries round-trip (parity with ZIP reader many-entries test)
     @("tar write: 150 entries round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import std.format : format;
 
@@ -642,6 +655,7 @@ version(unittest) {
     /// Permission value preservation round-trip
     @("tar write: permission values preserved")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import std.conv : octal;
 

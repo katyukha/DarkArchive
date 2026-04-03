@@ -341,10 +341,10 @@ private {
 // ===========================================================================
 
 version(unittest) {
-    import unit_threaded.assertions : shouldEqual, shouldBeTrue;
 
     @("datasource: readSlice at offset")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : write, remove;
         enum path = "test-data/tmp-datasource-read.bin";
         write(path, "Hello, World!");
@@ -358,6 +358,7 @@ version(unittest) {
 
     @("datasource: read ZIP magic bytes")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         auto ds = DataSource.fromFile("test-data/test-zip.zip");
         scope(exit) ds.close();
         assert(ds.length > 0);
@@ -368,6 +369,7 @@ version(unittest) {
 
     @("datasource: readLE")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : write, remove;
         enum path = "test-data/tmp-datasource-readle.bin";
         write(path, cast(const(ubyte)[]) [0x50, 0x4B, 0x03, 0x04, 0x00]);
@@ -379,6 +381,7 @@ version(unittest) {
 
     @("datasource: findBackward finds EOCD signature")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.zip.types : ZIP_END_OF_CENTRAL_DIR_SIG;
         auto ds = DataSource.fromFile("test-data/test-zip.zip");
         scope(exit) ds.close();
@@ -389,6 +392,7 @@ version(unittest) {
 
     @("datasource: out-of-bounds read throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import std.file : write, remove;
         import darkarchive.exception : DarkArchiveException;
         enum path = "test-data/tmp-datasource-oob.bin";

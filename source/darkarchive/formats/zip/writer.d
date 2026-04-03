@@ -498,12 +498,12 @@ private struct LocalEntryInfo {
 // ===========================================================================
 
 version(unittest) {
-    import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
     import darkarchive.formats.zip.reader : ZipReader;
 
     /// Write zip round-trip with addBuffer + addDirectory
     @("zip write: round-trip with addBuffer + addDirectory")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-zip-wrt-roundtrip.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -542,6 +542,7 @@ version(unittest) {
     /// Streaming write with addStream
     @("zip write: addStream streaming round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-zip-wrt-stream.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -568,6 +569,7 @@ version(unittest) {
     /// Method chaining
     @("zip write: method chaining")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-zip-wrt-chaining.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -588,6 +590,7 @@ version(unittest) {
     /// Large entry — 32KB data
     @("zip write: large entry multi-chunk")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-zip-wrt-large.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -617,6 +620,7 @@ version(unittest) {
     /// Entry properties
     @("zip write: entry properties (isFile, isDir, size)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-zip-wrt-props.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -645,6 +649,7 @@ version(unittest) {
     /// UTF-8 filenames in written archive
     @("zip write: UTF-8 filenames round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.algorithm : canFind;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-zip-wrt-utf8.zip";
@@ -670,6 +675,7 @@ version(unittest) {
     /// Written ZIP is readable by ZipReader from file
     @("zip write: write to file, read back")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-zip-wrt-file-readback.zip";
@@ -694,6 +700,7 @@ version(unittest) {
     /// Written ZIP is readable by Python's zipfile
     @("zip interop: written ZIP readable by Python")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import std.process : execute;
 
@@ -730,6 +737,7 @@ except Exception as e:
     /// Filename > 65535 bytes must throw, not silently truncate
     @("zip write security: filename > 65535 bytes throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import darkarchive.exception : DarkArchiveException;
         import std.array : replicate;
         import std.file : exists, remove;
@@ -753,6 +761,7 @@ except Exception as e:
     /// ZIP symlink round-trip: write symlink, read back
     @("zip write: symlink round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-zip-wrt-symlink.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -785,6 +794,7 @@ except Exception as e:
     /// addStream with known size must throw if too few bytes provided
     @("zip write security: addStream throws on size underflow")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import darkarchive.exception : DarkArchiveException;
 
@@ -807,6 +817,7 @@ except Exception as e:
     /// addStream with known size must throw if too many bytes provided
     @("zip write security: addStream throws on size overflow")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import darkarchive.exception : DarkArchiveException;
 

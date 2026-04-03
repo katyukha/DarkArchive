@@ -839,13 +839,13 @@ struct DarkArchiveWriter {
 // ===========================================================================
 
 version(unittest) {
-    import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
 
     private immutable testDataDir = "test-data";
 
     /// Read zip via high-level API
     @("high-level: read zip and verify content")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         auto reader = DarkArchiveReader(Path(testDataDir, "test-zip.zip"));
         reader.detectedFormat().shouldEqual(DarkArchiveFormat.zip);
         string[] names;
@@ -862,6 +862,7 @@ version(unittest) {
     /// Read tar.gz via high-level API
     @("high-level: read tar.gz and verify content")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         auto reader = DarkArchiveReader(Path(testDataDir, "test.tar.gz"));
         reader.detectedFormat().shouldEqual(DarkArchiveFormat.tarGz);
         foreach (entry; reader.entries) {
@@ -875,6 +876,7 @@ version(unittest) {
     /// Write zip round-trip via high-level API
     @("high-level: write zip round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : remove, exists;
 
         auto outPath = Path(testDataDir, "test-hl-write.zip");
@@ -906,6 +908,7 @@ version(unittest) {
     /// Write tar.gz round-trip
     @("high-level: write tar.gz round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : remove, exists;
 
         auto outPath = Path(testDataDir, "test-hl-write.tar.gz");
@@ -938,6 +941,7 @@ version(unittest) {
     /// Cross-format — same data readable from zip and tar.gz
     @("high-level: cross-format round-trip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : remove, exists;
 
         auto zipPath = Path(testDataDir, "test-hl-cross.zip");
@@ -981,6 +985,7 @@ version(unittest) {
     /// Error handling — non-existent file
     @("high-level: non-existent file throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         bool caught;
         try {
             auto reader = DarkArchiveReader(Path("nonexistent-file.zip"));
@@ -993,6 +998,7 @@ version(unittest) {
     /// Extract to directory
     @("high-level: extractTo")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, readText, rmdirRecurse;
 
         auto extractDir = Path(testDataDir, "extract-test");
@@ -1011,6 +1017,7 @@ version(unittest) {
     /// Write to file, read back
     @("high-level: write to file, read back")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-hl-mem.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -1031,6 +1038,7 @@ version(unittest) {
     /// Method chaining
     @("high-level: method chaining")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-hl-chain.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
@@ -1058,6 +1066,7 @@ version(unittest) {
     /// Path traversal: entry with "../" must be rejected by extractTo
     @("security: extractTo rejects path with '..' components")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-sec-dotdot.zip";
@@ -1086,6 +1095,7 @@ version(unittest) {
     /// Path traversal: entry with "foo/../../escape.txt" must be rejected
     @("security: extractTo rejects nested '..' traversal")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-sec-nested-dotdot.zip";
@@ -1111,6 +1121,7 @@ version(unittest) {
     /// Path traversal: absolute path must be rejected
     @("security: extractTo rejects absolute paths")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-sec-abs.zip";
@@ -1136,6 +1147,7 @@ version(unittest) {
     /// Symlink with absolute target: skipped by default (no symlinks flag)
     @("security: extractTo skips symlink with absolute target by default")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1160,6 +1172,7 @@ version(unittest) {
     /// Symlink with absolute target: rejected when symlinks flag IS set
     version(Posix) @("security: extractTo rejects absolute symlink when symlinks enabled")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1189,6 +1202,7 @@ version(unittest) {
     /// Symlink with traversal target: skipped by default
     @("security: extractTo skips symlink with traversal target by default")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1213,6 +1227,7 @@ version(unittest) {
     /// Symlink with traversal target: rejected when symlinks flag IS set
     version(Posix) @("security: extractTo rejects traversal symlink when symlinks enabled")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1242,6 +1257,7 @@ version(unittest) {
     /// Entry name "." and ".." as standalone components
     @("security: extractTo rejects entry named '..'")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-sec-dotdot-name.zip";
@@ -1272,6 +1288,7 @@ version(unittest) {
     /// With defaults (no symlinks flag), symlinks are skipped — attack is moot.
     @("CVE: two-step symlink+file — safe by default (symlinks skipped)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1299,6 +1316,7 @@ version(unittest) {
     /// CVE-2021-20206: With symlinks enabled, absolute target is still rejected
     version(Posix) @("CVE: two-step symlink+file — absolute target rejected with symlinks enabled")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1330,6 +1348,7 @@ version(unittest) {
     /// CVE-2021-20206 variant: relative symlink escape — safe by default
     @("CVE: two-step relative symlink — safe by default (symlinks skipped)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1355,6 +1374,7 @@ version(unittest) {
     /// CVE-2021-20206 relative: with symlinks enabled, traversal target rejected
     version(Posix) @("CVE: two-step relative symlink — rejected with symlinks enabled")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1386,6 +1406,7 @@ version(unittest) {
     /// not substring match. "file..name.txt" is a legitimate filename.
     @("CVE: Zip Slip - file..name.txt is legitimate, not rejected")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-cve-legit-dotdot.zip";
@@ -1411,6 +1432,7 @@ version(unittest) {
     /// ustar header has clean name, but pax path = "../../evil.txt"
     @("CVE: pax path override with traversal")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1439,6 +1461,7 @@ version(unittest) {
     /// Without symlinks flag, symlinks are skipped regardless of target
     @("security: absolute symlink skipped with DarkExtractFlags.none")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1464,6 +1487,7 @@ version(unittest) {
     /// With symlinks flag but no securePaths, absolute symlink is still rejected
     version(Posix) @("security: absolute symlink rejected unconditionally with symlinks flag")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1497,6 +1521,7 @@ version(unittest) {
     /// By default (no symlinks flag), symlink entries are skipped during extraction
     @("security: symlinks skipped by default during extraction")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, isSymlink, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1527,6 +1552,7 @@ version(unittest) {
     /// With symlinks flag, safe relative symlinks are created
     version(Posix) @("security: symlinks created when flag is set")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, isSymlink, readText, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1559,6 +1585,7 @@ version(unittest) {
     /// With symlinks flag, absolute targets are still rejected
     version(Posix) @("security: absolute symlink still rejected even with symlinks flag")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1594,6 +1621,7 @@ version(unittest) {
     /// But the entry claims a different name. Must not cause confusion.
     @("attack: null byte in filename")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-atk-null-byte.zip";
@@ -1620,6 +1648,7 @@ version(unittest) {
     /// extractTo strips "./" prefix, leaving empty path, which is skipped.
     @("attack: filename is just '.'")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove, dirEntries, SpanMode;
 
         auto tmpPath = "test-data/test-atk-dot-name.zip";
@@ -1654,6 +1683,7 @@ version(unittest) {
     /// not crash. Both entries should be readable during iteration.
     @("attack: duplicate filenames in archive")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, readText;
 
         // Create ZIP with duplicate names (Python-generated test data exists)
@@ -1679,6 +1709,7 @@ version(unittest) {
     /// content readable even if filesystem rejects extraction.
     @("attack: very long pathname")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import std.array : replicate;
 
@@ -1709,6 +1740,7 @@ version(unittest) {
     /// Control characters in filename (newlines, tabs)
     @("attack: control characters in filename")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-atk-ctrl-char.zip";
@@ -1746,6 +1778,7 @@ version(unittest) {
     /// Library should not crash; ideally entries are still iterable.
     @("attack: RTL override in filename")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-atk-rtl.zip";
@@ -1770,6 +1803,7 @@ version(unittest) {
     /// Library must not allocate unbounded memory.
     @("attack: deflate bomb (high compression ratio)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import darkarchive.formats.zip.writer : ZipWriter;
         import darkarchive.formats.zip.reader : ZipReader;
@@ -1802,6 +1836,7 @@ version(unittest) {
     /// header — amplification attack. Reading both should not crash.
     @("attack: overlapping central directory entries")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import darkarchive.formats.zip.writer : ZipWriter;
         import darkarchive.formats.zip.reader : ZipReader;
 
@@ -1821,6 +1856,7 @@ version(unittest) {
     /// File and directory with same name — what happens?
     @("attack: file and directory with same name")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-atk-conflict.zip";
@@ -1848,6 +1884,7 @@ version(unittest) {
     /// "file.txt:hidden" on Windows writes to ADS. On Linux it's a valid filename.
     @("attack: colon in filename (NTFS ADS)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-atk-colon.zip";
@@ -1874,6 +1911,7 @@ version(unittest) {
     /// processEntries on ZIP — find specific entry and read content
     @("processEntries: ZIP find and read specific entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-pe-zip-find.zip";
@@ -1900,6 +1938,7 @@ version(unittest) {
     /// processEntries on TAR — sequential find
     @("processEntries: TAR find and read specific entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -1927,6 +1966,7 @@ version(unittest) {
     /// processEntries — returns 0 when no match, delegate never called
     @("processEntries: returns 0 when no match")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-pe-no-match.zip";
@@ -1950,6 +1990,7 @@ version(unittest) {
     /// processEntries — multiple entries, all found
     @("processEntries: multiple entries all found")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-pe-multi-found.zip";
@@ -1978,6 +2019,7 @@ version(unittest) {
     /// processEntries on TAR.GZ — works through gzip layer
     @("processEntries: TAR.GZ through gzip layer")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : remove, exists;
 
         auto tmpTarGz = "test-data/test-pe-targz.tar.gz";
@@ -2001,6 +2043,7 @@ version(unittest) {
     /// processEntries all-entries overload — delegate called for every entry
     @("processEntries: all-entries overload")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-pe-all-entries.zip";
@@ -2026,6 +2069,7 @@ version(unittest) {
     /// processEntries — delegate reads data via readAll
     @("processEntries: delegate reads binary data via readAll")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto testData = new ubyte[](1024);
@@ -2052,6 +2096,7 @@ version(unittest) {
     /// processEntries with real test-data archives
     @("processEntries: real test-zip.zip")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         auto reader = DarkArchiveReader(Path(testDataDir, "test-zip.zip"));
         string content;
         auto count = reader.processEntries(["file1.txt"],
@@ -2065,6 +2110,7 @@ version(unittest) {
     /// processEntries with real tar.gz
     @("processEntries: real test.tar.gz")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         auto reader = DarkArchiveReader(Path(testDataDir, "test.tar.gz"));
         string content;
         auto count = reader.processEntries(["./file2.txt"],
@@ -2078,6 +2124,7 @@ version(unittest) {
     /// processEntries — read data in chunks without loading full entry
     @("processEntries: chunked read avoids full memory load")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         // Create entry with 32KB of data
@@ -2112,6 +2159,7 @@ version(unittest) {
     /// processEntries — chunked read on TAR works
     @("processEntries: chunked read on TAR")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import darkarchive.formats.tar : TarWriter;
 
@@ -2141,6 +2189,7 @@ version(unittest) {
     /// processEntries — extractTo uses chunked writes (not readAll)
     @("processEntries: extractTo uses streaming write")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, readText, getSize, remove;
 
         // Create archive with a 64KB entry
@@ -2169,6 +2218,7 @@ version(unittest) {
     /// processEntries — chunked read on empty entry produces no chunks
     @("processEntries: chunked read on empty entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-pe-empty.zip";
@@ -2197,6 +2247,7 @@ version(unittest) {
     /// Strip prefix — delegate removes "odoo-18.0/" from destPath
     @("extractTo delegate: strip prefix (unfoldPath)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, readText, remove;
 
         auto tmpPath = "test-data/test-dlg-unfold.zip";
@@ -2232,6 +2283,7 @@ version(unittest) {
     /// Skip by extension — delegate returns false for .pyc
     @("extractTo delegate: skip .pyc files")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
         import std.algorithm : endsWith;
 
@@ -2263,6 +2315,7 @@ version(unittest) {
     /// Security after delegate — delegate adds "../", exception thrown
     @("extractTo delegate: security catches delegate-introduced traversal")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-dlg-sec-trav.zip";
@@ -2292,6 +2345,7 @@ version(unittest) {
     /// Delegate introduces absolute path — exception thrown
     @("extractTo delegate: security catches delegate-introduced absolute path")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-dlg-sec-abs.zip";
@@ -2321,6 +2375,7 @@ version(unittest) {
     /// Null delegate — same as no-delegate overload
     @("extractTo delegate: null delegate same as default")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, readText, remove;
 
         auto tmpPath = "test-data/test-dlg-null.zip";
@@ -2343,6 +2398,7 @@ version(unittest) {
     /// Skip all entries — empty extraction dir
     @("extractTo delegate: skip all entries")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, dirEntries, SpanMode, remove;
 
         auto tmpPath = "test-data/test-dlg-skip-all.zip";
@@ -2373,6 +2429,7 @@ version(unittest) {
     /// Backward compatibility — existing extractTo still works
     @("extractTo delegate: backward compatibility")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, readText, remove;
 
         auto tmpPath = "test-data/test-dlg-compat.zip";
@@ -2403,6 +2460,7 @@ version(unittest) {
     /// Delegate can read sourceEntry metadata
     @("extractTo delegate: read sourceEntry metadata")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-dlg-metadata.zip";
@@ -2433,6 +2491,7 @@ version(unittest) {
     /// extractTo delegate on TAR.GZ
     @("extractTo delegate: works on TAR.GZ")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, readText, remove;
 
         auto tmpTarGz = "test-data/test-dlg-targz.tar.gz";
@@ -2465,6 +2524,7 @@ version(unittest) {
     /// addTree follows symlinks by default — archives target content
     @("addTree: follows symlinks by default")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         version(Posix) {
             import std.file : exists, rmdirRecurse, mkdirRecurse, write,
                 symlink, readText, getcwd, remove;
@@ -2502,6 +2562,7 @@ version(unittest) {
     /// addTree with FollowSymlinks.no preserves symlinks (Posix only)
     @("addTree: FollowSymlinks.no preserves symlinks")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         version(Posix) {
             import std.file : exists, rmdirRecurse, mkdirRecurse, write,
                 symlink, getcwd, remove;
@@ -2537,6 +2598,7 @@ version(unittest) {
     /// addTree default on directory with no symlinks — works same as before
     @("addTree: no symlinks in source works normally")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, mkdirRecurse, write, getcwd, remove;
 
         auto srcDir = Path(getcwd(), testDataDir, "nosym-tree-src");
@@ -2564,6 +2626,7 @@ version(unittest) {
     /// addTree with dangling symlink — must throw (broken source data)
     @("addTree: dangling symlink throws")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         version(Posix) {
             import std.file : exists, rmdirRecurse, mkdirRecurse, write,
                 symlink, getcwd, remove;
@@ -2590,6 +2653,7 @@ version(unittest) {
     /// addTree with circular symlinks — must throw, not hang
     @("addTree: circular symlinks throw, not hang")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         version(Posix) {
             import std.file : exists, rmdirRecurse, mkdirRecurse, write,
                 symlink, getcwd, remove;
@@ -2621,6 +2685,7 @@ version(unittest) {
     /// extractTo preserves safe permission bits (rwx) by default
     version(Posix) @("extractTo: preserves execute permission by default")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, getAttributes, remove;
         import std.conv : octal;
         import darkarchive.formats.tar : TarWriter;
@@ -2655,6 +2720,7 @@ version(unittest) {
     /// extractTo strips dangerous bits (setuid, setgid, sticky)
     version(Posix) @("extractTo: strips setuid/setgid/sticky bits")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, getAttributes, remove;
         import std.conv : octal;
         import darkarchive.formats.tar : TarWriter;
@@ -2692,6 +2758,7 @@ version(unittest) {
     /// extractTo caps group/other write bits (prevents world-writable files)
     version(Posix) @("extractTo: caps group/other write bits")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, getAttributes, remove;
         import std.conv : octal;
         import darkarchive.formats.tar : TarWriter;
@@ -2749,6 +2816,7 @@ version(unittest) {
     /// TAR write to file should not accumulate archive in memory
     @("streaming write: TAR to file does not accumulate memory")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove, getSize;
         import core.memory : GC;
 
@@ -2784,6 +2852,7 @@ version(unittest) {
     /// ZIP write to file should not accumulate archive in memory
     @("streaming write: ZIP to file does not accumulate memory")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove, getSize;
         import core.memory : GC;
 
@@ -2817,6 +2886,7 @@ version(unittest) {
     /// TAR.GZ write to file should not accumulate archive in memory
     @("streaming write: TAR.GZ to file does not accumulate memory")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove, getSize;
         import core.memory : GC;
 
@@ -2850,6 +2920,7 @@ version(unittest) {
     /// Written streaming archive should be readable and correct
     @("streaming write: TAR round-trip via streaming write")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto outPath = Path(testDataDir, "stream-write-roundtrip.tar");
@@ -2883,6 +2954,7 @@ version(unittest) {
     /// header then stream data directly without buffering.
     @("streaming: TAR addStream with known size does not buffer full entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove, getSize;
         import core.memory : GC;
 
@@ -2918,6 +2990,7 @@ version(unittest) {
     /// enabling true streaming with incremental CRC32 + deflate.
     @("streaming: ZIP addStream with known size does not buffer full entry")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove, getSize;
         import core.memory : GC;
 
@@ -2952,6 +3025,7 @@ version(unittest) {
     /// Should stream file chunks to the archive writer.
     @("streaming: add() from disk does not load full file into memory")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove, getSize;
         import std.stdio : File;
         import core.memory : GC;
@@ -2993,6 +3067,7 @@ version(unittest) {
     /// buffers the full 4MB entry.
     @("streaming: full write+read pipeline stays constant memory (TAR)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import core.memory : GC;
 
@@ -3038,6 +3113,7 @@ version(unittest) {
     /// Full pipeline for ZIP: write+read large entry with constant memory
     @("streaming: full write+read pipeline stays constant memory (ZIP)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import core.memory : GC;
 
@@ -3083,6 +3159,7 @@ version(unittest) {
     /// Full pipeline for TAR.GZ: write+read large entry with constant memory
     @("streaming: full write+read pipeline stays constant memory (TAR.GZ)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
         import core.memory : GC;
 
@@ -3128,6 +3205,7 @@ version(unittest) {
     /// addStream round-trip: data written via streaming must be readable and correct
     @("streaming: addStream round-trip data integrity (TAR)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto outPath = "test-data/stream-roundtrip-tar.tar";
@@ -3167,6 +3245,7 @@ version(unittest) {
     /// /tmp -> /private/tmp caused verifyPathWithinRoot to reject valid paths.
     version(Posix) @("extractTo: symlinked extraction root resolves correctly")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, rmdirRecurse, remove, readText, symlink, mkdir;
 
         auto zipPath = "test-data/test-symroot.zip";
@@ -3199,6 +3278,7 @@ version(unittest) {
     /// addStream round-trip data integrity for ZIP
     @("streaming: addStream round-trip data integrity (ZIP)")
     unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.file : exists, remove;
 
         auto outPath = "test-data/stream-roundtrip-zip.zip";
