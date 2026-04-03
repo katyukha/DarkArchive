@@ -505,10 +505,8 @@ struct DarkArchiveReader {
     /// Check if a resolved path stays within the expected root directory.
     /// Defends against two-step symlink+file attacks (CVE-2021-20206 pattern).
     private static void verifyPathWithinRoot(string path, string root) {
-        import std.path : absolutePath, buildNormalizedPath;
-
         auto resolved = resolveRealPath(path);
-        auto normalRoot = buildNormalizedPath(absolutePath(root));
+        auto normalRoot = resolveRealPath(root);
 
         if (!pathStartsWith(resolved, normalRoot))
             throw new DarkArchiveException(
@@ -3158,6 +3156,44 @@ version(unittest) {
 
         readBack.length.shouldEqual(ENTRY_SIZE);
         readBack.shouldEqual(sourceData);
+    }
+
+    // -------------------------------------------------------------------
+    // extractTo: symlinked root (macOS /tmp -> /private/tmp regression)
+    // -------------------------------------------------------------------
+
+    /// extractTo must succeed when the extraction root itself is (or is under) a
+    /// symlinked directory.  Reproduces the macOS CI failure where
+    /// /tmp -> /private/tmp caused verifyPathWithinRoot to reject valid paths.
+    version(Posix) @("extractTo: symlinked extraction root resolves correctly")
+    unittest {
+        import std.file : exists, rmdirRecurse, remove, readText, symlink, mkdir;
+
+        auto zipPath = "test-data/test-symroot.zip";
+        scope(exit) if (exists(zipPath)) remove(zipPath);
+
+        auto writer = DarkArchiveWriter(zipPath, DarkArchiveFormat.zip);
+        writer.addBuffer("hello.txt", cast(const(ubyte)[]) "hello");
+        writer.finish();
+
+        // real dir + relative symlink pointing to it (mirrors macOS /tmp -> /private/tmp)
+        auto realDir = "test-data/symroot-real";
+        auto linkDir = "test-data/symroot-link";
+        scope(exit) {
+            if (exists(realDir)) rmdirRecurse(realDir);
+            if (exists(linkDir)) remove(linkDir);
+        }
+        mkdir(realDir);
+        symlink("symroot-real", linkDir);
+
+        auto reader = DarkArchiveReader(zipPath);
+        scope(exit) reader.close();
+
+        // Must NOT throw "Refusing to write file: resolved path escapes extraction directory"
+        reader.extractTo(Path(linkDir));
+
+        assert(exists(realDir ~ "/hello.txt"), "file must land in the real dir");
+        readText(realDir ~ "/hello.txt").shouldEqual("hello");
     }
 
     /// addStream round-trip data integrity for ZIP
