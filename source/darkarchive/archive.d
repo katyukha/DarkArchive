@@ -11,7 +11,7 @@ import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip : ZipReader, ZipWriter;
 import darkarchive.formats.tar : TarReader, TarWriter;
-import darkarchive.datasource : GzipSequentialReader;
+import darkarchive.datasource : GzipSequentialReader, DelegateSequentialReader, chunkSource;
 
 import thepath : Path;
 
@@ -22,6 +22,37 @@ enum DarkArchiveFormat {
     tar,
     tarGz,
     // tarZst,  -- future stage
+}
+
+/// Optional capabilities that vary by format.
+enum ArchiveCapability {
+    streamingRead,   /// Can construct reader from a ubyte[] delegate() chunk source
+    streamingWrite,  /// Can construct writer with a void delegate(const ubyte[]) sink
+    randomAccessRead /// Can seek to arbitrary entries (e.g. ZIP central directory)
+}
+
+/// Query whether a format supports a given capability.
+bool supports(DarkArchiveFormat fmt, ArchiveCapability cap) {
+    final switch (cap) {
+        case ArchiveCapability.streamingRead:
+            final switch (fmt) {
+                case DarkArchiveFormat.zip:   return false;
+                case DarkArchiveFormat.tar:   return true;
+                case DarkArchiveFormat.tarGz: return true;
+            }
+        case ArchiveCapability.streamingWrite:
+            final switch (fmt) {
+                case DarkArchiveFormat.zip:   return false; // future: data-descriptor path
+                case DarkArchiveFormat.tar:   return true;
+                case DarkArchiveFormat.tarGz: return true;
+            }
+        case ArchiveCapability.randomAccessRead:
+            final switch (fmt) {
+                case DarkArchiveFormat.zip:   return true;
+                case DarkArchiveFormat.tar:   return false;
+                case DarkArchiveFormat.tarGz: return false;
+            }
+    }
 }
 
 /// Extract behavior flags.
@@ -66,6 +97,23 @@ struct ExtractParams {
 
 /// Create a TarWriter that pipes output through streaming gzip compressor
 /// directly to a file. No temporary files, constant memory.
+private TarWriter createGzipTarWriterToSink(void delegate(const(ubyte)[]) sink) {
+    import std.zlib : Compress, HeaderFormat;
+    auto compressor = new Compress(6, HeaderFormat.gzip);
+    return TarWriter.createToSink(
+        (const(ubyte)[] bytes) {
+            auto compressed = cast(ubyte[]) compressor.compress(bytes);
+            if (compressed.length > 0)
+                sink(compressed);
+        },
+        () {
+            auto tail = cast(ubyte[]) compressor.flush();
+            if (tail.length > 0)
+                sink(tail);
+        }
+    );
+}
+
 private TarWriter createGzipTarWriter(string outputPath) {
     import std.stdio : File;
     import std.zlib : Compress, HeaderFormat;
@@ -170,8 +218,32 @@ struct DarkArchiveReader {
     }
 
 
-    /// Detected archive format.
-    DarkArchiveFormat detectedFormat() const {
+    /// Construct a streaming reader from a chunk-producing delegate.
+    ///
+    /// The delegate returns the next compressed/raw chunk on each call,
+    /// or an empty slice on EOF. The returned slice must remain valid
+    /// until the next delegate call — `.dup` if the source reuses buffers.
+    ///
+    /// Only TAR and TAR.GZ formats are supported. ZIP requires random
+    /// access and will throw immediately. Check `supports(fmt, streamingRead)`
+    /// before calling if the format is not known at compile time.
+    this(DarkArchiveFormat fmt, ubyte[] delegate() source) {
+        _format = fmt;
+        final switch (fmt) {
+            case DarkArchiveFormat.zip:
+                throw new DarkArchiveException(
+                    "ZIP does not support streaming read — use supports() to check first");
+            case DarkArchiveFormat.tar:
+                _tar = new TarReader(new DelegateSequentialReader(source));
+                break;
+            case DarkArchiveFormat.tarGz:
+                _tar = new TarReader(new GzipSequentialReader(source));
+                break;
+        }
+    }
+
+    /// Archive format (detected from extension or set explicitly).
+    DarkArchiveFormat format() const {
         return _format;
     }
 
@@ -664,6 +736,32 @@ struct DarkArchiveWriter {
         createWriter();
     }
 
+    /// Create a streaming writer that pipes output to a sink delegate.
+    ///
+    /// The sink receives raw or compressed output chunks as the archive is
+    /// built. `finish()` must be called explicitly — the destructor will not
+    /// auto-finish sink-backed writers (unlike file-backed writers, where
+    /// `finish()` is called automatically on destruction).
+    ///
+    /// Only TAR and TAR.GZ are supported. ZIP is not yet supported.
+    /// Check `supports(fmt, streamingWrite)` before calling if unsure.
+    this(DarkArchiveFormat fmt, void delegate(const(ubyte)[]) sink) {
+        _format = fmt;
+        final switch (fmt) {
+            case DarkArchiveFormat.zip:
+                throw new DarkArchiveException(
+                    "ZIP does not support streaming write — use supports() to check first");
+            case DarkArchiveFormat.tar:
+                _tar = new TarWriter();
+                *_tar = TarWriter.createToSink(sink);
+                break;
+            case DarkArchiveFormat.tarGz:
+                _tar = new TarWriter();
+                *_tar = createGzipTarWriterToSink(sink);
+                break;
+        }
+    }
+
     private void createWriter() {
         if (_filePath is null)
             throw new DarkArchiveException(
@@ -847,7 +945,7 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         auto reader = DarkArchiveReader(Path(testDataDir, "test-zip.zip"));
-        reader.detectedFormat().shouldEqual(DarkArchiveFormat.zip);
+        reader.format.shouldEqual(DarkArchiveFormat.zip);
         string[] names;
         foreach (entry; reader.entries) {
             names ~= entry.pathname;
@@ -864,13 +962,50 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         auto reader = DarkArchiveReader(Path(testDataDir, "test.tar.gz"));
-        reader.detectedFormat().shouldEqual(DarkArchiveFormat.tarGz);
+        reader.format.shouldEqual(DarkArchiveFormat.tarGz);
         foreach (entry; reader.entries) {
             if (entry.pathname == "./file1.txt")
                 reader.readText().shouldEqual("Hello from file1\n");
             else
                 reader.skipData();
         }
+    }
+
+    // -------------------------------------------------------------------
+    // ArchiveCapability / supports()
+    // -------------------------------------------------------------------
+
+    @("capability: ZIP supports randomAccessRead only")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        supports(DarkArchiveFormat.zip, ArchiveCapability.randomAccessRead).shouldBeTrue;
+        supports(DarkArchiveFormat.zip, ArchiveCapability.streamingRead).shouldBeFalse;
+        supports(DarkArchiveFormat.zip, ArchiveCapability.streamingWrite).shouldBeFalse;
+    }
+
+    @("capability: TAR supports streaming read and write")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        supports(DarkArchiveFormat.tar, ArchiveCapability.streamingRead).shouldBeTrue;
+        supports(DarkArchiveFormat.tar, ArchiveCapability.streamingWrite).shouldBeTrue;
+        supports(DarkArchiveFormat.tar, ArchiveCapability.randomAccessRead).shouldBeFalse;
+    }
+
+    @("capability: TAR.GZ supports streaming read and write")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingRead).shouldBeTrue;
+        supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingWrite).shouldBeTrue;
+        supports(DarkArchiveFormat.tarGz, ArchiveCapability.randomAccessRead).shouldBeFalse;
+    }
+
+    @("capability: format property feeds supports() naturally")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        auto reader = DarkArchiveReader(Path(testDataDir, "test-zip.zip"));
+        scope(exit) reader.close();
+        reader.format.supports(ArchiveCapability.randomAccessRead).shouldBeTrue;
+        reader.format.supports(ArchiveCapability.streamingRead).shouldBeFalse;
     }
 
     /// Write zip round-trip via high-level API
@@ -2797,6 +2932,146 @@ version(unittest) {
         auto a4 = getAttributes((extractDir ~ "owner-only.sh").toString);
         assert(a4 & octal!100, "owner-execute preserved");
         assert(!(a4 & octal!40), "no group-read");
+    }
+
+    // -------------------------------------------------------------------
+    // Chunk-based streaming constructors
+    // -------------------------------------------------------------------
+
+    @("streaming read: DarkArchiveReader(tarGz, delegate) reads entries correctly")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        import std.file : read;
+
+        auto compressed = cast(ubyte[]) read(testDataDir ~ "/test.tar.gz");
+        auto reader = DarkArchiveReader(DarkArchiveFormat.tarGz, chunkSource(compressed, 4096));
+        scope(exit) reader.close();
+
+        reader.format.shouldEqual(DarkArchiveFormat.tarGz);
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "./file1.txt") {
+                found = true;
+                reader.readText().shouldEqual("Hello from file1\n");
+            } else {
+                reader.skipData();
+            }
+        }
+        found.shouldBeTrue;
+    }
+
+    @("streaming read: DarkArchiveReader(tar, delegate) reads entries correctly")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        import std.file : read, write, remove, exists;
+
+        // Build a small TAR in memory to use as chunk source
+        auto tarPath = testDataDir ~ "/test-stream-src.tar";
+        scope(exit) if (exists(tarPath)) remove(tarPath);
+        DarkArchiveWriter(tarPath, DarkArchiveFormat.tar)
+            .addBuffer("hello.txt", cast(const(ubyte)[]) "stream content")
+            .finish();
+
+        auto raw = cast(ubyte[]) read(tarPath);
+        auto reader = DarkArchiveReader(DarkArchiveFormat.tar, chunkSource(raw, 512));
+        scope(exit) reader.close();
+
+        reader.format.shouldEqual(DarkArchiveFormat.tar);
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                found = true;
+                reader.readText().shouldEqual("stream content");
+            } else {
+                reader.skipData();
+            }
+        }
+        found.shouldBeTrue;
+    }
+
+    @("streaming read: DarkArchiveReader(zip, delegate) throws immediately")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        bool threw;
+        try {
+            auto reader = DarkArchiveReader(DarkArchiveFormat.zip, () => cast(ubyte[]) []);
+            reader.close();
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
+    }
+
+    @("streaming write: DarkArchiveWriter(tar, sink) produces readable TAR")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        import std.file : write, remove, exists;
+
+        ubyte[] buf;
+        DarkArchiveWriter(DarkArchiveFormat.tar,
+                (const(ubyte)[] chunk) { buf ~= chunk; })
+            .addBuffer("hello.txt", cast(const(ubyte)[]) "sink content")
+            .finish();
+
+        auto tmpPath = testDataDir ~ "/test-sink-tar.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, buf);
+
+        auto reader = DarkArchiveReader(tmpPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                found = true;
+                reader.readText().shouldEqual("sink content");
+            } else {
+                reader.skipData();
+            }
+        }
+        found.shouldBeTrue;
+    }
+
+    @("streaming write: DarkArchiveWriter(tarGz, sink) produces readable TAR.GZ")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
+        import std.file : write, remove, exists;
+
+        ubyte[] buf;
+        DarkArchiveWriter(DarkArchiveFormat.tarGz,
+                (const(ubyte)[] chunk) { buf ~= chunk; })
+            .addBuffer("hello.txt", cast(const(ubyte)[]) "gzip sink content")
+            .finish();
+
+        auto tmpPath = testDataDir ~ "/test-sink-tar.tar.gz";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        write(tmpPath, buf);
+
+        auto reader = DarkArchiveReader(tmpPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                found = true;
+                reader.readText().shouldEqual("gzip sink content");
+            } else {
+                reader.skipData();
+            }
+        }
+        found.shouldBeTrue;
+    }
+
+    @("streaming write: DarkArchiveWriter(zip, sink) throws immediately")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        bool threw;
+        try {
+            auto w = DarkArchiveWriter(DarkArchiveFormat.zip,
+                (const(ubyte)[]) {});
+            w.finish();
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
     }
 
     // -------------------------------------------------------------------

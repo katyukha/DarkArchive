@@ -94,6 +94,24 @@ struct DataSource {
 
 }
 
+/// Create a chunk-producing delegate from an in-memory byte slice.
+///
+/// Returns a delegate that yields successive `chunkSize`-byte slices of
+/// `data` on each call, and an empty slice once exhausted. Each returned
+/// slice is `.dup`-ed, satisfying the chunk-delegate contract that the
+/// slice must remain valid until the next call.
+ubyte[] delegate() chunkSource(ubyte[] data, size_t chunkSize) {
+    size_t offset = 0;
+    return () {
+        if (offset >= data.length) return cast(ubyte[]) [];
+        auto end = offset + chunkSize;
+        if (end > data.length) end = data.length;
+        auto chunk = data[offset .. end].dup;
+        offset = end;
+        return chunk;
+    };
+}
+
 /// Sequential byte stream — used by TarReader for both plain TAR (backed by
 /// DataSource) and TAR.GZ (backed by streaming gzip decompressor).
 /// Unlike DataSource, this is a class for polymorphic dispatch.
@@ -173,7 +191,77 @@ class DataSourceSequentialReader : SequentialReader {
     }
 }
 
-/// SequentialReader backed by streaming gzip decompression of a file.
+/// SequentialReader that pulls bytes from a caller-provided delegate.
+///
+/// The delegate must return the next chunk of raw bytes on each call,
+/// or an empty slice to signal EOF. The returned slice must remain valid
+/// until the next call to the delegate — callers are responsible for
+/// `.dup`-ing if the source buffer is reused between calls.
+class DelegateSequentialReader : SequentialReader {
+    private {
+        ubyte[] delegate() _source;
+        ubyte[] _pending; // unconsumed tail of the last returned chunk
+        bool _eof;
+    }
+
+    this(ubyte[] delegate() source) {
+        _source = source;
+    }
+
+    override ubyte[] read(size_t len) {
+        auto buf = new ubyte[](len);
+        readInto(buf);
+        return buf;
+    }
+
+    override size_t readInto(ubyte[] buf) {
+        size_t filled = 0;
+        while (filled < buf.length) {
+            if (_pending.length == 0) {
+                if (_eof)
+                    throw new DarkArchiveException("TAR: unexpected end of stream");
+                auto chunk = _source();
+                if (chunk.length == 0) { _eof = true; break; }
+                _pending = chunk;
+            }
+            auto take = buf.length - filled;
+            if (take > _pending.length) take = _pending.length;
+            buf[filled .. filled + take] = _pending[0 .. take];
+            filled += take;
+            _pending = _pending[take .. $];
+        }
+        if (filled < buf.length)
+            throw new DarkArchiveException("TAR: unexpected end of stream");
+        return filled;
+    }
+
+    override void skip(size_t len) {
+        while (len > 0) {
+            if (_pending.length == 0) {
+                if (_eof) return;
+                auto chunk = _source();
+                if (chunk.length == 0) { _eof = true; return; }
+                _pending = chunk;
+            }
+            auto take = len > _pending.length ? _pending.length : len;
+            _pending = _pending[take .. $];
+            len -= take;
+        }
+    }
+
+    override bool empty() {
+        if (_pending.length > 0) return false;
+        if (_eof) return true;
+        auto chunk = _source();
+        if (chunk.length == 0) { _eof = true; return true; }
+        _pending = chunk;
+        return false;
+    }
+}
+
+/// SequentialReader backed by streaming gzip decompression of a file or
+/// a caller-provided chunk delegate.
+///
 /// Uses C zlib directly for bounded memory — decompresses into a fixed-size
 /// ring buffer, never accumulating more than DECOMP_BUF_SIZE of decompressed
 /// data regardless of compression ratio. Peak memory: ~576KB
@@ -183,7 +271,13 @@ class GzipSequentialReader : SequentialReader {
         import std.stdio : File;
         import etc.c.zlib;
 
+        // File-backed source (null when using chunk delegate)
         File _file;
+
+        // Delegate-based source (null when using file)
+        ubyte[] delegate() _chunkSource;
+        ubyte[] _currentChunk; // pinned so zlib next_in ptr stays valid
+
         z_stream _zs;
         bool _zsInit;
 
@@ -192,15 +286,16 @@ class GzipSequentialReader : SequentialReader {
         size_t _decompPos;   // read position within _decompBuf
         size_t _decompLen;   // valid bytes in _decompBuf (from start)
 
-        ubyte[] _readBuf;    // reusable compressed read buffer
+        ubyte[] _readBuf;    // reusable compressed read buffer (file mode only)
         bool _fileEOF;
         bool _inflateEOF;
 
-        enum COMP_CHUNK = 64 * 1024;      // 64KB compressed read chunks
+        enum COMP_CHUNK = 64 * 1024;       // 64KB compressed read chunks
         enum DECOMP_BUF_SIZE = 512 * 1024; // 512KB decompressed buffer
         enum COMPACT_THRESHOLD = 256 * 1024; // compact when 256KB consumed
     }
 
+    /// Construct from a gzip file path.
     this(string gzipPath) {
         _file = File(gzipPath, "rb");
         _decompBuf = new ubyte[](DECOMP_BUF_SIZE);
@@ -211,6 +306,26 @@ class GzipSequentialReader : SequentialReader {
         _inflateEOF = false;
 
         // Initialize C zlib for gzip format (windowBits = 15 + 16 for gzip)
+        _zs = z_stream.init;
+        auto ret = inflateInit2(&_zs, 15 + 16);
+        if (ret != Z_OK)
+            throw new DarkArchiveException("GZIP: inflateInit2 failed");
+        _zsInit = true;
+    }
+
+    /// Construct from a chunk-producing delegate.
+    ///
+    /// The delegate returns the next compressed chunk on each call,
+    /// or an empty slice on EOF. The returned slice must remain valid
+    /// until the next delegate call — `.dup` if the source reuses buffers.
+    this(ubyte[] delegate() chunkSource) {
+        _chunkSource = chunkSource;
+        _decompBuf = new ubyte[](DECOMP_BUF_SIZE);
+        _decompPos = 0;
+        _decompLen = 0;
+        _fileEOF = false;
+        _inflateEOF = false;
+
         _zs = z_stream.init;
         auto ret = inflateInit2(&_zs, 15 + 16);
         if (ret != Z_OK)
@@ -264,7 +379,10 @@ class GzipSequentialReader : SequentialReader {
             inflateEnd(&_zs);
             _zsInit = false;
         }
-        _file.close();
+        if (_chunkSource is null)
+            _file.close();
+        _chunkSource = null;
+        _currentChunk = null;
         _decompBuf = null;
         _readBuf = null;
     }
@@ -287,12 +405,22 @@ class GzipSequentialReader : SequentialReader {
 
         // Fill compressed input if zlib needs more
         if (_zs.avail_in == 0 && !_fileEOF) {
-            auto got = _file.rawRead(_readBuf[]);
-            if (got.length == 0) {
-                _fileEOF = true;
+            if (_chunkSource !is null) {
+                _currentChunk = _chunkSource(); // pin so zlib ptr stays valid
+                if (_currentChunk.length == 0) {
+                    _fileEOF = true;
+                } else {
+                    _zs.next_in  = cast(ubyte*) _currentChunk.ptr;
+                    _zs.avail_in = cast(uint)   _currentChunk.length;
+                }
             } else {
-                _zs.next_in = cast(ubyte*) got.ptr;
-                _zs.avail_in = cast(uint) got.length;
+                auto got = _file.rawRead(_readBuf[]);
+                if (got.length == 0) {
+                    _fileEOF = true;
+                } else {
+                    _zs.next_in  = cast(ubyte*) got.ptr;
+                    _zs.avail_in = cast(uint)   got.length;
+                }
             }
         }
 
