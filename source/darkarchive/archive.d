@@ -881,11 +881,10 @@ version(unittest) {
 
         auto outPath = Path(testDataDir, "test-hl-write.zip");
 
-        auto writer = DarkArchiveWriter(outPath);
-        writer
+        DarkArchiveWriter(outPath)
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
-            .addDirectory("emptydir");
-        writer.finish();
+            .addDirectory("emptydir")
+            .finish();
 
         auto reader = DarkArchiveReader(outPath);
         scope(exit) {
@@ -913,11 +912,10 @@ version(unittest) {
 
         auto outPath = Path(testDataDir, "test-hl-write.tar.gz");
 
-        auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tarGz);
-        writer
+        DarkArchiveWriter(outPath, DarkArchiveFormat.tarGz)
             .addBuffer("file-a.txt", cast(const(ubyte)[]) "Content A")
-            .addBuffer("file-b.txt", cast(const(ubyte)[]) "Content B");
-        writer.finish();
+            .addBuffer("file-b.txt", cast(const(ubyte)[]) "Content B")
+            .finish();
 
         auto reader = DarkArchiveReader(outPath);
         scope(exit) {
@@ -953,13 +951,13 @@ version(unittest) {
 
         auto content = cast(const(ubyte)[]) "Cross-format test";
 
-        auto w1 = DarkArchiveWriter(zipPath);
-        w1.addBuffer("cross.txt", content);
-        w1.finish();
+        DarkArchiveWriter(zipPath)
+            .addBuffer("cross.txt", content)
+            .finish();
 
-        auto w2 = DarkArchiveWriter(tarPath, DarkArchiveFormat.tarGz);
-        w2.addBuffer("cross.txt", content);
-        w2.finish();
+        DarkArchiveWriter(tarPath, DarkArchiveFormat.tarGz)
+            .addBuffer("cross.txt", content)
+            .finish();
 
         // Read zip
         auto r1 = DarkArchiveReader(zipPath);
@@ -1021,9 +1019,9 @@ version(unittest) {
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-hl-mem.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("mem.txt", cast(const(ubyte)[]) "from memory");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("mem.txt", cast(const(ubyte)[]) "from memory")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -1042,12 +1040,11 @@ version(unittest) {
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-hl-chain.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
-            .addBuffer("c.txt", cast(const(ubyte)[]) "C");
-        writer.finish();
+            .addBuffer("c.txt", cast(const(ubyte)[]) "C")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -1071,9 +1068,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-sec-dotdot.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("../escape.txt", cast(const(ubyte)[]) "escaped!");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("../escape.txt", cast(const(ubyte)[]) "escaped!")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-dotdot-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1100,9 +1097,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-sec-nested-dotdot.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("foo/../../escape2.txt", cast(const(ubyte)[]) "escaped!");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("foo/../../escape2.txt", cast(const(ubyte)[]) "escaped!")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-nested-dotdot-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1126,9 +1123,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-sec-abs.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("/tmp/evil.txt", cast(const(ubyte)[]) "evil!");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("/tmp/evil.txt", cast(const(ubyte)[]) "evil!")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-abs-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1262,9 +1259,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-sec-dotdot-name.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("..", cast(const(ubyte)[]) "dot dot");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("..", cast(const(ubyte)[]) "dot dot")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-dotdot-name-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1411,9 +1408,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-cve-legit-dotdot.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("file..name.txt", cast(const(ubyte)[]) "legitimate");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("file..name.txt", cast(const(ubyte)[]) "legitimate")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-legit-dotdot-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1626,9 +1623,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-atk-null-byte.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("safe.txt\x00hidden", cast(const(ubyte)[]) "trick");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("safe.txt\x00hidden", cast(const(ubyte)[]) "trick")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-null-byte-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1653,9 +1650,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-atk-dot-name.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer(".", cast(const(ubyte)[]) "overwrite root?");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer(".", cast(const(ubyte)[]) "overwrite root?")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-dot-name-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1719,9 +1716,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-atk-longpath.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer(longPath, cast(const(ubyte)[]) "deep");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer(longPath, cast(const(ubyte)[]) "deep")
+            .finish();
 
         // Entry must be iterable with correct name and content
         auto reader = DarkArchiveReader(tmpPath);
@@ -1745,10 +1742,10 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-atk-ctrl-char.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("line1\nline2.txt", cast(const(ubyte)[]) "newline name");
-        writer.addBuffer("tab\there.txt", cast(const(ubyte)[]) "tab name");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("line1\nline2.txt", cast(const(ubyte)[]) "newline name")
+            .addBuffer("tab\there.txt", cast(const(ubyte)[]) "tab name")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-control-char-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1783,10 +1780,10 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-atk-rtl.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("readme\xE2\x80\xAEtxt.exe",
-            cast(const(ubyte)[]) "spoofed extension");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("readme\xE2\x80\xAEtxt.exe",
+                cast(const(ubyte)[]) "spoofed extension")
+            .finish();
 
         // Must not crash during reading
         auto reader = DarkArchiveReader(tmpPath);
@@ -1861,11 +1858,11 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-atk-conflict.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
         // Write a directory, then a file with same name (without trailing /)
-        writer.addDirectory("conflict");
-        writer.addBuffer("conflict", cast(const(ubyte)[]) "file wins?");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addDirectory("conflict")
+            .addBuffer("conflict", cast(const(ubyte)[]) "file wins?")
+            .finish();
 
         auto extractDir = Path(testDataDir, "sec-conflict-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -1889,9 +1886,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-atk-colon.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("file.txt:hidden", cast(const(ubyte)[]) "ADS data");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("file.txt:hidden", cast(const(ubyte)[]) "ADS data")
+            .finish();
 
         // Must not crash during reading
         auto reader = DarkArchiveReader(tmpPath);
@@ -1916,12 +1913,11 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-zip-find.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("a.txt", cast(const(ubyte)[]) "content A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "content B")
-            .addBuffer("c.txt", cast(const(ubyte)[]) "content C");
-        writer.finish();
+            .addBuffer("c.txt", cast(const(ubyte)[]) "content C")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -1971,9 +1967,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-no-match.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("exists.txt", cast(const(ubyte)[]) "data");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("exists.txt", cast(const(ubyte)[]) "data")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -1995,12 +1991,11 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-multi-found.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("x.txt", cast(const(ubyte)[]) "X")
             .addBuffer("y.txt", cast(const(ubyte)[]) "Y")
-            .addBuffer("z.txt", cast(const(ubyte)[]) "Z");
-        writer.finish();
+            .addBuffer("z.txt", cast(const(ubyte)[]) "Z")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -2024,9 +2019,9 @@ version(unittest) {
 
         auto tmpTarGz = "test-data/test-pe-targz.tar.gz";
         scope(exit) if (exists(tmpTarGz)) remove(tmpTarGz);
-        auto writer = DarkArchiveWriter(tmpTarGz, DarkArchiveFormat.tarGz);
-        writer.addBuffer("gz-file.txt", cast(const(ubyte)[]) "gzipped content");
-        writer.finish();
+        DarkArchiveWriter(tmpTarGz, DarkArchiveFormat.tarGz)
+            .addBuffer("gz-file.txt", cast(const(ubyte)[]) "gzipped content")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpTarGz);
         scope(exit) reader.close();
@@ -2048,12 +2043,11 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-all-entries.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("one.txt", cast(const(ubyte)[]) "1")
             .addBuffer("two.txt", cast(const(ubyte)[]) "2")
-            .addBuffer("three.txt", cast(const(ubyte)[]) "3");
-        writer.finish();
+            .addBuffer("three.txt", cast(const(ubyte)[]) "3")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -2077,9 +2071,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-binary.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("binary.bin", testData);
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("binary.bin", testData)
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -2133,9 +2127,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-chunked.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("large.bin", testData);
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("large.bin", testData)
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -2198,9 +2192,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-streaming.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("big.bin", testData);
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("big.bin", testData)
+            .finish();
 
         auto extractDir = Path(testDataDir, "streaming-extract-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2223,9 +2217,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-pe-empty.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("empty.txt", cast(const(ubyte)[]) "");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("empty.txt", cast(const(ubyte)[]) "")
+            .finish();
 
         auto reader = DarkArchiveReader(tmpPath);
         scope(exit) reader.close();
@@ -2252,12 +2246,11 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-unfold.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("odoo-18.0/README.txt", cast(const(ubyte)[]) "readme")
             .addBuffer("odoo-18.0/setup.py", cast(const(ubyte)[]) "setup")
-            .addDirectory("odoo-18.0/addons");
-        writer.finish();
+            .addDirectory("odoo-18.0/addons")
+            .finish();
 
         auto extractDir = Path(testDataDir, "unfold-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2289,12 +2282,11 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-skip-pyc.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("module.py", cast(const(ubyte)[]) "python source")
             .addBuffer("module.pyc", cast(const(ubyte)[]) "bytecode")
-            .addBuffer("other.txt", cast(const(ubyte)[]) "text");
-        writer.finish();
+            .addBuffer("other.txt", cast(const(ubyte)[]) "text")
+            .finish();
 
         auto extractDir = Path(testDataDir, "skip-pyc-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2320,9 +2312,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-sec-trav.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("safe.txt", cast(const(ubyte)[]) "data");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("safe.txt", cast(const(ubyte)[]) "data")
+            .finish();
 
         auto extractDir = Path(testDataDir, "delegate-sec-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2350,9 +2342,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-sec-abs.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("safe.txt", cast(const(ubyte)[]) "data");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("safe.txt", cast(const(ubyte)[]) "data")
+            .finish();
 
         auto extractDir = Path(testDataDir, "delegate-abs-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2380,9 +2372,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-null.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("test.txt", cast(const(ubyte)[]) "content");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("test.txt", cast(const(ubyte)[]) "content")
+            .finish();
 
         auto extractDir = Path(testDataDir, "null-delegate-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2403,11 +2395,10 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-skip-all.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
-            .addBuffer("b.txt", cast(const(ubyte)[]) "B");
-        writer.finish();
+            .addBuffer("b.txt", cast(const(ubyte)[]) "B")
+            .finish();
 
         auto extractDir = Path(testDataDir, "skip-all-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2434,9 +2425,9 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-compat.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer.addBuffer("compat.txt", cast(const(ubyte)[]) "works");
-        writer.finish();
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
+            .addBuffer("compat.txt", cast(const(ubyte)[]) "works")
+            .finish();
 
         // No-delegate overload
         auto extractDir1 = Path(testDataDir, "compat-test-1");
@@ -2465,11 +2456,10 @@ version(unittest) {
 
         auto tmpPath = "test-data/test-dlg-metadata.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip);
-        writer
+        DarkArchiveWriter(tmpPath, DarkArchiveFormat.zip)
             .addBuffer("file.txt", cast(const(ubyte)[]) "content")
-            .addDirectory("dir");
-        writer.finish();
+            .addDirectory("dir")
+            .finish();
 
         auto extractDir = Path(testDataDir, "source-entry-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2496,9 +2486,9 @@ version(unittest) {
 
         auto tmpTarGz = "test-data/test-dlg-targz.tar.gz";
         scope(exit) if (exists(tmpTarGz)) remove(tmpTarGz);
-        auto writer = DarkArchiveWriter(tmpTarGz, DarkArchiveFormat.tarGz);
-        writer.addBuffer("prefix/data.txt", cast(const(ubyte)[]) "tar data");
-        writer.finish();
+        DarkArchiveWriter(tmpTarGz, DarkArchiveFormat.tarGz)
+            .addBuffer("prefix/data.txt", cast(const(ubyte)[]) "tar data")
+            .finish();
 
         auto extractDir = Path(testDataDir, "delegate-targz-test");
         scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
@@ -2539,9 +2529,9 @@ version(unittest) {
             auto tmpZip = "test-data/test-tree-follow-sym.zip";
             scope(exit) if (exists(tmpZip)) remove(tmpZip);
 
-            auto writer = DarkArchiveWriter(tmpZip, DarkArchiveFormat.zip);
-            writer.addTree(srcDir);
-            writer.finish();
+            DarkArchiveWriter(tmpZip, DarkArchiveFormat.zip)
+                .addTree(srcDir)
+                .finish();
 
             // Read back — link.txt should be a regular file with real content
             auto reader = DarkArchiveReader(tmpZip);
@@ -2576,9 +2566,9 @@ version(unittest) {
             auto tmpTar = "test-data/test-tree-preserve-sym.tar";
             scope(exit) if (exists(tmpTar)) remove(tmpTar);
 
-            auto writer = DarkArchiveWriter(tmpTar, DarkArchiveFormat.tar);
-            writer.addTree(srcDir, null, FollowSymlinks.no);
-            writer.finish();
+            DarkArchiveWriter(tmpTar, DarkArchiveFormat.tar)
+                .addTree(srcDir, null, FollowSymlinks.no)
+                .finish();
 
             auto reader = DarkArchiveReader(tmpTar);
             scope(exit) reader.close();
@@ -2610,9 +2600,9 @@ version(unittest) {
         auto tmpZip = "test-data/test-tree-nosym.zip";
         scope(exit) if (exists(tmpZip)) remove(tmpZip);
 
-        auto writer = DarkArchiveWriter(tmpZip, DarkArchiveFormat.zip);
-        writer.addTree(srcDir);
-        writer.finish();
+        DarkArchiveWriter(tmpZip, DarkArchiveFormat.zip)
+            .addTree(srcDir)
+            .finish();
 
         auto reader = DarkArchiveReader(tmpZip);
         scope(exit) reader.close();
@@ -2926,11 +2916,10 @@ version(unittest) {
         auto outPath = Path(testDataDir, "stream-write-roundtrip.tar");
         scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
 
-        auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
-        writer
+        DarkArchiveWriter(outPath, DarkArchiveFormat.tar)
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello!")
-            .addBuffer("world.txt", cast(const(ubyte)[]) "World!");
-        writer.finish();
+            .addBuffer("world.txt", cast(const(ubyte)[]) "World!")
+            .finish();
 
         auto reader = DarkArchiveReader(outPath);
         scope(exit) reader.close();
@@ -2968,12 +2957,12 @@ version(unittest) {
         GC.collect();
         auto memBefore = GC.stats.usedSize;
 
-        auto writerTar = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
-        writerTar.addStream("large.bin", (scope sink) {
-            foreach (_; 0 .. ENTRY_SIZE / chunk.length)
-                sink(chunk);
-        }, ENTRY_SIZE);
-        writerTar.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.tar)
+            .addStream("large.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE)
+            .finish();
 
         GC.collect();
         auto memAfter = GC.stats.usedSize;
@@ -3004,12 +2993,12 @@ version(unittest) {
         GC.collect();
         auto memBefore = GC.stats.usedSize;
 
-        auto writerZip = DarkArchiveWriter(outPath, DarkArchiveFormat.zip);
-        writerZip.addStream("large.bin", (scope sink) {
-            foreach (_; 0 .. ENTRY_SIZE / chunk.length)
-                sink(chunk);
-        }, ENTRY_SIZE);
-        writerZip.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.zip)
+            .addStream("large.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE)
+            .finish();
 
         GC.collect();
         auto memAfter = GC.stats.usedSize;
@@ -3048,9 +3037,9 @@ version(unittest) {
         GC.collect();
         auto memBefore = GC.stats.usedSize;
 
-        auto writer = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
-        writer.add(srcPath, "large.bin");
-        writer.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.tar)
+            .add(srcPath, "large.bin")
+            .finish();
 
         GC.collect();
         auto memAfter = GC.stats.usedSize;
@@ -3079,12 +3068,12 @@ version(unittest) {
         foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
 
         // Write
-        auto writerTar = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
-        writerTar.addStream("pipeline.bin", (scope sink) {
-            foreach (_; 0 .. ENTRY_SIZE / chunk.length)
-                sink(chunk);
-        }, ENTRY_SIZE);
-        writerTar.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.tar)
+            .addStream("pipeline.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE)
+            .finish();
 
         GC.collect();
         auto memBefore = GC.stats.usedSize;
@@ -3125,12 +3114,12 @@ version(unittest) {
         foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
 
         // Write
-        auto writerZip = DarkArchiveWriter(outPath, DarkArchiveFormat.zip);
-        writerZip.addStream("pipeline.bin", (scope sink) {
-            foreach (_; 0 .. ENTRY_SIZE / chunk.length)
-                sink(chunk);
-        }, ENTRY_SIZE);
-        writerZip.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.zip)
+            .addStream("pipeline.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE)
+            .finish();
 
         GC.collect();
         auto memBefore = GC.stats.usedSize;
@@ -3171,12 +3160,12 @@ version(unittest) {
         foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
 
         // Write
-        auto writerGz = DarkArchiveWriter(outPath, DarkArchiveFormat.tarGz);
-        writerGz.addStream("pipeline.bin", (scope sink) {
-            foreach (_; 0 .. ENTRY_SIZE / chunk.length)
-                sink(chunk);
-        }, ENTRY_SIZE);
-        writerGz.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.tarGz)
+            .addStream("pipeline.bin", (scope sink) {
+                foreach (_; 0 .. ENTRY_SIZE / chunk.length)
+                    sink(chunk);
+            }, ENTRY_SIZE)
+            .finish();
 
         GC.collect();
         auto memBefore = GC.stats.usedSize;
@@ -3215,13 +3204,13 @@ version(unittest) {
         auto sourceData = new ubyte[](ENTRY_SIZE);
         foreach (i, ref b; sourceData) b = cast(ubyte)(i & 0xFF);
 
-        auto writerTar = DarkArchiveWriter(outPath, DarkArchiveFormat.tar);
-        writerTar.addStream("data.bin", (scope sink) {
-            // Send in 4KB chunks
-            foreach (off; 0 .. ENTRY_SIZE / 4096)
-                sink(sourceData[off * 4096 .. (off + 1) * 4096]);
-        }, ENTRY_SIZE);
-        writerTar.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.tar)
+            .addStream("data.bin", (scope sink) {
+                // Send in 4KB chunks
+                foreach (off; 0 .. ENTRY_SIZE / 4096)
+                    sink(sourceData[off * 4096 .. (off + 1) * 4096]);
+            }, ENTRY_SIZE)
+            .finish();
 
         // Read back and verify
         auto reader = DarkArchiveReader(outPath);
@@ -3251,9 +3240,9 @@ version(unittest) {
         auto zipPath = "test-data/test-symroot.zip";
         scope(exit) if (exists(zipPath)) remove(zipPath);
 
-        auto writer = DarkArchiveWriter(zipPath, DarkArchiveFormat.zip);
-        writer.addBuffer("hello.txt", cast(const(ubyte)[]) "hello");
-        writer.finish();
+        DarkArchiveWriter(zipPath, DarkArchiveFormat.zip)
+            .addBuffer("hello.txt", cast(const(ubyte)[]) "hello")
+            .finish();
 
         // real dir + relative symlink pointing to it (mirrors macOS /tmp -> /private/tmp)
         auto realDir = "test-data/symroot-real";
@@ -3288,12 +3277,12 @@ version(unittest) {
         auto sourceData = new ubyte[](ENTRY_SIZE);
         foreach (i, ref b; sourceData) b = cast(ubyte)(i & 0xFF);
 
-        auto writerZip = DarkArchiveWriter(outPath, DarkArchiveFormat.zip);
-        writerZip.addStream("data.bin", (scope sink) {
-            foreach (off; 0 .. ENTRY_SIZE / 4096)
-                sink(sourceData[off * 4096 .. (off + 1) * 4096]);
-        }, ENTRY_SIZE);
-        writerZip.finish();
+        DarkArchiveWriter(outPath, DarkArchiveFormat.zip)
+            .addStream("data.bin", (scope sink) {
+                foreach (off; 0 .. ENTRY_SIZE / 4096)
+                    sink(sourceData[off * 4096 .. (off + 1) * 4096]);
+            }, ENTRY_SIZE)
+            .finish();
 
         auto reader = DarkArchiveReader(outPath);
         scope(exit) reader.close();
