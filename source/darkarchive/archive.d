@@ -90,6 +90,19 @@ struct ExtractParams {
     const(DarkArchiveEntry)* sourceEntry;
 }
 
+/// Hard limits enforced during extraction — defence against malicious archives.
+///
+/// All limits default to `ulong.max` (no limit). Set only the limits you need.
+/// Exceeding any limit throws `DarkArchiveException` immediately.
+struct ExtractionLimits {
+    /// Maximum total uncompressed bytes across all extracted entries.
+    ulong maxTotalBytes = ulong.max;
+    /// Maximum uncompressed size of a single entry.
+    ulong maxEntryBytes = ulong.max;
+    /// Maximum number of entries extracted (directories included).
+    ulong maxEntries    = ulong.max;
+}
+
 
 // ---------------------------------------------------------------------------
 // DarkArchiveReader
@@ -435,7 +448,7 @@ struct DarkArchiveReader {
     /// ---
     void extractTo(in Path destination,
                     DarkExtractFlags flags = DarkExtractFlags.defaults) {
-        extractToImpl(destination, flags, null);
+        extractToImpl(destination, flags, ExtractionLimits.init, null);
     }
 
     /// Extract with entry preprocessing/filtering delegate.
@@ -448,16 +461,37 @@ struct DarkArchiveReader {
     void extractTo(in Path destination,
                     DarkExtractFlags flags,
                     scope bool delegate(ref ExtractParams params) preprocess) {
-        extractToImpl(destination, flags, preprocess);
+        extractToImpl(destination, flags, ExtractionLimits.init, preprocess);
+    }
+
+    /// Extract with extraction limits (guards against decompression bombs and
+    /// entry-count explosions). Throws `DarkArchiveException` if any limit is
+    /// exceeded.
+    void extractTo(in Path destination,
+                    DarkExtractFlags flags,
+                    ExtractionLimits limits) {
+        extractToImpl(destination, flags, limits, null);
+    }
+
+    /// ditto — with both limits and preprocessing delegate.
+    void extractTo(in Path destination,
+                    DarkExtractFlags flags,
+                    ExtractionLimits limits,
+                    scope bool delegate(ref ExtractParams params) preprocess) {
+        extractToImpl(destination, flags, limits, preprocess);
     }
 
     private void extractToImpl(
             in Path destination,
             DarkExtractFlags flags,
+            ExtractionLimits limits,
             scope bool delegate(ref ExtractParams params) preprocess) {
         import std.file : mkdirRecurse, write, exists;
+        import std.format : format;
 
         auto destStr = destination.toString();
+        ulong totalBytes;
+        ulong entryCount;
 
         foreach (entry; entries()) {
             ExtractParams params;
@@ -470,6 +504,11 @@ struct DarkArchiveReader {
                     continue;
                 }
             }
+
+            entryCount++;
+            if (entryCount > limits.maxEntries)
+                throw new DarkArchiveException(
+                    "Extraction limit exceeded: too many entries (max %d)".format(limits.maxEntries));
 
             auto entryPath = params.destPath;
 
@@ -524,6 +563,26 @@ struct DarkArchiveReader {
                         ~ entryPath);
                 }
                 skipData();
+            } else if (entry.isHardlink) {
+                // Hardlinks are skipped by default (same threat model as symlinks).
+                // Enable with DarkExtractFlags.symlinks; securePaths still applies.
+                if (!(flags & DarkExtractFlags.symlinks)) {
+                    skipData();
+                    continue;
+                }
+
+                auto target = entry.symlinkTarget;
+
+                if (target.length > 0 && target[0] == '/')
+                    throw new DarkArchiveException(
+                        "Refusing to create hardlink with absolute target: " ~ target);
+
+                if (flags & DarkExtractFlags.securePaths) {
+                    if (hasPathTraversal(target))
+                        throw new DarkArchiveException(
+                            "Refusing to create hardlink with '..' in target: " ~ target);
+                }
+                skipData();
             } else {
                 auto parent = fullPath.parent;
                 if (!exists(parent.toString()))
@@ -533,7 +592,7 @@ struct DarkArchiveReader {
                     verifyPathWithinRoot(parent.toString(), destStr);
                 }
 
-                writeEntryToFile(fullPath.toString());
+                writeEntryToFile(fullPath.toString(), limits, totalBytes);
                 applyPermissions(fullPath.toString(), entry.permissions);
             }
         }
@@ -559,16 +618,34 @@ struct DarkArchiveReader {
         // On Windows: no-op (Windows doesn't use POSIX permission bits)
     }
 
-    /// Write current entry's data to a file in chunks.
-    private void writeEntryToFile(string outPath) {
+    /// Write current entry's data to a file in chunks, enforcing extraction limits.
+    private void writeEntryToFile(string outPath, ExtractionLimits limits, ref ulong totalBytes) {
         import std.stdio : File;
+        import std.format : format;
         auto f = File(outPath, "wb");
+        ulong entryBytes;
         if (_zip !is null) {
             _zip.readDataChunked(_zipIndex, (const(ubyte)[] chunk) {
+                entryBytes += chunk.length;
+                totalBytes += chunk.length;
+                if (entryBytes > limits.maxEntryBytes)
+                    throw new DarkArchiveException(
+                        "Extraction limit exceeded: entry exceeds %s bytes".format(limits.maxEntryBytes));
+                if (totalBytes > limits.maxTotalBytes)
+                    throw new DarkArchiveException(
+                        "Extraction limit exceeded: total extracted bytes exceed %s".format(limits.maxTotalBytes));
                 f.rawWrite(chunk);
             });
         } else {
             _tar.readDataChunked((const(ubyte)[] chunk) {
+                entryBytes += chunk.length;
+                totalBytes += chunk.length;
+                if (entryBytes > limits.maxEntryBytes)
+                    throw new DarkArchiveException(
+                        "Extraction limit exceeded: entry exceeds %s bytes".format(limits.maxEntryBytes));
+                if (totalBytes > limits.maxTotalBytes)
+                    throw new DarkArchiveException(
+                        "Extraction limit exceeded: total extracted bytes exceed %s".format(limits.maxTotalBytes));
                 f.rawWrite(chunk);
             });
         }
@@ -3537,6 +3614,253 @@ version(unittest) {
 
         assert(exists(realDir ~ "/hello.txt"), "file must land in the real dir");
         readText(realDir ~ "/hello.txt").shouldEqual("hello");
+    }
+
+    // -------------------------------------------------------------------
+    // Security: ExtractionLimits
+    // -------------------------------------------------------------------
+
+    @("security: ExtractionLimits.maxEntryBytes prevents per-entry decompression bomb")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        // Archive with one 200KB entry (compresses well — simulates a decompression bomb)
+        auto zipPath = testDataDir ~ "/test-sec-bomb.zip";
+        scope(exit) if (exists(zipPath)) remove(zipPath);
+        DarkArchiveWriter(zipPath, DarkArchiveFormat.zip)
+            .addBuffer("big.txt", new ubyte[](200 * 1024))
+            .finish();
+
+        auto extractDir = Path(testDataDir, "sec-bomb-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto limits = ExtractionLimits(ulong.max, 50 * 1024, ulong.max); // 50KB per entry
+        bool threw;
+        try {
+            auto reader = DarkArchiveReader(zipPath);
+            scope(exit) reader.close();
+            reader.extractTo(extractDir, DarkExtractFlags.defaults, limits);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
+    }
+
+    @("security: ExtractionLimits.maxTotalBytes prevents total-size bomb")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        // Archive with 5 × 40KB entries = 200KB total
+        auto zipPath = testDataDir ~ "/test-sec-totalbomb.zip";
+        scope(exit) if (exists(zipPath)) remove(zipPath);
+        {
+            import std.format : format;
+            auto w = DarkArchiveWriter(zipPath, DarkArchiveFormat.zip);
+            foreach (i; 0 .. 5)
+                w.addBuffer("file%d.bin".format(i), new ubyte[](40 * 1024));
+            w.finish();
+        }
+
+        auto extractDir = Path(testDataDir, "sec-totalbomb-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto limits = ExtractionLimits(100 * 1024); // 100KB total
+        bool threw;
+        try {
+            auto reader = DarkArchiveReader(zipPath);
+            scope(exit) reader.close();
+            reader.extractTo(extractDir, DarkExtractFlags.defaults, limits);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
+    }
+
+    @("security: ExtractionLimits.maxEntries prevents entry-count explosion")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+        import std.format : format;
+
+        // Archive with 20 tiny entries
+        auto zipPath = testDataDir ~ "/test-sec-entries.zip";
+        scope(exit) if (exists(zipPath)) remove(zipPath);
+        {
+            auto w = DarkArchiveWriter(zipPath, DarkArchiveFormat.zip);
+            foreach (i; 0 .. 20)
+                w.addBuffer("f%d.txt".format(i), cast(const(ubyte)[]) "x");
+            w.finish();
+        }
+
+        auto extractDir = Path(testDataDir, "sec-entries-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto limits = ExtractionLimits(ulong.max, ulong.max, 5); // max 5 entries
+        bool threw;
+        try {
+            auto reader = DarkArchiveReader(zipPath);
+            scope(exit) reader.close();
+            reader.extractTo(extractDir, DarkExtractFlags.defaults, limits);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Security: stream failure
+    // -------------------------------------------------------------------
+
+    @("security: stream failure mid-extraction throws and leaves partial files")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove, write;
+
+        // Build a TAR with two entries
+        auto tarPath = testDataDir ~ "/test-sec-partial.tar";
+        scope(exit) if (exists(tarPath)) remove(tarPath);
+        DarkArchiveWriter(tarPath, DarkArchiveFormat.tar)
+            .addBuffer("first.txt",  cast(const(ubyte)[]) "first file content")
+            .addBuffer("second.txt", cast(const(ubyte)[]) "second file content")
+            .finish();
+
+        auto extractDir = Path(testDataDir, "sec-partial-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // Chunk source that cuts off after the first 512 bytes (partial stream)
+        import std.file : read;
+        auto raw = cast(ubyte[]) read(tarPath);
+        auto truncated = raw[0 .. 512].dup; // only one TAR block — cuts mid-archive
+        size_t offset;
+        auto brokenSource = () {
+            if (offset >= truncated.length) return cast(ubyte[]) [];
+            auto chunk = truncated[offset .. $].dup;
+            offset = truncated.length;
+            return chunk;
+        };
+
+        bool threw;
+        try {
+            auto reader = DarkArchiveReader(DarkArchiveFormat.tar, brokenSource);
+            scope(exit) reader.close();
+            reader.extractTo(extractDir);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        // Stream failure must propagate as an exception — no silent partial success
+        threw.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Security: TAR hardlinks
+    // -------------------------------------------------------------------
+
+    version(unittest) private ubyte[] buildTarWithHardlink(
+            string regularName, const(ubyte)[] content,
+            string linkName,    string linkTarget) {
+        import darkarchive.formats.tar.types : TAR_BLOCK_SIZE;
+        import std.algorithm : min;
+
+        ubyte[] result;
+
+        void writeOctal(ubyte[] buf, ulong val) {
+            import std.format : format;
+            auto s = format!"%0*o\0"(cast(int)(buf.length - 1), val);
+            buf[] = cast(ubyte[]) s[0 .. buf.length];
+        }
+
+        void writeHeader(string name, char typeflag, ulong size, string lname) {
+            ubyte[512] h;
+            h[] = 0;
+            auto nb = cast(ubyte[]) name;
+            h[0 .. min(nb.length, 100)] = nb[0 .. min(nb.length, 100)];
+            writeOctal(h[100 .. 108], octal!644);
+            writeOctal(h[108 .. 116], 0);
+            writeOctal(h[116 .. 124], 0);
+            writeOctal(h[124 .. 136], size);
+            writeOctal(h[136 .. 148], 0);
+            h[156] = typeflag;
+            if (lname.length > 0) {
+                auto lb = cast(ubyte[]) lname;
+                h[157 .. 157 + min(lb.length, 100)] = lb[0 .. min(lb.length, 100)];
+            }
+            h[257 .. 263] = cast(ubyte[]) "ustar\0";
+            h[263 .. 265] = cast(ubyte[]) "00";
+            // checksum
+            h[148 .. 156] = ' ';
+            uint sum = 0;
+            foreach (b; h) sum += b;
+            writeOctal(h[148 .. 156], sum);
+            h[155] = ' ';
+            result ~= h[];
+        }
+
+        // Regular file
+        writeHeader(regularName, '0', content.length, "");
+        result ~= content;
+        auto rem = content.length % 512;
+        if (rem > 0) result ~= new ubyte[](512 - rem);
+
+        // Hardlink entry (no data blocks)
+        writeHeader(linkName, '1', 0, linkTarget);
+
+        // End-of-archive: two zero blocks
+        result ~= new ubyte[](1024);
+        return result;
+    }
+
+    @("security: TAR hardlink entries are skipped by default")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue, shouldBeFalse;
+        import std.file : exists, rmdirRecurse, remove, write;
+
+        auto tarPath = testDataDir ~ "/test-sec-hardlink.tar";
+        scope(exit) if (exists(tarPath)) remove(tarPath);
+        write(tarPath, buildTarWithHardlink(
+            "target.txt", cast(ubyte[]) "target content",
+            "link.txt",   "target.txt"));
+
+        auto extractDir = Path(testDataDir, "sec-hardlink-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        auto reader = DarkArchiveReader(tarPath);
+        scope(exit) reader.close();
+        reader.extractTo(extractDir);
+
+        // Regular file must be extracted
+        exists((extractDir ~ "target.txt").toString).shouldBeTrue;
+        // Hardlink must be SKIPPED — not silently created as an empty file
+        exists((extractDir ~ "link.txt").toString).shouldBeFalse;
+    }
+
+    @("security: TAR hardlink pointing outside extraction dir is rejected")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove, write;
+
+        auto tarPath = testDataDir ~ "/test-sec-hardlink-escape.tar";
+        scope(exit) if (exists(tarPath)) remove(tarPath);
+        // Hardlink whose target escapes the extraction directory
+        write(tarPath, buildTarWithHardlink(
+            "target.txt", cast(ubyte[]) "target content",
+            "link.txt",   "../../../etc/passwd"));
+
+        auto extractDir = Path(testDataDir, "sec-hardlink-escape-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // With symlinks/hardlinks enabled and securePaths, escape must be rejected
+        bool threw;
+        try {
+            auto reader = DarkArchiveReader(tarPath);
+            scope(exit) reader.close();
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
     }
 
     /// addStream round-trip data integrity for ZIP

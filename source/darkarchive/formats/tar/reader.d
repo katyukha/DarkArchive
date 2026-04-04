@@ -85,13 +85,9 @@ struct TarReader {
         size_t remaining = _currentDataSize;
         while (remaining > 0) {
             auto toRead = remaining > chunkSize ? chunkSize : remaining;
-            try {
-                _stream.readInto(buf[0 .. toRead]);
-                sink(buf[0 .. toRead]);
-                remaining -= toRead;
-            } catch (DarkArchiveException) {
-                break;
-            }
+            _stream.readInto(buf[0 .. toRead]);
+            sink(buf[0 .. toRead]);
+            remaining -= toRead;
         }
         _dataConsumed = true;
     }
@@ -271,6 +267,10 @@ private DarkArchiveEntry parseHeader(const(ubyte)[] header) {
             break;
         case TAR_TYPE_SYMLINK:
             e.type = EntryType.symlink;
+            e.symlinkTarget = parseString(header[157 .. 257]);
+            break;
+        case TAR_TYPE_HARDLINK:
+            e.type = EntryType.hardlink;
             e.symlinkTarget = parseString(header[157 .. 257]);
             break;
         default:

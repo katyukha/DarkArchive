@@ -7,6 +7,7 @@ enum EntryType {
     file,
     directory,
     symlink,
+    hardlink,  /// TAR hard link (typeflag '1') — links to another entry in the same archive
 }
 
 /// Archive entry metadata. Plain value struct — fully copyable, no C pointers.
@@ -25,4 +26,5 @@ struct DarkArchiveEntry {
     bool isFile() const { return type == EntryType.file; }
     bool isDir() const { return type == EntryType.directory; }
     bool isSymlink() const { return type == EntryType.symlink; }
+    bool isHardlink() const { return type == EntryType.hardlink; }
 }
