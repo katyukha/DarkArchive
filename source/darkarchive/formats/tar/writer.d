@@ -60,6 +60,16 @@ struct TarWriter(R)
         return this;
     }
 
+    /// Add a hardlink (TAR typeflag '1'). `target` is the pathname of the
+    /// original file as it appears in the archive — typically the same value
+    /// that was passed to `addBuffer`/`addStream` for that entry.
+    ref TarWriter!R addHardlink(string archiveName, string target,
+                                 uint permissions = octal!644) return {
+        writePaxIfNeeded(archiveName, 0, target);
+        writeHeader(archiveName, '1', 0, permissions, target);
+        return this;
+    }
+
     /// Add from a streaming source.
     ///
     /// When size is known (>= 0), data is streamed directly to the archive

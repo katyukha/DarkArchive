@@ -414,20 +414,15 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
     // -- extractTo --
 
     void extractTo(in Path destination,
-                    DarkExtractFlags flags = DarkExtractFlags.defaults) {
-        extractToImpl(destination, flags, ExtractionLimits.init, null);
+                    DarkExtractFlags flags = DarkExtractFlags.defaults,
+                    ExtractionLimits limits = ExtractionLimits.init) {
+        extractToImpl(destination, flags, limits, null);
     }
 
     void extractTo(in Path destination,
                     DarkExtractFlags flags,
                     scope bool delegate(ref ExtractParams params) preprocess) {
         extractToImpl(destination, flags, ExtractionLimits.init, preprocess);
-    }
-
-    void extractTo(in Path destination,
-                    DarkExtractFlags flags,
-                    ExtractionLimits limits) {
-        extractToImpl(destination, flags, limits, null);
     }
 
     void extractTo(in Path destination,
@@ -517,6 +512,19 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                             "Refusing to create hardlink with '..' in target: " ~ target);
                 }
                 skipData();
+                version(Posix) {
+                    import core.sys.posix.unistd : posixLink = link;
+                    import std.string : toStringz;
+                    auto targetFull = destStr ~ "/" ~ target;
+                    if (flags & DarkExtractFlags.securePaths)
+                        verifyPathWithinRoot(targetFull, destStr);
+                    auto parent = fullPath.parent;
+                    if (!exists(parent.toString()))
+                        mkdirRecurse(parent.toString());
+                    if (posixLink(targetFull.toStringz, fullPath.toString.toStringz) != 0)
+                        throw new DarkArchiveException(
+                            "Failed to create hardlink: " ~ fullPath.toString);
+                }
             } else {
                 auto parent = fullPath.parent;
                 if (!exists(parent.toString()))
@@ -832,6 +840,41 @@ version(unittest) {
         import unit_threaded.assertions : shouldThrow;
         shouldThrow!DarkArchiveException(
             probeArchive(cast(const(ubyte)[]) "PK"));
+    }
+
+    // -------------------------------------------------------------------
+    // Cross-format behaviour
+    // -------------------------------------------------------------------
+
+    @("cross-format: tarReader on a ZIP file yields zero entries")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import darkarchive.formats.tar.reader : tarReader;
+        // ZIP magic bytes fail the TAR checksum check on the first block.
+        auto reader = tarReader(testDataDir ~ "/test-zip.zip");
+        scope(exit) reader.close();
+        int count;
+        foreach (entry; reader.entries) count++;
+        count.shouldEqual(0);
+    }
+
+    @("cross-format: DarkArchiveReader!tar on a ZIP file yields zero entries")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        auto reader = RTar(testDataDir ~ "/test-zip.zip");
+        scope(exit) reader.close();
+        size_t count;
+        reader.processEntries((const ref e, scope dr) { count++; });
+        count.shouldEqual(0);
+    }
+
+    @("cross-format: DarkArchiveReader!zip on a TAR file throws")
+    unittest {
+        import unit_threaded.assertions : shouldThrow;
+        // ZIP reader parses the central directory; a plain TAR file has no ZIP
+        // magic bytes and must be rejected with a DarkArchiveException.
+        shouldThrow!DarkArchiveException(
+            RZip(testDataDir ~ "/test-symlink.tar"));
     }
 
     // -------------------------------------------------------------------
@@ -1442,6 +1485,185 @@ version(unittest) {
         scope(exit) reader.close();
         bool caught;
         try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Hardlink extraction tests
+    // -------------------------------------------------------------------
+
+    version(Posix) @("hardlink: extractTo creates hardlink when symlinks flag set")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove, readText, getAttributes;
+        import darkarchive.formats.tar.writer : tarWriter;
+        import core.sys.posix.sys.stat : stat_t, stat;
+
+        auto tmpTar = "test-data/test-hardlink-extract.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addBuffer("original.txt", cast(const(ubyte)[]) "hardlink content");
+        tw.addHardlink("link.txt", "original.txt");
+        tw.finish();
+
+        auto extractDir = Path(testDataDir, "hardlink-extract-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        reader.extractTo(extractDir, DarkExtractFlags.symlinks);
+
+        assert(exists((extractDir ~ "original.txt").toString));
+        assert(exists((extractDir ~ "link.txt").toString));
+        readText((extractDir ~ "link.txt").toString).shouldEqual("hardlink content");
+
+        // Verify same inode — confirms it's a real hardlink, not a copy
+        stat_t s1, s2;
+        stat((extractDir ~ "original.txt").toString.ptr, &s1);
+        stat((extractDir ~ "link.txt").toString.ptr, &s2);
+        (s1.st_ino == s2.st_ino).shouldBeTrue;
+    }
+
+    @("hardlink: skipped by default when symlinks flag not set")
+    unittest {
+        import unit_threaded.assertions : shouldBeFalse;
+        import std.file : exists, rmdirRecurse, remove;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        auto tmpTar = "test-data/test-hardlink-skip.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addBuffer("original.txt", cast(const(ubyte)[]) "content");
+        tw.addHardlink("link.txt", "original.txt");
+        tw.finish();
+
+        auto extractDir = Path(testDataDir, "hardlink-skip-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        reader.extractTo(extractDir); // default flags — symlinks flag not set
+
+        assert(exists((extractDir ~ "original.txt").toString));
+        exists((extractDir ~ "link.txt").toString).shouldBeFalse;
+    }
+
+    @("hardlink: absolute target throws")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        auto tmpTar = "test-data/test-hardlink-abs.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addHardlink("link.txt", "/etc/passwd");
+        tw.finish();
+
+        auto extractDir = Path(testDataDir, "hardlink-abs-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.symlinks); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("hardlink: traversal target throws")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        auto tmpTar = "test-data/test-hardlink-traversal.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addHardlink("link.txt", "../outside.txt");
+        tw.finish();
+
+        auto extractDir = Path(testDataDir, "hardlink-traversal-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // ExtractionLimits tests
+    // -------------------------------------------------------------------
+
+    @("limits: maxEntries throws when exceeded")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        auto tmpPath = "test-data/test-limits-entries.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        WZip(tmpPath)
+            .addBuffer("a.txt", cast(const(ubyte)[]) "A")
+            .addBuffer("b.txt", cast(const(ubyte)[]) "B")
+            .addBuffer("c.txt", cast(const(ubyte)[]) "C")
+            .finish();
+
+        auto extractDir = Path(testDataDir, "limits-entries-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RZip(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                               ExtractionLimits(ulong.max, ulong.max, 2)); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("limits: maxEntryBytes throws when exceeded")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        auto tmpPath = "test-data/test-limits-entrybytes.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        WZip(tmpPath)
+            .addBuffer("big.bin", new ubyte[](1024))
+            .finish();
+
+        auto extractDir = Path(testDataDir, "limits-entrybytes-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RZip(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                               ExtractionLimits(ulong.max, 512, ulong.max)); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("limits: maxTotalBytes throws when exceeded")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        auto tmpPath = "test-data/test-limits-totalbytes.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        WZip(tmpPath)
+            .addBuffer("a.bin", new ubyte[](512))
+            .addBuffer("b.bin", new ubyte[](512))
+            .finish();
+
+        auto extractDir = Path(testDataDir, "limits-totalbytes-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RZip(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                               ExtractionLimits(768, ulong.max, ulong.max)); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
     }

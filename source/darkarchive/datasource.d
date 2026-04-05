@@ -11,26 +11,24 @@ import std.array : front, popFront, empty;
 struct DataSource {
     private {
         import std.stdio : File;
-        File* _file;
+        File _file;
         ulong _fileSize;
     }
 
     /// Create from file path (does not load file into memory).
     static DataSource fromFile(string path) {
         DataSource ds;
-        ds._file = new File(path, "rb");
+        ds._file = File(path, "rb");
         ds._file.seek(0, SEEK_END);
         ds._fileSize = ds._file.tell();
         return ds;
     }
 
-    /// Close the underlying file handle (if file-backed). Safe to call
-    /// multiple times or on memory-backed sources (no-op).
+    /// Close the underlying file handle. Safe to call multiple times (no-op if
+    /// already closed).
     void close() {
-        if (_file !is null) {
+        if (_file.isOpen())
             _file.close();
-            _file = null;
-        }
     }
 
     /// Total size of the data source.
