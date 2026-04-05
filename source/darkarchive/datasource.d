@@ -216,7 +216,9 @@ struct GzipRange(R)
     private {
         R _source;
         const(ubyte)[] _compChunk; // current compressed chunk, kept for zlib ptr validity
-        z_stream _zs;
+        // Heap-allocated so copies share the same z_stream, keeping zlib's
+        // state->strm back-pointer stable (same fix as GzipSink).
+        z_stream* _zs;
         bool _zsInit;
         ubyte[] _outBuf;
         const(ubyte)[] _current; // decompressed chunk returned by front()
@@ -226,13 +228,13 @@ struct GzipRange(R)
     }
 
     @disable this();
-    @disable this(this); // z_stream holds a state pointer — copying would alias it
 
     this(R source) {
         _source = source;
         _outBuf = new ubyte[](OUT_CHUNK);
-        _zs = z_stream.init;
-        if (inflateInit2(&_zs, 15 + 16) != Z_OK)
+        _zs = new z_stream;
+        *_zs = z_stream.init;
+        if (inflateInit2(_zs, 15 + 16) != Z_OK)
             throw new DarkArchiveException("GZIP: inflateInit2 failed");
         _zsInit = true;
         advance(); // prime: load first decompressed chunk
@@ -253,7 +255,7 @@ struct GzipRange(R)
     /// safe to call manually for early termination.
     void close() {
         if (_zsInit) {
-            inflateEnd(&_zs);
+            inflateEnd(_zs);
             _zsInit = false;
         }
     }
@@ -279,7 +281,7 @@ struct GzipRange(R)
             _zs.next_out  = _outBuf.ptr;
             _zs.avail_out = cast(uint) _outBuf.length;
 
-            auto ret = inflate(&_zs, Z_NO_FLUSH);
+            auto ret = inflate(_zs, Z_NO_FLUSH);
             auto produced = _outBuf.length - _zs.avail_out;
 
             if (produced > 0) {
@@ -669,6 +671,35 @@ class GzipSequentialReader : SequentialReader {
 }
 
 // ===========================================================================
+// In-memory input range of byte chunks (for streaming readers in tests)
+// ===========================================================================
+
+/// Input range that yields fixed-size `const(ubyte)[]` slices from an in-memory
+/// byte buffer. Useful for feeding streaming readers (TarReader, etc.) from
+/// in-memory data without writing a temp file.
+struct ByteChunks {
+    private const(ubyte)[] _data;
+    private size_t _chunkSize;
+
+    bool empty() const { return _data.length == 0; }
+
+    const(ubyte)[] front() const {
+        auto n = _chunkSize < _data.length ? _chunkSize : _data.length;
+        return _data[0 .. n];
+    }
+
+    void popFront() {
+        auto n = _chunkSize < _data.length ? _chunkSize : _data.length;
+        _data = _data[n .. $];
+    }
+}
+
+/// Create a `ByteChunks` range from an in-memory buffer.
+ByteChunks byChunks(const(ubyte)[] data, size_t chunkSize) {
+    return ByteChunks(data, chunkSize);
+}
+
+// ===========================================================================
 // Output-range sinks
 // ===========================================================================
 
@@ -876,8 +907,7 @@ version(unittest) {
         ubyte[] compressed = cast(ubyte[]) c.compress(cast(ubyte[]) "Hello, GzipRange!");
         compressed ~= cast(ubyte[]) c.flush();
 
-        // Decompress via GzipRange — use while loop (foreach copies the struct,
-        // which aliases the z_stream.state C pointer → Z_STREAM_ERROR)
+        // Decompress via GzipRange (z_stream is now heap-allocated, copying is safe)
         auto range = only(cast(const(ubyte)[]) compressed);
         auto gz = GzipRange!(typeof(range))(range);
         ubyte[] result;
