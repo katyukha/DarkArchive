@@ -11,7 +11,8 @@ import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip : ZipReader, ZipWriter;
 import darkarchive.formats.tar : TarReader, TarWriter;
-import darkarchive.datasource : GzipSequentialReader, DelegateSequentialReader, chunkSource;
+import darkarchive.datasource : SequentialReader, GzipSequentialReader, DelegateSequentialReader, chunkSource;
+private alias TarSR = TarReader!SequentialReader;
 
 import thepath : Path;
 
@@ -166,6 +167,44 @@ private bool hasPathTraversal(string path) {
     return false;
 }
 
+/// Detect the archive format of a file by reading its magic bytes.
+///
+/// Reads only the first 264 bytes (enough for ZIP, GZIP, and TAR ustar magic).
+/// Throws `DarkArchiveException` if the format cannot be determined.
+DarkArchiveFormat probeArchive(string path) {
+    import std.file : read, getSize;
+    auto fileSize = getSize(path);
+    if (fileSize < 4)
+        throw new DarkArchiveException("Archive file too small to detect format");
+    auto headerLen = fileSize > 264 ? 264 : cast(size_t) fileSize;
+    return probeArchive(cast(const(ubyte)[]) read(path, headerLen));
+}
+
+/// ditto — probe from a pre-read header byte slice.
+///
+/// `header` must contain at least the first 4 bytes of the archive.
+/// Passing the first 264 bytes enables TAR detection (ustar magic at offset 257).
+DarkArchiveFormat probeArchive(const(ubyte)[] header) {
+    if (header.length < 4)
+        throw new DarkArchiveException("Archive header too small to detect format");
+
+    // ZIP: PK\x03\x04 (local file header) or PK\x05\x06 (empty archive)
+    if (header[0] == 'P' && header[1] == 'K' &&
+        (header[2] == 3 || header[2] == 5))
+        return DarkArchiveFormat.zip;
+
+    // GZIP: \x1f\x8b
+    if (header[0] == 0x1f && header[1] == 0x8b)
+        return DarkArchiveFormat.tarGz;
+
+    // TAR (ustar): magic "ustar" at offset 257
+    if (header.length >= 262 &&
+        header[257 .. 262] == cast(const(ubyte)[]) "ustar")
+        return DarkArchiveFormat.tar;
+
+    throw new DarkArchiveException("Cannot detect archive format");
+}
+
 /// High-level archive reader. Auto-detects format from file content.
 ///
 /// Supports ZIP, TAR, and TAR.GZ formats. For non-ASCII pathnames in ZIP
@@ -174,7 +213,7 @@ struct DarkArchiveReader {
     private {
         // Format-specific state (only one is active)
         ZipReader* _zip;
-        TarReader* _tar;
+        TarSR* _tar;
 
         DarkArchiveFormat _format;
         // For zip: iteration index
@@ -193,41 +232,25 @@ struct DarkArchiveReader {
 
     /// ditto
     this(string path) {
-        // Read just the first 264 bytes for format detection (enough for
-        // ZIP magic at 0, GZIP magic at 0, and TAR ustar magic at 257)
         import std.file : read, getSize;
         auto fileSize = getSize(path);
         if (fileSize < 4)
             throw new DarkArchiveException("Archive file too small to detect format");
-
         auto headerLen = fileSize > 264 ? 264 : cast(size_t) fileSize;
         auto header = cast(const(ubyte)[]) read(path, headerLen);
 
-        // ZIP: file-backed (no full load)
-        if (header[0] == 'P' && header[1] == 'K' &&
-            (header[2] == 3 || header[2] == 5)) {
-            _zip = new ZipReader(path);
-            _format = DarkArchiveFormat.zip;
-            return;
+        _format = probeArchive(header);
+        final switch (_format) {
+            case DarkArchiveFormat.zip:
+                _zip = new ZipReader(path);
+                break;
+            case DarkArchiveFormat.tarGz:
+                _tar = new TarSR(new GzipSequentialReader(path));
+                break;
+            case DarkArchiveFormat.tar:
+                _tar = new TarSR(path);
+                break;
         }
-
-        // GZIP: streaming decompression — no temp files, constant memory
-        if (header.length >= 2 && header[0] == 0x1f && header[1] == 0x8b) {
-            auto gzStream = new GzipSequentialReader(path);
-            _tar = new TarReader(gzStream);
-            _format = DarkArchiveFormat.tarGz;
-            return;
-        }
-
-        // TAR: file-backed (no full load)
-        if (header.length >= 263 &&
-            header[257 .. 262] == cast(const(ubyte)[]) "ustar") {
-            _tar = new TarReader(path);
-            _format = DarkArchiveFormat.tar;
-            return;
-        }
-
-        throw new DarkArchiveException("Cannot detect archive format");
     }
 
 
@@ -247,10 +270,10 @@ struct DarkArchiveReader {
                 throw new DarkArchiveException(
                     "ZIP does not support streaming read — use supports() to check first");
             case DarkArchiveFormat.tar:
-                _tar = new TarReader(new DelegateSequentialReader(source));
+                _tar = new TarSR(new DelegateSequentialReader(source));
                 break;
             case DarkArchiveFormat.tarGz:
-                _tar = new TarReader(new GzipSequentialReader(source));
+                _tar = new TarSR(new GzipSequentialReader(source));
                 break;
         }
     }
@@ -717,7 +740,7 @@ struct DarkArchiveReader {
         private {
             DarkArchiveReader* _parent;
             // TAR mode
-            TarReader.EntryRange _tarRange;
+            TarSR.EntryRange _tarRange;
             bool _isTar;
         }
 
@@ -1016,6 +1039,57 @@ struct DarkArchiveWriter {
 version(unittest) {
 
     private immutable testDataDir = "test-data";
+
+    // -------------------------------------------------------------------
+    // probeArchive
+    // -------------------------------------------------------------------
+
+    @("probeArchive: detects ZIP from file")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        probeArchive(testDataDir ~ "/test-zip.zip").shouldEqual(DarkArchiveFormat.zip);
+    }
+
+    @("probeArchive: detects TAR.GZ from file")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        probeArchive(testDataDir ~ "/test.tar.gz").shouldEqual(DarkArchiveFormat.tarGz);
+    }
+
+    @("probeArchive: detects plain TAR from file")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        probeArchive(testDataDir ~ "/test-symlink.tar").shouldEqual(DarkArchiveFormat.tar);
+    }
+
+    @("probeArchive: detects format from header bytes")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        // ZIP magic
+        probeArchive(cast(const(ubyte)[]) "PK\x03\x04extradata")
+            .shouldEqual(DarkArchiveFormat.zip);
+        // GZIP magic
+        probeArchive(cast(const(ubyte)[]) "\x1f\x8b\x08\x00extradata")
+            .shouldEqual(DarkArchiveFormat.tarGz);
+        // TAR ustar magic at offset 257
+        ubyte[264] tarHeader;
+        tarHeader[257 .. 262] = cast(ubyte[5]) "ustar";
+        probeArchive(tarHeader[]).shouldEqual(DarkArchiveFormat.tar);
+    }
+
+    @("probeArchive: throws on unknown format")
+    unittest {
+        import unit_threaded.assertions : shouldThrow;
+        shouldThrow!DarkArchiveException(
+            probeArchive(cast(const(ubyte)[]) "????garbage"));
+    }
+
+    @("probeArchive: throws when header too small")
+    unittest {
+        import unit_threaded.assertions : shouldThrow;
+        shouldThrow!DarkArchiveException(
+            probeArchive(cast(const(ubyte)[]) "PK"));
+    }
 
     /// Read zip via high-level API
     @("high-level: read zip and verify content")

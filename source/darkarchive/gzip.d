@@ -39,6 +39,8 @@ const(ubyte)[] gunzip(const(ubyte)[] data) {
 
 version(unittest) {
     import darkarchive.formats.tar.reader : TarReader;
+    import darkarchive.datasource : SequentialReader;
+    alias TR = TarReader!SequentialReader;
 
     private immutable testDataDir = "test-data";
 
@@ -65,7 +67,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
 
         string[] names;
@@ -93,7 +95,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
 
         int count;
@@ -115,7 +117,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
 
         foreach (entry; reader.entries) {
@@ -186,7 +188,7 @@ version(unittest) {
         import darkarchive.datasource : GzipSequentialReader;
 
         auto gzStream = new GzipSequentialReader(testDataDir ~ "/test.tar.gz");
-        auto reader = TarReader(gzStream);
+        auto reader = TR(gzStream);
         string[] names;
         foreach (entry; reader.entries) {
             names ~= entry.pathname;
@@ -230,7 +232,7 @@ version(unittest) {
 
         // Stream through all entries, reading each via chunked API
         auto gzStream = new GzipSequentialReader(tmpPath);
-        auto reader = TarReader(gzStream);
+        auto reader = TR(gzStream);
         size_t totalRead;
         foreach (entry; reader.entries) {
             if (entry.isFile) {

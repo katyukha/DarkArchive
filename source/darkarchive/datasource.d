@@ -4,6 +4,8 @@
 module darkarchive.datasource;
 
 import darkarchive.exception : DarkArchiveException;
+import std.range : isInputRange, ElementType;
+import std.array : front, popFront, empty;
 
 /// Read-only data source backed by a file.
 struct DataSource {
@@ -110,6 +112,209 @@ ubyte[] delegate() chunkSource(ubyte[] data, size_t chunkSize) {
         offset = end;
         return chunk;
     };
+}
+
+// ===========================================================================
+// Range-based streaming: ChunkReader and GzipRange
+// ===========================================================================
+
+/// Adapts any input range of `const(ubyte)[]` chunks to a byte-stream interface
+/// (`readInto` / `skip` / `empty`) needed by TarReader.
+///
+/// `_pending` is a slice into the range's last `front` — the range's buffer
+/// must remain live until `advance()` is called. Ranges that reuse their buffer
+/// between `popFront` calls (e.g. `File.byChunk`) should be wrapped with
+/// `.map!(c => c.dup)` before passing, or use the `.dup`-ing overload via
+/// `chunkReader`.
+struct ChunkReader(R)
+    if (isInputRange!R && is(ElementType!R : const(ubyte)[]))
+{
+    import darkarchive.exception : DarkArchiveException;
+
+    private {
+        R _source;
+        const(ubyte)[] _pending;
+        bool _eof;
+    }
+
+    this(R source) {
+        _source = source;
+    }
+
+    /// True when no more bytes are available.
+    bool empty() {
+        if (_pending.length > 0) return false;
+        if (_eof) return true;
+        return !refill();
+    }
+
+    /// Read exactly `buf.length` bytes into `buf`. Throws on truncation.
+    void readInto(ubyte[] buf) {
+        size_t filled = 0;
+        while (filled < buf.length) {
+            if (_pending.length == 0) {
+                if (!refill())
+                    throw new DarkArchiveException("TAR: unexpected end of stream");
+            }
+            auto take = buf.length - filled;
+            if (take > _pending.length) take = _pending.length;
+            buf[filled .. filled + take] = _pending[0 .. take];
+            filled += take;
+            _pending = _pending[take .. $];
+        }
+    }
+
+    /// Skip `len` bytes (consume and discard). Silent on truncation — the next
+    /// `readInto` will throw.
+    void skip(size_t len) {
+        while (len > 0) {
+            if (_pending.length == 0) {
+                if (!refill()) return;
+            }
+            auto take = len > _pending.length ? _pending.length : len;
+            _pending = _pending[take .. $];
+            len -= take;
+        }
+    }
+
+    private bool refill() {
+        while (!_source.empty) {
+            auto chunk = cast(const(ubyte)[]) _source.front;
+            _source.popFront();
+            if (chunk.length > 0) {
+                _pending = chunk;
+                return true;
+            }
+        }
+        _eof = true;
+        return false;
+    }
+}
+
+/// Construct a `ChunkReader` from any input range of chunks, `.dup`-ing each
+/// chunk on read so the range may reuse its buffer between iterations.
+auto chunkReader(R)(R source)
+    if (isInputRange!R && is(ElementType!R : const(ubyte)[]))
+{
+    import std.algorithm : map;
+    static ubyte[] dupChunk(const(ubyte)[] c) { return c.dup; }
+    auto mapped = source.map!dupChunk;
+    return ChunkReader!(typeof(mapped))(mapped);
+}
+
+/// Input range of decompressed chunks, wrapping any compressed input range.
+///
+/// Each `front()` yields a `const(ubyte)[]` of decompressed bytes. `popFront()`
+/// drives the zlib inflate loop until more output is produced or EOF is reached.
+/// Peak memory: one output chunk (64KB) + one pinned compressed input chunk.
+struct GzipRange(R)
+    if (isInputRange!R && is(ElementType!R : const(ubyte)[]))
+{
+    import darkarchive.exception : DarkArchiveException;
+    import etc.c.zlib;
+
+    private {
+        R _source;
+        const(ubyte)[] _compChunk; // current compressed chunk, kept for zlib ptr validity
+        z_stream _zs;
+        bool _zsInit;
+        ubyte[] _outBuf;
+        const(ubyte)[] _current; // decompressed chunk returned by front()
+        bool _done;
+
+        enum OUT_CHUNK = 64 * 1024;
+    }
+
+    @disable this();
+    @disable this(this); // z_stream holds a state pointer — copying would alias it
+
+    this(R source) {
+        _source = source;
+        _outBuf = new ubyte[](OUT_CHUNK);
+        _zs = z_stream.init;
+        if (inflateInit2(&_zs, 15 + 16) != Z_OK)
+            throw new DarkArchiveException("GZIP: inflateInit2 failed");
+        _zsInit = true;
+        advance(); // prime: load first decompressed chunk
+    }
+
+    /// True once all decompressed output has been consumed.
+    bool empty() const { return _current.length == 0; }
+
+    /// Current decompressed chunk. Valid until the next `popFront()`.
+    const(ubyte)[] front() { return _current; }
+
+    /// Advance to the next decompressed chunk.
+    void popFront() {
+        advance();
+    }
+
+    /// Release zlib resources. Called automatically on Z_STREAM_END or EOF;
+    /// safe to call manually for early termination.
+    void close() {
+        if (_zsInit) {
+            inflateEnd(&_zs);
+            _zsInit = false;
+        }
+    }
+
+    private void advance() {
+        _current = null;
+        if (_done) return; // stream exhausted — leave _current null (empty)
+        while (true) {
+            // Refill zlib input from source range if exhausted
+            if (_zs.avail_in == 0) {
+                if (_source.empty) {
+                    // Truncated stream — no Z_STREAM_END received
+                    _done = true;
+                    close();
+                    return;
+                }
+                _compChunk = cast(const(ubyte)[]) _source.front.dup;
+                _source.popFront();
+                _zs.next_in  = cast(ubyte*) _compChunk.ptr;
+                _zs.avail_in = cast(uint)   _compChunk.length;
+            }
+
+            _zs.next_out  = _outBuf.ptr;
+            _zs.avail_out = cast(uint) _outBuf.length;
+
+            auto ret = inflate(&_zs, Z_NO_FLUSH);
+            auto produced = _outBuf.length - _zs.avail_out;
+
+            if (produced > 0) {
+                _current = _outBuf[0 .. produced].dup;
+                if (ret == Z_STREAM_END) {
+                    _done = true;
+                    close();
+                }
+                return; // have a chunk — caller gets it via front()
+            }
+
+            if (ret == Z_STREAM_END) {
+                _done = true;
+                close();
+                return;
+            }
+            if (ret != Z_OK && ret != Z_BUF_ERROR)
+                throw new DarkArchiveException("GZIP: inflate failed");
+
+            // Z_BUF_ERROR + no output + no more input → stuck on truncated stream
+            if (_zs.avail_in == 0 && _source.empty) {
+                _done = true;
+                close();
+                return;
+            }
+            // Otherwise: Z_BUF_ERROR with input still available — loop to refill
+        }
+    }
+}
+
+/// Construct a `GzipRange` from any compressed input range (IFTI).
+auto gzipRange(R)(R source)
+    if (isInputRange!R && is(ElementType!R : const(ubyte)[]))
+{
+    return GzipRange!R(source);
 }
 
 /// Sequential byte stream — used by TarReader for both plain TAR (backed by
@@ -540,5 +745,145 @@ version(unittest) {
             caught = true;
         }
         caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // ChunkReader
+    // -------------------------------------------------------------------
+
+    @("ChunkReader: readInto across multiple chunks")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        // Source: three 4-byte chunks
+        const(ubyte)[][] chunks = [
+            cast(const(ubyte)[]) "ABCD",
+            cast(const(ubyte)[]) "EFGH",
+            cast(const(ubyte)[]) "IJKL",
+        ];
+        auto r = ChunkReader!(const(ubyte)[][])(chunks);
+        ubyte[9] buf;
+        r.readInto(buf[]);
+        (cast(string) buf[]).shouldEqual("ABCDEFGHI");
+        // Read remaining 3 bytes
+        r.readInto(buf[0 .. 3]);
+        (cast(string) buf[0 .. 3]).shouldEqual("JKL");
+        r.empty.shouldEqual(true);
+    }
+
+    @("ChunkReader: skip across chunks")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        const(ubyte)[][] chunks = [
+            cast(const(ubyte)[]) "AAAA",
+            cast(const(ubyte)[]) "BBBB",
+            cast(const(ubyte)[]) "CCCC",
+        ];
+        auto r = ChunkReader!(const(ubyte)[][])(chunks);
+        r.skip(6); // skip AAAA + BB
+        ubyte[6] buf;
+        r.readInto(buf[]);
+        (cast(string) buf[]).shouldEqual("BBCCCC");
+    }
+
+    @("ChunkReader: readInto throws on truncation")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.exception : DarkArchiveException;
+        const(ubyte)[][] chunks = [cast(const(ubyte)[]) "AB"];
+        auto r = ChunkReader!(const(ubyte)[][])(chunks);
+        bool threw;
+        try {
+            ubyte[10] buf;
+            r.readInto(buf[]);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
+    }
+
+    @("ChunkReader: empty chunks are skipped transparently")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        const(ubyte)[][] chunks = [
+            cast(const(ubyte)[]) "",
+            cast(const(ubyte)[]) "Hello",
+            cast(const(ubyte)[]) "",
+            cast(const(ubyte)[]) " World",
+        ];
+        auto r = ChunkReader!(const(ubyte)[][])(chunks);
+        ubyte[11] buf;
+        r.readInto(buf[]);
+        (cast(string) buf[]).shouldEqual("Hello World");
+    }
+
+    // -------------------------------------------------------------------
+    // GzipRange
+    // -------------------------------------------------------------------
+
+    @("GzipRange: decompress known gzip stream")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.zlib : Compress, HeaderFormat;
+        import std.range : only;
+
+        // Compress known data
+        auto c = new Compress(6, HeaderFormat.gzip);
+        ubyte[] compressed = cast(ubyte[]) c.compress(cast(ubyte[]) "Hello, GzipRange!");
+        compressed ~= cast(ubyte[]) c.flush();
+
+        // Decompress via GzipRange — use while loop (foreach copies the struct,
+        // which aliases the z_stream.state C pointer → Z_STREAM_ERROR)
+        auto range = only(cast(const(ubyte)[]) compressed);
+        auto gz = GzipRange!(typeof(range))(range);
+        ubyte[] result;
+        while (!gz.empty) { result ~= gz.front; gz.popFront(); }
+
+        (cast(string) result).shouldEqual("Hello, GzipRange!");
+    }
+
+    @("GzipRange: works with multiple compressed input chunks")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.zlib : Compress, HeaderFormat;
+
+        auto c = new Compress(6, HeaderFormat.gzip);
+        ubyte[] compressed = cast(ubyte[]) c.compress(cast(ubyte[]) "chunked input test");
+        compressed ~= cast(ubyte[]) c.flush();
+
+        // Split into small chunks to exercise multi-chunk feeding
+        const(ubyte)[][] chunks;
+        for (size_t i = 0; i < compressed.length; i += 4)
+            chunks ~= cast(const(ubyte)[]) compressed[i .. (i + 4 < compressed.length ? i + 4 : compressed.length)];
+
+        auto gz = GzipRange!(const(ubyte)[][])(chunks);
+        ubyte[] result;
+        while (!gz.empty) { result ~= gz.front; gz.popFront(); }
+
+        (cast(string) result).shouldEqual("chunked input test");
+    }
+
+    @("GzipRange: truncated stream stops iteration without hanging")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.zlib : Compress, HeaderFormat;
+        import std.range : only;
+
+        auto c = new Compress(6, HeaderFormat.gzip);
+        ubyte[] compressed = cast(ubyte[]) c.compress(cast(ubyte[]) "truncation test data");
+        compressed ~= cast(ubyte[]) c.flush();
+
+        // Feed only first half — truncated stream
+        auto truncated = compressed[0 .. compressed.length / 2].dup;
+        auto range = only(cast(const(ubyte)[]) truncated);
+        auto gz = GzipRange!(typeof(range))(range);
+
+        // Must iterate to completion without hanging (may produce partial output or none)
+        size_t iterations;
+        while (!gz.empty) {
+            gz.popFront();
+            iterations++;
+            if (iterations > 1000) assert(false, "GzipRange looped too many times");
+        }
+        gz.empty.shouldBeTrue;
     }
 }

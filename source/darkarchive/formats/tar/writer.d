@@ -291,6 +291,8 @@ ubyte[] gzipCompress(const(ubyte)[] data) {
 
 version(unittest) {
     import darkarchive.formats.tar.reader : TarReader;
+    import darkarchive.datasource : SequentialReader;
+    alias TR = TarReader!SequentialReader;
 
     @("tar write: round-trip with addBuffer")
     unittest {
@@ -306,7 +308,7 @@ version(unittest) {
             .addBuffer("sub/nested.txt", cast(const(ubyte)[]) "Nested content");
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         bool foundHello, foundNested;
         foreach (entry; reader.entries) {
@@ -334,7 +336,7 @@ version(unittest) {
         writer.addDirectory("mydir");
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries)
             if (entry.pathname == "mydir/")
@@ -353,7 +355,7 @@ version(unittest) {
         writer.addSymlink("link.txt", "target.txt");
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "link.txt") {
@@ -377,7 +379,7 @@ version(unittest) {
         writer.addBuffer(longName, cast(const(ubyte)[]) "pax content");
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == longName) {
@@ -403,7 +405,7 @@ version(unittest) {
             .addDirectory("dir");
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
@@ -442,7 +444,7 @@ version(unittest) {
         scope(exit) if (exists(tarTmpPath2)) remove(tarTmpPath2);
         write(tarTmpPath2, decompressed);
 
-        auto reader = TarReader(tarTmpPath2);
+        auto reader = TR(tarTmpPath2);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) {
@@ -467,7 +469,7 @@ version(unittest) {
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "tar file content");
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
@@ -587,7 +589,7 @@ version(unittest) {
             .addDirectory("streamdir");
         writer.finish();
 
-        auto reader = TarReader(outPath);
+        auto reader = TR(outPath);
         scope(exit) reader.close();
         bool found;
         foreach (entry; reader.entries) {
@@ -617,7 +619,7 @@ version(unittest) {
             .addBuffer("Ünïcödé/nested.txt", cast(const(ubyte)[]) "nested");
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         string[] names;
         foreach (entry; reader.entries)
@@ -645,7 +647,7 @@ version(unittest) {
                 cast(const(ubyte)[]) "content %d".format(i));
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
@@ -674,7 +676,7 @@ version(unittest) {
             .addDirectory("mydir", octal!755);
         writer.finish();
 
-        auto reader = TarReader(tmpPath);
+        auto reader = TR(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "script.sh")
