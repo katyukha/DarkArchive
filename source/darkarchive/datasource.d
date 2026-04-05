@@ -668,6 +668,51 @@ class GzipSequentialReader : SequentialReader {
     }
 }
 
+// ===========================================================================
+// Output-range sinks
+// ===========================================================================
+
+/// Output range backed by a binary file.
+struct FileSink {
+    private {
+        import std.stdio : File;
+        File _file;
+    }
+
+    this(string path) {
+        import std.stdio : File;
+        _file = File(path, "wb");
+    }
+
+    void put(const(ubyte)[] data) { _file.rawWrite(data); }
+    void close() { _file.close(); }
+}
+
+/// Output range backed by a delegate pair (put + optional close).
+///
+/// The write delegate is called for each `put()`; the optional close
+/// delegate (if non-null) is called by `close()`.
+struct DelegateSink {
+    private {
+        void delegate(const(ubyte)[]) _put;
+        void delegate() _close;
+    }
+
+    this(void delegate(const(ubyte)[]) put,
+         void delegate() close = null) {
+        _put = put;
+        _close = close;
+    }
+
+    void put(const(ubyte)[] data) {
+        if (_put !is null) _put(data);
+    }
+
+    void close() {
+        if (_close !is null) _close();
+    }
+}
+
 private {
     import std.bitmanip : nativeToLittleEndian;
     import core.stdc.stdio : SEEK_END;

@@ -529,11 +529,11 @@ version(unittest) {
     @("tar security: truncated archive does not crash")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-trunc-src.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "some content here");
         writer.finish();
@@ -609,14 +609,14 @@ version(unittest) {
     @("tar format: data size exactly 512 bytes, no padding")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-exact512.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto data = new ubyte[](512);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
 
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("exact512.bin", data);
         writer.finish();
@@ -637,14 +637,14 @@ version(unittest) {
     @("tar format: data size 513 bytes, needs 511 padding")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-over512.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         auto data = new ubyte[](513);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
 
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("over512.bin", data);
         writer.finish();
@@ -664,11 +664,11 @@ version(unittest) {
     @("tar format: single byte entry")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-onebyte.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("one.bin", [cast(ubyte) 0x42]);
         writer.finish();
@@ -701,11 +701,11 @@ version(unittest) {
     @("tar format: empty filename produces empty string, not null")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-emptyname.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("", cast(const(ubyte)[]) "no name");
         writer.finish();
@@ -744,11 +744,11 @@ version(unittest) {
     @("tar security: huge size field does not OOB")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-hugesize-src.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("small.txt", cast(const(ubyte)[]) "tiny");
         writer.finish();
@@ -781,11 +781,11 @@ version(unittest) {
     @("tar security: entry with zero size does not crash readData")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-zerosize.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("zero.txt", cast(const(ubyte)[]) "");
         writer.finish();
@@ -803,11 +803,11 @@ version(unittest) {
     @("tar security: corrupted header mid-archive throws")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-corrupt-src.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("file1.txt", cast(const(ubyte)[]) "content 1")
@@ -837,7 +837,7 @@ version(unittest) {
     @("tar read: range-based tarReader from in-memory bytes")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import darkarchive.formats.tar.writer : TarWriter;
+        import darkarchive.formats.tar.writer : tarWriter;
         import darkarchive.datasource : chunkSource;
         import std.file : exists, remove, read;
         import std.range : only;
@@ -845,7 +845,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-tarr-range.tar";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
 
-        auto writer = TarWriter.createToFile(tmpPath);
+        auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("range.txt", cast(const(ubyte)[]) "range content");
         writer.finish();

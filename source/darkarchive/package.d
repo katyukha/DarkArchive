@@ -8,4 +8,6 @@ public import darkarchive.archive : DarkArchiveReader, DarkArchiveWriter,
                                      probeArchive;
 public import darkarchive.entry : DarkArchiveEntry, EntryType;
 public import darkarchive.exception : DarkArchiveException;
-public import darkarchive.datasource : chunkSource;
+public import darkarchive.datasource : chunkSource, FileSink, DelegateSink;
+public import darkarchive.gzip : GzipSink, gzipSink;
+public import darkarchive.formats.tar : tarWriter, tarGzWriter;
