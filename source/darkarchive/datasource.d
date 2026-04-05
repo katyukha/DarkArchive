@@ -443,6 +443,11 @@ class GzipSequentialReader : SequentialReader {
         if (ret != Z_OK && ret != Z_BUF_ERROR)
             throw new DarkArchiveException("GZIP: inflate failed");
 
+        // Stuck: no compressed input left and inflate made no progress.
+        // The stream is truncated — further calls will loop forever otherwise.
+        if (produced == 0 && _zs.avail_in == 0 && _fileEOF)
+            return false;
+
         return produced > 0 || available > 0;
     }
 

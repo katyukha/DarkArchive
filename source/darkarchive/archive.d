@@ -3753,6 +3753,84 @@ version(unittest) {
         threw.shouldBeTrue;
     }
 
+    @("security: truncated tar.gz stream throws instead of looping forever")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        // Two 64KB entries with non-trivial content (cycling bytes — resists compression).
+        // This ensures the tar.gz is large enough that truncating at 1/3 cuts
+        // mid-entry rather than before the first header.
+        auto content = new ubyte[](64 * 1024);
+        foreach (i, ref b; content) b = cast(ubyte)(i & 0xFF);
+
+        ubyte[] compressed;
+        {
+            auto w = DarkArchiveWriter(DarkArchiveFormat.tarGz,
+                    (const(ubyte)[] chunk) { compressed ~= chunk; });
+            w.addBuffer("a.bin", content);
+            w.addBuffer("b.bin", content);
+            w.finish();
+        }
+
+        // Truncate to the first third — cuts mid gzip stream, mid first entry
+        auto truncated = compressed[0 .. compressed.length / 3].dup;
+
+        auto extractDir = Path(testDataDir, "sec-truncgz-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        bool threw;
+        try {
+            size_t offset;
+            auto reader = DarkArchiveReader(DarkArchiveFormat.tarGz, () {
+                if (offset >= truncated.length) return cast(ubyte[]) [];
+                auto chunk = truncated[offset .. $].dup;
+                offset = truncated.length;
+                return chunk;
+            });
+            scope(exit) reader.close();
+            reader.extractTo(extractDir);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        // Must throw — not loop forever consuming 100% CPU
+        threw.shouldBeTrue;
+    }
+
+    @("security: truncated tar.gz FILE throws instead of looping forever")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove, write, read;
+
+        auto tgzPath = testDataDir ~ "/test-sec-truncgz-file.tar.gz";
+        scope(exit) if (exists(tgzPath)) remove(tgzPath);
+
+        auto content = new ubyte[](64 * 1024);
+        foreach (i, ref b; content) b = cast(ubyte)(i & 0xFF);
+
+        DarkArchiveWriter(tgzPath, DarkArchiveFormat.tarGz)
+            .addBuffer("a.bin", content)
+            .addBuffer("b.bin", content)
+            .finish();
+
+        // Overwrite with first-third only — truncated mid gzip stream
+        auto full = cast(ubyte[]) read(tgzPath);
+        write(tgzPath, full[0 .. full.length / 3]);
+
+        auto extractDir = Path(testDataDir, "sec-truncgz-file-out");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        bool threw;
+        try {
+            auto reader = DarkArchiveReader(tgzPath);
+            scope(exit) reader.close();
+            reader.extractTo(extractDir);
+        } catch (DarkArchiveException) {
+            threw = true;
+        }
+        threw.shouldBeTrue;
+    }
+
     // -------------------------------------------------------------------
     // Security: TAR hardlinks
     // -------------------------------------------------------------------
