@@ -15,11 +15,9 @@ import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip : ZipReader, ZipWriter;
 import darkarchive.formats.tar : TarReader, TarWriter, tarWriter, tarGzWriter;
-import darkarchive.datasource : SequentialReader, GzipSequentialReader,
-    DelegateSequentialReader, chunkSource, DelegateSink;
+import darkarchive.datasource : chunkSource, DelegateSink, FileChunkSource,
+    ChunkReader, GzipRange;
 import darkarchive.gzip : GzipSink;
-
-private alias TarSR = TarReader!SequentialReader;
 
 import thepath : Path;
 
@@ -276,8 +274,10 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
     static if (fmt == DarkArchiveFormat.zip) {
         private ZipReader* _reader;
         private size_t _currentIdx;
-    } else {
-        private TarSR* _reader;
+    } else static if (fmt == DarkArchiveFormat.tar) {
+        private TarReader!(ChunkReader!FileChunkSource)* _reader;
+    } else { // tarGz
+        private TarReader!(ChunkReader!(GzipRange!FileChunkSource))* _reader;
     }
 
     /// The archive format — a compile-time constant.
@@ -292,9 +292,12 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
         static if (fmt == DarkArchiveFormat.zip) {
             _reader = new ZipReader(path);
         } else static if (fmt == DarkArchiveFormat.tar) {
-            _reader = new TarSR(path);
+            auto cr = ChunkReader!FileChunkSource(FileChunkSource(path));
+            _reader = new typeof(*_reader)(cr);
         } else {
-            _reader = new TarSR(new GzipSequentialReader(path));
+            alias CR = ChunkReader!(GzipRange!FileChunkSource);
+            auto cr = CR(GzipRange!FileChunkSource(FileChunkSource(path)));
+            _reader = new typeof(*_reader)(cr);
         }
     }
 
@@ -588,7 +591,12 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
             void popFront() { _idx++; }
 
         } else {
-            private TarSR.EntryRange _range;
+            static if (fmt == DarkArchiveFormat.tar)
+                alias TarReaderT = TarReader!(ChunkReader!FileChunkSource);
+            else
+                alias TarReaderT = TarReader!(ChunkReader!(GzipRange!FileChunkSource));
+
+            private TarReaderT.EntryRange _range;
 
             this(DarkArchiveReader!fmt* parent) {
                 _parent = parent;

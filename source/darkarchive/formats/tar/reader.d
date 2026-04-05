@@ -4,8 +4,8 @@
 /// Supports pax extended headers for UTF-8 pathnames and large sizes.
 ///
 /// `TarReader(R)` is a template over a stream type R. Any type with
-/// `readInto(ubyte[])`, `skip(size_t)`, and `empty()` qualifies — this
-/// includes `SequentialReader` (legacy) and `ChunkReader!X` (range-based).
+/// `readInto(ubyte[])`, `skip(size_t)`, and `empty()` qualifies — use
+/// `ChunkReader!X` or the `tarReader`/`tarGzReader` file factories.
 ///
 /// Use the `tarReader(range)` factory for range-based construction.
 module darkarchive.formats.tar.reader;
@@ -13,8 +13,7 @@ module darkarchive.formats.tar.reader;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.tar.types;
-import darkarchive.datasource : DataSource, SequentialReader,
-    DataSourceSequentialReader, ChunkReader;
+import darkarchive.datasource : FileChunkSource, ChunkReader, GzipRange;
 import std.range : isInputRange, ElementType;
 
 /// Concept: any type providing the byte-stream interface needed by TarReader.
@@ -28,8 +27,8 @@ template isTarStream(R) {
 
 /// Reads a TAR archive from any stream type R satisfying `isTarStream!R`.
 ///
-/// For file-backed reading use `TarReader!SequentialReader(path)`.
-/// For range-based reading use the `tarReader(range)` factory function.
+/// For file-backed reading use the `tarReader(path)` or `tarGzReader(path)` factories.
+/// For range-based reading use `tarReader(range)`.
 struct TarReader(R) if (isTarStream!R) {
     private {
         R _stream;
@@ -44,23 +43,9 @@ struct TarReader(R) if (isTarStream!R) {
 
     @disable this();
 
-    static if (is(R == SequentialReader)) {
-        /// Open TAR from a file path (does not load full file into memory).
-        this(string path) {
-            auto ds = new DataSource();
-            *ds = DataSource.fromFile(path);
-            _stream = new DataSourceSequentialReader(ds);
-        }
-
-        /// Open TAR from an existing SequentialReader (e.g. GzipSequentialReader).
-        this(SequentialReader stream) {
-            _stream = stream;
-        }
-    } else {
-        /// Open TAR from a stream value (ChunkReader or other isTarStream type).
-        this(R stream) {
-            _stream = stream;
-        }
+    /// Open TAR from a stream value (ChunkReader or other isTarStream type).
+    this(R stream) {
+        _stream = stream;
     }
 
     /// Close the underlying data source.
@@ -265,6 +250,22 @@ auto tarReader(R)(R source)
     return TarReader!(typeof(cr))(cr);
 }
 
+/// Construct a file-backed TarReader from a plain TAR file path.
+/// Reads in 64KB chunks; `close()` propagates to release the file handle.
+auto tarReader(string path) {
+    auto source = FileChunkSource(path);
+    return TarReader!(ChunkReader!FileChunkSource)(ChunkReader!FileChunkSource(source));
+}
+
+/// Construct a file-backed TarReader from a gzip-compressed TAR file path.
+/// Decompresses on the fly; `close()` propagates through the entire chain.
+auto tarGzReader(string path) {
+    auto source = FileChunkSource(path);
+    auto gz = GzipRange!FileChunkSource(source);
+    alias CR = ChunkReader!(GzipRange!FileChunkSource);
+    return TarReader!CR(CR(gz));
+}
+
 // -- Header parsing --
 
 private DarkArchiveEntry parseHeader(const(ubyte)[] header) {
@@ -442,7 +443,7 @@ version(unittest) {
     @("tar read: symlink entry")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        auto reader = TarReader!SequentialReader(testDataDir ~ "/test-symlink.tar");
+        auto reader = tarReader(testDataDir ~ "/test-symlink.tar");
         bool foundLink, foundTarget;
         foreach (entry; reader.entries) {
             if (entry.pathname == "./link.txt") {
@@ -462,7 +463,7 @@ version(unittest) {
     @("tar read: zero-byte files")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        auto reader = TarReader!SequentialReader(testDataDir ~ "/test-empty-files.tar");
+        auto reader = tarReader(testDataDir ~ "/test-empty-files.tar");
         bool foundGitkeep, foundEmpty, foundNotempty;
         foreach (entry; reader.entries) {
             if (entry.pathname == "./.gitkeep") {
@@ -489,7 +490,7 @@ version(unittest) {
     @("tar read: directory entries")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        auto reader = TarReader!SequentialReader(testDataDir ~ "/test-symlink.tar");
+        auto reader = tarReader(testDataDir ~ "/test-symlink.tar");
         bool foundDir;
         foreach (entry; reader.entries)
             if (entry.pathname == "./" && entry.isDir) foundDir = true;
@@ -499,7 +500,7 @@ version(unittest) {
     @("tar read: permissions parsed")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        auto reader = TarReader!SequentialReader(testDataDir ~ "/test-empty-files.tar");
+        auto reader = tarReader(testDataDir ~ "/test-empty-files.tar");
         foreach (entry; reader.entries)
             if (entry.pathname == "./notempty.txt")
                 assert(entry.permissions > 0);
@@ -519,7 +520,7 @@ version(unittest) {
         auto padded = new ubyte[](1024);
         padded[0 .. garbage.length] = garbage[];
         write(tmpPath, padded);
-        auto reader = TarReader!SequentialReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
@@ -544,7 +545,7 @@ version(unittest) {
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, truncated);
 
-        auto reader = TarReader!SequentialReader(corruptPath);
+        auto reader = tarReader(corruptPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
@@ -595,7 +596,7 @@ version(unittest) {
         foreach (i, ref b; header) b = cast(ubyte)((i * 37 + 13) & 0xFF);
         write(tmpPath, header[]);
 
-        auto reader = TarReader!SequentialReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
@@ -621,7 +622,7 @@ version(unittest) {
         writer.addBuffer("exact512.bin", data);
         writer.finish();
 
-        auto reader = TarReader!SequentialReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "exact512.bin") {
@@ -649,7 +650,7 @@ version(unittest) {
         writer.addBuffer("over512.bin", data);
         writer.finish();
 
-        auto reader = TarReader!SequentialReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "over512.bin") {
@@ -673,7 +674,7 @@ version(unittest) {
         writer.addBuffer("one.bin", [cast(ubyte) 0x42]);
         writer.finish();
 
-        auto reader = TarReader!SequentialReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "one.bin") {
@@ -691,7 +692,7 @@ version(unittest) {
         // GNU tar uses ././@LongLink pseudo-entries for names > 100 chars.
         // Our reader skips GNU extensions (only supports pax). Verify we
         // still iterate without crashing and produce at least one entry.
-        auto reader = TarReader!SequentialReader(testDataDir ~ "/test-gnu-longname.tar");
+        auto reader = tarReader(testDataDir ~ "/test-gnu-longname.tar");
         string[] names;
         foreach (entry; reader.entries)
             names ~= entry.pathname;
@@ -710,7 +711,7 @@ version(unittest) {
         writer.addBuffer("", cast(const(ubyte)[]) "no name");
         writer.finish();
 
-        auto reader = TarReader!SequentialReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) {
@@ -767,7 +768,7 @@ version(unittest) {
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
 
-        auto reader = TarReader!SequentialReader(corruptPath);
+        auto reader = tarReader(corruptPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "small.txt") {
@@ -790,7 +791,7 @@ version(unittest) {
         writer.addBuffer("zero.txt", cast(const(ubyte)[]) "");
         writer.finish();
 
-        auto reader = TarReader!SequentialReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "zero.txt") {
@@ -823,7 +824,7 @@ version(unittest) {
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
 
-        auto reader = TarReader!SequentialReader(corruptPath);
+        auto reader = tarReader(corruptPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;

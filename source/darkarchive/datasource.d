@@ -177,6 +177,10 @@ struct ChunkReader(R)
         }
     }
 
+    /// Propagate close to the underlying source if it supports it.
+    static if (__traits(hasMember, R, "close"))
+        void close() { _source.close(); }
+
     private bool refill() {
         while (!_source.empty) {
             auto chunk = cast(const(ubyte)[]) _source.front;
@@ -252,12 +256,14 @@ struct GzipRange(R)
     }
 
     /// Release zlib resources. Called automatically on Z_STREAM_END or EOF;
-    /// safe to call manually for early termination.
+    /// safe to call manually for early termination. Propagates to the source.
     void close() {
         if (_zsInit) {
             inflateEnd(_zs);
             _zsInit = false;
         }
+        static if (__traits(hasMember, R, "close"))
+            _source.close();
     }
 
     private void advance() {
@@ -317,357 +323,6 @@ auto gzipRange(R)(R source)
     if (isInputRange!R && is(ElementType!R : const(ubyte)[]))
 {
     return GzipRange!R(source);
-}
-
-/// Sequential byte stream — used by TarReader for both plain TAR (backed by
-/// DataSource) and TAR.GZ (backed by streaming gzip decompressor).
-/// Unlike DataSource, this is a class for polymorphic dispatch.
-class SequentialReader {
-    /// Read exactly `len` bytes at the current position. Advances position.
-    /// Allocates a new buffer each call — prefer readInto for hot paths.
-    ubyte[] read(size_t len) {
-        assert(false, "not implemented");
-    }
-
-    /// Read into a caller-provided buffer. Returns bytes actually read.
-    /// Zero-allocation on the hot path — use in readDataChunked.
-    size_t readInto(ubyte[] buf) {
-        // Default implementation: delegate to read() + copy.
-        // Subclasses override for zero-copy.
-        auto data = read(buf.length);
-        buf[0 .. data.length] = data[];
-        return data.length;
-    }
-
-    /// Skip `len` bytes (advance position without reading).
-    void skip(size_t len) {
-        assert(false, "not implemented");
-    }
-
-    /// Whether there are more bytes to read.
-    bool empty() {
-        assert(false, "not implemented");
-        return true;
-    }
-
-    /// Close underlying resources.
-    void close() {}
-}
-
-/// SequentialReader backed by a DataSource (memory or file).
-class DataSourceSequentialReader : SequentialReader {
-    private DataSource* _ds;
-    private ulong _pos;
-
-    this(DataSource* ds) {
-        _ds = ds;
-        _pos = 0;
-    }
-
-    override ubyte[] read(size_t len) {
-        if (_pos + len > _ds.length)
-            throw new DarkArchiveException("TAR: unexpected end of data");
-        auto result = cast(ubyte[]) _ds.readSlice(_pos, len).dup;
-        _pos += len;
-        return result;
-    }
-
-    override size_t readInto(ubyte[] buf) {
-        auto len = buf.length;
-        if (_pos + len > _ds.length)
-            throw new DarkArchiveException("TAR: unexpected end of data");
-        auto slice = _ds.readSlice(_pos, len);
-        buf[0 .. len] = slice[0 .. len];
-        _pos += len;
-        return len;
-    }
-
-    override void skip(size_t len) {
-        _pos += len;
-        if (_pos > _ds.length)
-            _pos = cast(size_t) _ds.length;
-    }
-
-    override bool empty() {
-        return _pos >= _ds.length;
-    }
-
-    override void close() {
-        if (_ds !is null)
-            _ds.close();
-    }
-}
-
-/// SequentialReader that pulls bytes from a caller-provided delegate.
-///
-/// The delegate must return the next chunk of raw bytes on each call,
-/// or an empty slice to signal EOF. The returned slice must remain valid
-/// until the next call to the delegate — callers are responsible for
-/// `.dup`-ing if the source buffer is reused between calls.
-class DelegateSequentialReader : SequentialReader {
-    private {
-        ubyte[] delegate() _source;
-        ubyte[] _pending; // unconsumed tail of the last returned chunk
-        bool _eof;
-    }
-
-    this(ubyte[] delegate() source) {
-        _source = source;
-    }
-
-    override ubyte[] read(size_t len) {
-        auto buf = new ubyte[](len);
-        readInto(buf);
-        return buf;
-    }
-
-    override size_t readInto(ubyte[] buf) {
-        size_t filled = 0;
-        while (filled < buf.length) {
-            if (_pending.length == 0) {
-                if (_eof)
-                    throw new DarkArchiveException("TAR: unexpected end of stream");
-                auto chunk = _source();
-                if (chunk.length == 0) { _eof = true; break; }
-                _pending = chunk;
-            }
-            auto take = buf.length - filled;
-            if (take > _pending.length) take = _pending.length;
-            buf[filled .. filled + take] = _pending[0 .. take];
-            filled += take;
-            _pending = _pending[take .. $];
-        }
-        if (filled < buf.length)
-            throw new DarkArchiveException("TAR: unexpected end of stream");
-        return filled;
-    }
-
-    override void skip(size_t len) {
-        while (len > 0) {
-            if (_pending.length == 0) {
-                if (_eof) return;
-                auto chunk = _source();
-                if (chunk.length == 0) { _eof = true; return; }
-                _pending = chunk;
-            }
-            auto take = len > _pending.length ? _pending.length : len;
-            _pending = _pending[take .. $];
-            len -= take;
-        }
-    }
-
-    override bool empty() {
-        if (_pending.length > 0) return false;
-        if (_eof) return true;
-        auto chunk = _source();
-        if (chunk.length == 0) { _eof = true; return true; }
-        _pending = chunk;
-        return false;
-    }
-}
-
-/// SequentialReader backed by streaming gzip decompression of a file or
-/// a caller-provided chunk delegate.
-///
-/// Uses C zlib directly for bounded memory — decompresses into a fixed-size
-/// ring buffer, never accumulating more than DECOMP_BUF_SIZE of decompressed
-/// data regardless of compression ratio. Peak memory: ~576KB
-/// (512KB decomp buffer + 64KB compressed read buffer).
-class GzipSequentialReader : SequentialReader {
-    private {
-        import std.stdio : File;
-        import etc.c.zlib;
-
-        // File-backed source (null when using chunk delegate)
-        File _file;
-
-        // Delegate-based source (null when using file)
-        ubyte[] delegate() _chunkSource;
-        ubyte[] _currentChunk; // pinned so zlib next_in ptr stays valid
-
-        z_stream _zs;
-        bool _zsInit;
-
-        // Fixed-size decompression buffer (ring-style: compact when half consumed)
-        ubyte[] _decompBuf;
-        size_t _decompPos;   // read position within _decompBuf
-        size_t _decompLen;   // valid bytes in _decompBuf (from start)
-
-        ubyte[] _readBuf;    // reusable compressed read buffer (file mode only)
-        bool _fileEOF;
-        bool _inflateEOF;
-
-        enum COMP_CHUNK = 64 * 1024;       // 64KB compressed read chunks
-        enum DECOMP_BUF_SIZE = 512 * 1024; // 512KB decompressed buffer
-        enum COMPACT_THRESHOLD = 256 * 1024; // compact when 256KB consumed
-    }
-
-    /// Construct from a gzip file path.
-    this(string gzipPath) {
-        _file = File(gzipPath, "rb");
-        _decompBuf = new ubyte[](DECOMP_BUF_SIZE);
-        _readBuf = new ubyte[](COMP_CHUNK);
-        _decompPos = 0;
-        _decompLen = 0;
-        _fileEOF = false;
-        _inflateEOF = false;
-
-        // Initialize C zlib for gzip format (windowBits = 15 + 16 for gzip)
-        _zs = z_stream.init;
-        auto ret = inflateInit2(&_zs, 15 + 16);
-        if (ret != Z_OK)
-            throw new DarkArchiveException("GZIP: inflateInit2 failed");
-        _zsInit = true;
-    }
-
-    /// Construct from a chunk-producing delegate.
-    ///
-    /// The delegate returns the next compressed chunk on each call,
-    /// or an empty slice on EOF. The returned slice must remain valid
-    /// until the next delegate call — `.dup` if the source reuses buffers.
-    this(ubyte[] delegate() chunkSource) {
-        _chunkSource = chunkSource;
-        _decompBuf = new ubyte[](DECOMP_BUF_SIZE);
-        _decompPos = 0;
-        _decompLen = 0;
-        _fileEOF = false;
-        _inflateEOF = false;
-
-        _zs = z_stream.init;
-        auto ret = inflateInit2(&_zs, 15 + 16);
-        if (ret != Z_OK)
-            throw new DarkArchiveException("GZIP: inflateInit2 failed");
-        _zsInit = true;
-    }
-
-    override ubyte[] read(size_t len) {
-        ensureAvailable(len);
-        if (available < len)
-            throw new DarkArchiveException("GZIP: unexpected end of compressed data");
-        auto result = _decompBuf[_decompPos .. _decompPos + len].dup;
-        _decompPos += len;
-        compact();
-        return result;
-    }
-
-    override size_t readInto(ubyte[] buf) {
-        auto len = buf.length;
-        ensureAvailable(len);
-        if (available < len)
-            throw new DarkArchiveException("GZIP: unexpected end of compressed data");
-        buf[0 .. len] = _decompBuf[_decompPos .. _decompPos + len];
-        _decompPos += len;
-        compact();
-        return len;
-    }
-
-    override void skip(size_t len) {
-        while (len > 0) {
-            if (available == 0) {
-                if (!decompressMore())
-                    return;
-                continue;
-            }
-            auto toSkip = len > available ? available : len;
-            _decompPos += toSkip;
-            len -= toSkip;
-        }
-        compact();
-    }
-
-    override bool empty() {
-        if (available > 0) return false;
-        if (_inflateEOF) return true;
-        return !decompressMore();
-    }
-
-    override void close() {
-        if (_zsInit) {
-            inflateEnd(&_zs);
-            _zsInit = false;
-        }
-        if (_chunkSource is null)
-            _file.close();
-        _chunkSource = null;
-        _currentChunk = null;
-        _decompBuf = null;
-        _readBuf = null;
-    }
-
-    private @property size_t available() const {
-        return _decompLen - _decompPos;
-    }
-
-    private void ensureAvailable(size_t needed) {
-        while (available < needed) {
-            if (!decompressMore())
-                return;
-        }
-    }
-
-    private bool decompressMore() {
-        if (_inflateEOF) return false;
-
-        compact();
-
-        // Fill compressed input if zlib needs more
-        if (_zs.avail_in == 0 && !_fileEOF) {
-            if (_chunkSource !is null) {
-                _currentChunk = _chunkSource(); // pin so zlib ptr stays valid
-                if (_currentChunk.length == 0) {
-                    _fileEOF = true;
-                } else {
-                    _zs.next_in  = cast(ubyte*) _currentChunk.ptr;
-                    _zs.avail_in = cast(uint)   _currentChunk.length;
-                }
-            } else {
-                auto got = _file.rawRead(_readBuf[]);
-                if (got.length == 0) {
-                    _fileEOF = true;
-                } else {
-                    _zs.next_in  = cast(ubyte*) got.ptr;
-                    _zs.avail_in = cast(uint)   got.length;
-                }
-            }
-        }
-
-        // Decompress into the free space at end of _decompBuf
-        auto freeSpace = _decompBuf.length - _decompLen;
-        if (freeSpace == 0) return available > 0; // buffer full, need compact
-
-        _zs.next_out = cast(ubyte*) (_decompBuf.ptr + _decompLen);
-        _zs.avail_out = cast(uint) freeSpace;
-
-        auto ret = inflate(&_zs, Z_NO_FLUSH);
-
-        auto produced = freeSpace - _zs.avail_out;
-        _decompLen += produced;
-
-        if (ret == Z_STREAM_END) {
-            _inflateEOF = true;
-            return available > 0;
-        }
-        if (ret != Z_OK && ret != Z_BUF_ERROR)
-            throw new DarkArchiveException("GZIP: inflate failed");
-
-        // Stuck: no compressed input left and inflate made no progress.
-        // The stream is truncated — further calls will loop forever otherwise.
-        if (produced == 0 && _zs.avail_in == 0 && _fileEOF)
-            return false;
-
-        return produced > 0 || available > 0;
-    }
-
-    /// Compact: shift unconsumed data to front of buffer.
-    private void compact() {
-        if (_decompPos >= COMPACT_THRESHOLD) {
-            auto rem = available;
-            if (rem > 0)
-                _decompBuf[0 .. rem] = _decompBuf[_decompPos .. _decompLen];
-            _decompPos = 0;
-            _decompLen = rem;
-        }
-    }
 }
 
 // ===========================================================================
@@ -741,6 +396,48 @@ struct DelegateSink {
 
     void close() {
         if (_close !is null) _close();
+    }
+}
+
+/// Input range that reads a binary file in fixed-size chunks.
+///
+/// Each `front()` returns a freshly allocated slice — slices remain valid
+/// after `popFront()` is called and across copies of this struct.
+/// Call `close()` to release the file handle early; it is NOT called
+/// automatically on destruction (no destructor in D structs).
+struct FileChunkSource {
+    private {
+        import std.stdio : File;
+        File _file;
+        ubyte[] _buf;
+        ubyte[] _current;
+        bool _eof;
+        enum CHUNK = 64 * 1024;
+    }
+
+    this(string path) {
+        _file = File(path, "rb");
+        _buf = new ubyte[](CHUNK);
+        refill(); // prime first chunk
+    }
+
+    bool empty() const { return _current is null; }
+
+    const(ubyte)[] front() const { return _current; }
+
+    void popFront() { refill(); }
+
+    void close() { _file.close(); }
+
+    private void refill() {
+        if (_eof) { _current = null; return; }
+        auto got = _file.rawRead(_buf[]);
+        if (got.length == 0) {
+            _eof = true;
+            _current = null;
+        } else {
+            _current = got.dup;
+        }
     }
 }
 
@@ -821,6 +518,38 @@ version(unittest) {
             caught = true;
         }
         caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // FileChunkSource
+    // -------------------------------------------------------------------
+
+    @("FileChunkSource: empty file is immediately empty")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : write, remove;
+        enum path = "test-data/tmp-fcs-empty.bin";
+        write(path, cast(ubyte[]) []);
+        scope(exit) remove(path);
+        auto src = FileChunkSource(path);
+        scope(exit) src.close();
+        src.empty.shouldBeTrue;
+    }
+
+    @("FileChunkSource: close propagates through ChunkReader to tarReader")
+    unittest {
+        // After close(), the file handle must be released so a second open succeeds.
+        // On Linux this is always true; the test also verifies the close chain
+        // TarReader → ChunkReader → FileChunkSource → File does not throw.
+        import darkarchive.formats.tar.reader : tarReader;
+        auto reader = tarReader("test-data/test-empty-files.tar");
+        reader.close();
+        // Re-open same path — would fail on some OS if file handle leaked
+        auto reader2 = tarReader("test-data/test-empty-files.tar");
+        scope(exit) reader2.close();
+        int count;
+        foreach (entry; reader2.entries) count++;
+        assert(count > 0, "should read entries on second open");
     }
 
     // -------------------------------------------------------------------

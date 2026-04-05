@@ -302,9 +302,7 @@ ubyte[] gzipCompress(const(ubyte)[] data) {
 // ===========================================================================
 
 version(unittest) {
-    import darkarchive.formats.tar.reader : TarReader;
-    import darkarchive.datasource : SequentialReader;
-    alias TR = TarReader!SequentialReader;
+    import darkarchive.formats.tar.reader : tarReader, tarGzReader;
 
     @("tar write: round-trip with addBuffer")
     unittest {
@@ -320,7 +318,7 @@ version(unittest) {
             .addBuffer("sub/nested.txt", cast(const(ubyte)[]) "Nested content");
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         bool foundHello, foundNested;
         foreach (entry; reader.entries) {
@@ -348,7 +346,7 @@ version(unittest) {
         writer.addDirectory("mydir");
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries)
             if (entry.pathname == "mydir/")
@@ -367,7 +365,7 @@ version(unittest) {
         writer.addSymlink("link.txt", "target.txt");
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "link.txt") {
@@ -391,7 +389,7 @@ version(unittest) {
         writer.addBuffer(longName, cast(const(ubyte)[]) "pax content");
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == longName) {
@@ -417,17 +415,16 @@ version(unittest) {
             .addDirectory("dir");
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
         count.shouldEqual(3);
     }
 
-    @("tar.gz write: round-trip via tarGzWriter + GzipSequentialReader")
+    @("tar.gz write: round-trip via tarGzWriter + tarGzReader")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import darkarchive.datasource : GzipSequentialReader;
         import std.file : exists, remove;
 
         auto gzTmpPath = "test-data/test-tarw-gz-roundtrip.tar.gz";
@@ -440,7 +437,7 @@ version(unittest) {
             .addBuffer("file-b.txt", cast(const(ubyte)[]) "Content B");
         writer.finish();
 
-        auto reader = TR(new GzipSequentialReader(gzTmpPath));
+        auto reader = tarGzReader(gzTmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) {
@@ -465,7 +462,7 @@ version(unittest) {
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "tar file content");
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
@@ -577,7 +574,7 @@ version(unittest) {
             .addDirectory("streamdir");
         writer.finish();
 
-        auto reader = TR(outPath);
+        auto reader = tarReader(outPath);
         scope(exit) reader.close();
         bool found;
         foreach (entry; reader.entries) {
@@ -607,7 +604,7 @@ version(unittest) {
             .addBuffer("Ünïcödé/nested.txt", cast(const(ubyte)[]) "nested");
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         string[] names;
         foreach (entry; reader.entries)
@@ -635,7 +632,7 @@ version(unittest) {
                 cast(const(ubyte)[]) "content %d".format(i));
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         int count;
         foreach (entry; reader.entries) count++;
@@ -664,7 +661,7 @@ version(unittest) {
             .addDirectory("mydir", octal!755);
         writer.finish();
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         foreach (entry; reader.entries) {
             if (entry.pathname == "script.sh")
@@ -682,7 +679,7 @@ version(unittest) {
     @("tar.gz write: tarGzWriter to delegate sink round-trip")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import darkarchive.datasource : DelegateSink, GzipSequentialReader;
+        import darkarchive.datasource : DelegateSink;
         import std.file : write, remove, exists;
 
         ubyte[] buf;
@@ -695,7 +692,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, buf);
 
-        auto reader = TR(new GzipSequentialReader(tmpPath));
+        auto reader = tarGzReader(tmpPath);
         scope(exit) reader.close();
         bool found;
         foreach (entry; reader.entries) {

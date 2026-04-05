@@ -130,9 +130,7 @@ auto gzipSink(R)(R sink)
 // ===========================================================================
 
 version(unittest) {
-    import darkarchive.formats.tar.reader : TarReader;
-    import darkarchive.datasource : SequentialReader;
-    alias TR = TarReader!SequentialReader;
+    import darkarchive.formats.tar.reader : tarReader, tarGzReader;
 
     private immutable testDataDir = "test-data";
 
@@ -159,7 +157,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
 
         string[] names;
@@ -187,7 +185,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
 
         int count;
@@ -209,7 +207,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TR(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
 
         foreach (entry; reader.entries) {
@@ -273,21 +271,19 @@ version(unittest) {
         caught.shouldBeTrue;
     }
 
-    /// Streaming gzip decompression via GzipSequentialReader + TarReader
-    @("gzip: streaming decompression via GzipSequentialReader")
+    /// Streaming gzip decompression via tarGzReader
+    @("gzip: streaming decompression via tarGzReader")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import darkarchive.datasource : GzipSequentialReader;
 
-        auto gzStream = new GzipSequentialReader(testDataDir ~ "/test.tar.gz");
-        auto reader = TR(gzStream);
+        auto reader = tarGzReader(testDataDir ~ "/test.tar.gz");
         string[] names;
         foreach (entry; reader.entries) {
             names ~= entry.pathname;
             if (entry.pathname == "./file1.txt")
                 reader.readText().shouldEqual("Hello from file1\n");
         }
-        assert(names.length > 0, "should find entries via streaming gzip");
+        assert(names.length > 0, "should find entries via tarGzReader");
     }
 
     /// Memory consistency: streaming through tar.gz should not accumulate memory
@@ -295,7 +291,6 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter, gzipCompress;
-        import darkarchive.datasource : GzipSequentialReader;
         import core.memory : GC;
         import std.file : write, read, remove, exists;
 
@@ -323,8 +318,7 @@ version(unittest) {
         auto memBefore = GC.stats.usedSize;
 
         // Stream through all entries, reading each via chunked API
-        auto gzStream = new GzipSequentialReader(tmpPath);
-        auto reader = TR(gzStream);
+        auto reader = tarGzReader(tmpPath);
         size_t totalRead;
         foreach (entry; reader.entries) {
             if (entry.isFile) {
