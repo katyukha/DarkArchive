@@ -162,13 +162,9 @@ auto darkArchiveWriter(DarkArchiveFormat fmt, R)(R sink)
     if (fmt != DarkArchiveFormat.zip)
 {
     import std.range : isOutputRange;
-    import darkarchive.formats.tar.writer : tarWriter, tarGzWriter;
     static assert(isOutputRange!(R, const(ubyte)[]),
         "darkArchiveWriter: R must be an output range of const(ubyte)[]");
-    static if (fmt == DarkArchiveFormat.tar)
-        return tarWriter(sink);
-    else // tarGz
-        return tarGzWriter(sink);
+    return DarkArchiveWriter!(fmt, R)(sink);
 }
 
 
@@ -619,57 +615,109 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
 // DarkArchiveWriter
 // ---------------------------------------------------------------------------
 
-/// High-level archive writer parameterized on format.
-struct DarkArchiveWriter(DarkArchiveFormat fmt) {
-    static if (fmt == DarkArchiveFormat.zip)
-        private ZipWriter* _writer;
-    else static if (fmt == DarkArchiveFormat.tar)
-        private TarWriter!DelegateSink* _writer;
-    else // tarGz
-        private TarWriter!(GzipSink!DelegateSink)* _writer;
+/// High-level archive writer parameterized on format and (optionally) sink type.
+///
+/// `DarkArchiveWriter!(fmt)` writes to a file path (default, `SinkT = void`).
+/// `DarkArchiveWriter!(fmt, R)` writes to any output range `R` of `const(ubyte)[]`.
+/// Use the `darkArchiveWriter(fmt, sink)` factory to construct the sink-backed form
+/// without spelling out the sink type.
+///
+/// ZIP format does not support output-range sinks (requires random access for the
+/// central directory). Attempting to instantiate `DarkArchiveWriter!(zip, R)` is
+/// a compile-time error.
+struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
+
+    private alias Self = DarkArchiveWriter!(fmt, SinkT);
+
+    // Internal writer type depends on whether we are file-backed or sink-backed.
+    static if (is(SinkT == void)) {
+        // File-backed: delegate sink wraps a heap-allocated File.
+        static if (fmt == DarkArchiveFormat.zip)
+            private ZipWriter* _writer;
+        else static if (fmt == DarkArchiveFormat.tar)
+            private TarWriter!DelegateSink* _writer;
+        else // tarGz
+            private TarWriter!(GzipSink!DelegateSink)* _writer;
+    } else {
+        // Sink-backed: caller supplies any isOutputRange!(R, const(ubyte)[]).
+        static assert(fmt != DarkArchiveFormat.zip,
+            "ZIP format requires random access — output-range sink is not supported. "
+            ~ "Use DarkArchiveWriter!(DarkArchiveFormat.zip)(path) instead.");
+        import std.range : isOutputRange;
+        static assert(isOutputRange!(SinkT, const(ubyte)[]),
+            "SinkT must satisfy isOutputRange!(SinkT, const(ubyte)[])");
+        static if (fmt == DarkArchiveFormat.tar)
+            private TarWriter!SinkT* _writer;
+        else // tarGz
+            private TarWriter!(GzipSink!SinkT)* _writer;
+    }
 
     private bool _finished;
-    private string _filePath;
+    private string _filePath;   // non-null only for file-backed writers
 
     @disable this();
 
-    this(in Path path) { this(path.toString()); }
+    // -----------------------------------------------------------------------
+    // File-backed constructors (only available when SinkT == void)
+    // -----------------------------------------------------------------------
 
-    /// Create writer to file.
-    this(string path) {
-        _filePath = path;
-        static if (fmt == DarkArchiveFormat.zip) {
-            _writer = new ZipWriter();
-            *_writer = ZipWriter.createToFile(path);
-        } else static if (fmt == DarkArchiveFormat.tar) {
-            import std.stdio : File;
-            auto f = new File(path, "wb");
-            _writer = new TarWriter!DelegateSink(DelegateSink(
-                (const(ubyte)[] data) { f.rawWrite(data); },
-                () { f.close(); }
-            ));
-        } else { // tarGz
-            import std.stdio : File;
-            auto f = new File(path, "wb");
-            auto fsink = DelegateSink(
-                (const(ubyte)[] data) { f.rawWrite(data); },
-                () { f.close(); }
-            );
-            _writer = new TarWriter!(GzipSink!DelegateSink)(
-                GzipSink!DelegateSink(fsink)
-            );
+    static if (is(SinkT == void)) {
+
+        this(in Path path) { this(path.toString()); }
+
+        /// Create writer to file.  Format is inferred from the template parameter.
+        this(string path) {
+            _filePath = path;
+            static if (fmt == DarkArchiveFormat.zip) {
+                _writer = new ZipWriter();
+                *_writer = ZipWriter.createToFile(path);
+            } else static if (fmt == DarkArchiveFormat.tar) {
+                import std.stdio : File;
+                auto f = new File(path, "wb");
+                _writer = new TarWriter!DelegateSink(DelegateSink(
+                    (const(ubyte)[] data) { f.rawWrite(data); },
+                    () { f.close(); }
+                ));
+            } else { // tarGz
+                import std.stdio : File;
+                auto f = new File(path, "wb");
+                auto fsink = DelegateSink(
+                    (const(ubyte)[] data) { f.rawWrite(data); },
+                    () { f.close(); }
+                );
+                _writer = new TarWriter!(GzipSink!DelegateSink)(
+                    GzipSink!DelegateSink(fsink)
+                );
+            }
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Sink-backed constructor (only available when SinkT != void)
+    // -----------------------------------------------------------------------
+
+    static if (!is(SinkT == void)) {
+
+        /// Create writer streaming to `sink`.  Call `finish()` when done.
+        this(SinkT sink) {
+            static if (fmt == DarkArchiveFormat.tar)
+                _writer = new TarWriter!SinkT(sink);
+            else // tarGz
+                _writer = new TarWriter!(GzipSink!SinkT)(GzipSink!SinkT(sink));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Entry-adding methods — identical for both file-backed and sink-backed
+    // -----------------------------------------------------------------------
+
     /// Add file from disk.
-    ref DarkArchiveWriter!fmt add(in Path sourcePath,
-                                   string archiveName = null) return {
+    ref Self add(in Path sourcePath, string archiveName = null) return {
         return add(sourcePath.toString(), archiveName);
     }
 
     /// ditto
-    ref DarkArchiveWriter!fmt add(string sourcePath,
-                                   string archiveName = null) return {
+    ref Self add(string sourcePath, string archiveName = null) return {
         import std.stdio : File;
         if (archiveName is null)
             archiveName = Path(sourcePath).baseName;
@@ -687,17 +735,15 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt) {
     }
 
     /// Add directory tree recursively.
-    ref DarkArchiveWriter!fmt addTree(
-            in Path rootPath, string prefix = null,
-            FollowSymlinks followSym = FollowSymlinks.yes) return {
+    ref Self addTree(in Path rootPath, string prefix = null,
+                     FollowSymlinks followSym = FollowSymlinks.yes) return {
         return addTree(rootPath.toString(), prefix, followSym);
     }
 
     /// ditto
-    ref DarkArchiveWriter!fmt addTree(
-            string rootPath, string prefix = null,
-            FollowSymlinks followSym = FollowSymlinks.yes) return {
-        auto root = Path(rootPath);
+    ref Self addTree(string rootPath, string prefix = null,
+                     FollowSymlinks followSym = FollowSymlinks.yes) return {
+        auto root = Path(rootPath).toAbsolute();
         if (prefix is null) prefix = root.baseName;
         foreach (de; root.walkDepth(followSym == FollowSymlinks.yes)) {
             auto relPath = de.relativeTo(root);
@@ -724,38 +770,36 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt) {
     }
 
     /// Add from in-memory buffer.
-    ref DarkArchiveWriter!fmt addBuffer(string archiveName,
-                                         const(ubyte)[] data,
-                                         uint permissions = octal!644) return {
+    ref Self addBuffer(string archiveName, const(ubyte)[] data,
+                       uint permissions = octal!644) return {
         _writer.addBuffer(archiveName, data, permissions);
         return this;
     }
 
     /// Add empty directory.
-    ref DarkArchiveWriter!fmt addDirectory(string archiveName,
-                                            uint permissions = octal!755) return {
+    ref Self addDirectory(string archiveName,
+                          uint permissions = octal!755) return {
         _writer.addDirectory(archiveName, permissions);
         return this;
     }
 
     /// Add from streaming source.
-    ref DarkArchiveWriter!fmt addStream(
-            string archiveName,
-            scope void delegate(scope void delegate(const(ubyte)[])) reader,
-            long size = -1,
-            uint permissions = octal!644) return {
+    ref Self addStream(string archiveName,
+                       scope void delegate(scope void delegate(const(ubyte)[])) reader,
+                       long size = -1,
+                       uint permissions = octal!644) return {
         _writer.addStream(archiveName, reader, size, permissions);
         return this;
     }
 
     /// Add symlink entry.
-    ref DarkArchiveWriter!fmt addSymlink(string archiveName,
-                                          string target) return {
+    ref Self addSymlink(string archiveName, string target) return {
         _writer.addSymlink(archiveName, target);
         return this;
     }
 
-    /// Finish writing the archive.
+    /// Flush and finalise the archive.  Must be called explicitly for
+    /// sink-backed writers; file-backed writers also call it in the destructor.
     void finish() {
         if (_finished) return;
         _finished = true;
@@ -763,9 +807,12 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt) {
     }
 
     ~this() {
-        if (!_finished && _filePath !is null) {
+        if (_finished || _writer is null) return;
+        // Auto-finish: always for file-backed (prevents truncated files on early
+        // return); for sink-backed only when _filePath is non-null (never, so
+        // sink-backed writers require an explicit finish() call).
+        if (_filePath !is null)
             try { finish(); } catch (Exception) {}
-        }
     }
 }
 
@@ -2777,6 +2824,79 @@ version(unittest) {
             }
         }
         found.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Sink-backed writer: addTree and add(path)
+    // -------------------------------------------------------------------
+
+    @("sink-backed writer: darkArchiveWriter returns DarkArchiveWriter with addTree")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+        import darkarchive.datasource : DelegateSink;
+        // addTree on a sink-backed writer must produce a readable archive
+        auto srcDir = Path(testDataDir, "sink-tree-src");
+        auto tmpPath = testDataDir ~ "/test-sink-addtree.tar.gz";
+        scope(exit) {
+            if (srcDir.exists) srcDir.remove();
+            if (Path(tmpPath).exists) Path(tmpPath).remove();
+        }
+        srcDir.mkdir(true);
+        (srcDir ~ "a.txt").writeFile("hello");
+        (srcDir ~ "b.txt").writeFile("world");
+        ubyte[] buf;
+        darkArchiveWriter!(DarkArchiveFormat.tarGz)(
+                DelegateSink((const(ubyte)[] c) { buf ~= c; }))
+            .addTree(srcDir)
+            .finish();
+        Path(tmpPath).writeFile(buf);
+        auto reader = RTarGz(tmpPath);
+        scope(exit) reader.close();
+        int count;
+        foreach (entry; reader.entries) {
+            if (entry.isFile) {
+                count++;
+                reader.skipData();
+            } else {
+                reader.skipData();
+            }
+        }
+        count.shouldEqual(2);
+    }
+
+    @("sink-backed writer: add(path) streams file from disk into sink")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+        import darkarchive.datasource : DelegateSink;
+        auto srcFile = testDataDir ~ "/test-zip.zip";  // any existing file
+        ubyte[] buf;
+        darkArchiveWriter!(DarkArchiveFormat.tar)(
+                DelegateSink((const(ubyte)[] c) { buf ~= c; }))
+            .add(srcFile, "payload.bin")
+            .finish();
+        auto tmpPath = testDataDir ~ "/test-sink-addfile.tar";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(buf);
+        auto reader = RTar(tmpPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "payload.bin") {
+                found = true;
+                entry.size.shouldEqual(Path(srcFile).getSize());
+                reader.skipData();
+            } else {
+                reader.skipData();
+            }
+        }
+        found.shouldBeTrue;
+    }
+
+    @("sink-backed writer: ZIP + sink is a compile-time error")
+    unittest {
+        import darkarchive.datasource : DelegateSink;
+        static assert(!__traits(compiles,
+            DarkArchiveWriter!(DarkArchiveFormat.zip, DelegateSink)(DelegateSink.init)));
     }
 
     // -------------------------------------------------------------------
