@@ -1,7 +1,8 @@
-/// GZIP reader (RFC 1952 framing around std.zlib raw deflate).
+/// GZIP reader/writer (RFC 1952 framing around std.zlib raw deflate).
 module darkarchive.gzip;
 
 import darkarchive.exception : DarkArchiveException;
+import std.range : isOutputRange;
 
 /// Decompress a gzip-compressed byte buffer.
 /// Returns the uncompressed data.
@@ -34,11 +35,102 @@ const(ubyte)[] gunzip(const(ubyte)[] data) {
 
 
 // ===========================================================================
+// GzipSink — output range that gzip-compresses to an inner output range
+// ===========================================================================
+
+/// Output range that deflate-compresses data in gzip format and forwards
+/// compressed bytes to an inner output range.
+///
+/// Call `close()` to flush the compressor and write the gzip trailer.
+/// `close()` also calls `_sink.close()` if the inner range has that method.
+///
+/// Warning: Do not copy this struct after calling `put()` — the internal
+/// zlib state is shared between copies and concurrent use causes corruption.
+struct GzipSink(R)
+    if (isOutputRange!(R, const(ubyte)[]))
+{
+    import etc.c.zlib;
+
+    private {
+        R _sink;
+        // Heap-allocated so copies of GzipSink share a pointer to the same
+        // z_stream, keeping zlib's state->strm back-pointer stable across copies.
+        z_stream* _zs;
+        bool _zsInit;
+        ubyte[] _outBuf;
+
+        enum OUT_CHUNK = 64 * 1024;
+    }
+
+    this(R sink) {
+        _sink = sink;
+        _outBuf = new ubyte[](OUT_CHUNK);
+        _zs = new z_stream;
+        *_zs = z_stream.init;
+        if (deflateInit2(_zs, 6, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+            throw new DarkArchiveException("GZIP: deflateInit2 failed");
+        _zsInit = true;
+    }
+
+    void put(const(ubyte)[] data) {
+        _zs.next_in = cast(ubyte*) data.ptr;
+        _zs.avail_in = cast(uint) data.length;
+        while (_zs.avail_in > 0) {
+            _zs.next_out = _outBuf.ptr;
+            _zs.avail_out = cast(uint) _outBuf.length;
+            auto ret = deflate(_zs, Z_NO_FLUSH);
+            if (ret != Z_OK && ret != Z_BUF_ERROR)
+                throw new DarkArchiveException("GZIP: deflate failed");
+            auto produced = _outBuf.length - _zs.avail_out;
+            if (produced > 0)
+                emit(_outBuf[0 .. produced]);
+        }
+    }
+
+    void close() {
+        if (!_zsInit) return;
+        _zs.next_in = null;
+        _zs.avail_in = 0;
+        int ret;
+        do {
+            _zs.next_out = _outBuf.ptr;
+            _zs.avail_out = cast(uint) _outBuf.length;
+            ret = deflate(_zs, Z_FINISH);
+            if (ret != Z_OK && ret != Z_STREAM_END)
+                throw new DarkArchiveException("GZIP: deflate finish failed");
+            auto produced = _outBuf.length - _zs.avail_out;
+            if (produced > 0)
+                emit(_outBuf[0 .. produced]);
+        } while (ret != Z_STREAM_END);
+
+        deflateEnd(_zs);
+        _zsInit = false;
+        _outBuf = null;
+
+        static if (__traits(hasMember, R, "close"))
+            _sink.close();
+    }
+
+    private void emit(const(ubyte)[] data) {
+        import std.range.primitives : rangePut = put;
+        rangePut(_sink, data);
+    }
+}
+
+/// Create a `GzipSink` wrapping any output range (IFTI).
+auto gzipSink(R)(R sink)
+    if (isOutputRange!(R, const(ubyte)[]))
+{
+    return GzipSink!R(sink);
+}
+
+
+// ===========================================================================
 // Unit tests
 // ===========================================================================
 
 version(unittest) {
-    import darkarchive.formats.tar.reader : TarReader;
+    import darkarchive.formats.tar.reader : tarReader, tarGzReader;
 
     private immutable testDataDir = "test-data";
 
@@ -65,7 +157,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TarReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
 
         string[] names;
@@ -93,7 +185,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TarReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
 
         int count;
@@ -115,7 +207,7 @@ version(unittest) {
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         write(tmpPath, tarData);
 
-        auto reader = TarReader(tmpPath);
+        auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
 
         foreach (entry; reader.entries) {
@@ -179,36 +271,55 @@ version(unittest) {
         caught.shouldBeTrue;
     }
 
-    /// Streaming gzip decompression via GzipSequentialReader + TarReader
-    @("gzip: streaming decompression via GzipSequentialReader")
+    /// Streaming gzip decompression via tarGzReader
+    @("gzip: streaming decompression via tarGzReader")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import darkarchive.datasource : GzipSequentialReader;
 
-        auto gzStream = new GzipSequentialReader(testDataDir ~ "/test.tar.gz");
-        auto reader = TarReader(gzStream);
+        auto reader = tarGzReader(testDataDir ~ "/test.tar.gz");
         string[] names;
         foreach (entry; reader.entries) {
             names ~= entry.pathname;
             if (entry.pathname == "./file1.txt")
                 reader.readText().shouldEqual("Hello from file1\n");
         }
-        assert(names.length > 0, "should find entries via streaming gzip");
+        assert(names.length > 0, "should find entries via tarGzReader");
+    }
+
+    /// Multi-member gzip: second member is silently ignored (std.zlib stops at Z_STREAM_END).
+    /// This documents the current behavior — it is not wrong, just a known limitation.
+    @("gzip: multi-member gzip — second member silently ignored, first returned intact")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import darkarchive.formats.tar.writer : gzipCompress;
+
+        auto data1 = cast(const(ubyte)[]) "first member";
+        auto data2 = cast(const(ubyte)[]) "second member";
+        auto member1 = gzipCompress(data1);
+        auto member2 = gzipCompress(data2);
+
+        // Concatenate to form a multi-member gzip stream
+        auto multiMember = member1 ~ member2;
+
+        // gunzip returns the first member's content and ignores the second
+        auto result = gunzip(multiMember);
+        assert(result == data1, "first member data should be returned correctly");
+        // Note: second member ("second member") is silently discarded by std.zlib.
+        // Callers that need multi-member support must use a streaming zlib wrapper.
     }
 
     /// Memory consistency: streaming through tar.gz should not accumulate memory
     @("gzip: streaming does not accumulate memory")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import darkarchive.formats.tar.writer : TarWriter, gzipCompress;
-        import darkarchive.datasource : GzipSequentialReader;
+        import darkarchive.formats.tar.writer : tarWriter, gzipCompress;
         import core.memory : GC;
         import std.file : write, read, remove, exists;
 
         // Create tar with many entries totaling ~1MB via temp file
         auto tarTmpPath = "test-data/test-mem-consistency-inner.tar";
         scope(exit) if (exists(tarTmpPath)) remove(tarTmpPath);
-        auto tw = TarWriter.createToFile(tarTmpPath);
+        auto tw = tarWriter(tarTmpPath);
         scope(exit) tw.close();
         auto chunk = new ubyte[](4096); // 4KB per entry
         foreach (i; 0 .. 256) { // 256 * 4KB = 1MB total
@@ -229,8 +340,7 @@ version(unittest) {
         auto memBefore = GC.stats.usedSize;
 
         // Stream through all entries, reading each via chunked API
-        auto gzStream = new GzipSequentialReader(tmpPath);
-        auto reader = TarReader(gzStream);
+        auto reader = tarGzReader(tmpPath);
         size_t totalRead;
         foreach (entry; reader.entries) {
             if (entry.isFile) {

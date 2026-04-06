@@ -88,6 +88,14 @@ struct ZipReader {
         auto uncompressedSize = ci.uncompressedSize;
         auto method = ci.compressionMethod;
 
+        // Guard against zip bombs: reject entries whose declared decompressed size
+        // would cause an OOM allocation.  Large entries must go through
+        // readDataChunked() which applies ExtractionLimits incrementally.
+        enum ulong MAX_READDATA_BYTES = 256UL * 1024 * 1024; // 256 MB
+        if (uncompressedSize > MAX_READDATA_BYTES)
+            throw new DarkArchiveException(
+                "ZIP: entry too large for readData() — use readDataChunked()");
+
         if (compressedSize > _ds.length || dataStart + compressedSize > _ds.length)
             throw new DarkArchiveException("ZIP: compressed data out of bounds");
 
@@ -124,7 +132,7 @@ struct ZipReader {
     /// incrementally across all chunks.
     void readDataChunked(size_t index,
                           scope void delegate(const(ubyte)[] chunk) sink,
-                          size_t chunkSize = 8192) {
+                          size_t chunkSize = 65536) {
         if (index >= _entries.length)
             throw new DarkArchiveException("ZIP: entry index out of bounds");
         auto ci = &_entries[index];
@@ -251,9 +259,17 @@ struct ZipReader {
         if (totalEntries > maxPossibleEntries)
             totalEntries = maxPossibleEntries;
 
+        // Hard cap: reserve at most 1M entries up front to prevent a malicious
+        // EOCD from causing a multi-GB allocation before any entry is read.
+        // The parsing loop below still reads up to totalEntries entries (which
+        // is already bounded by maxPossibleEntries / actual CD size).
+        enum ulong MAX_ENTRIES_RESERVE = 1_000_000;
+        auto reserveCount = totalEntries < MAX_ENTRIES_RESERVE
+            ? totalEntries : MAX_ENTRIES_RESERVE;
+
         // Parse central directory entries
         _entries.length = 0;
-        _entries.reserve(cast(size_t) totalEntries);
+        _entries.reserve(cast(size_t) reserveCount);
 
         auto cdPos = centralDirOffset + (offsetAdjust > 0 ? cast(ulong) offsetAdjust : 0);
         for (ulong i = 0; i < totalEntries; i++) {
@@ -377,6 +393,8 @@ private T readLEStatic(T)(const(ubyte)[] data, size_t offset) {
 }
 
 /// Decode a filename from raw bytes, using UTF-8 flag or fallback.
+/// NUL bytes are preserved — rejection of NUL-containing names happens
+/// at extraction time (extractToImpl) so callers can still list entries.
 private string decodeFilename(const(ubyte)[] bytes, ushort flags) {
     if (bytes.length == 0)
         return "";
@@ -407,6 +425,8 @@ private string decodeFilename(const(ubyte)[] bytes, ushort flags) {
 }
 
 /// Inflate (decompress) raw deflated data.
+/// Throws if decompressed output exceeds `uncompressedSize` (or 256 MB when unknown),
+/// preventing decompression bombs from growing the output buffer without bound.
 private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
     import etc.c.zlib;
     import std.array : appender;
@@ -421,6 +441,11 @@ private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
 
     scope(exit) inflateEnd(&zs);
 
+    // Hard cap: never produce more bytes than the declared uncompressed size.
+    // When uncompressedSize is unknown (0), fall back to a 256 MB safety limit.
+    enum ulong INFLATE_FALLBACK_CAP = 256UL * 1024 * 1024;
+    auto cap = (uncompressedSize > 0) ? uncompressedSize : INFLATE_FALLBACK_CAP;
+
     auto result = appender!(ubyte[])();
     ubyte[8192] outBuf;
 
@@ -429,18 +454,19 @@ private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
         zs.avail_out = cast(uint) outBuf.length;
 
         ret = etc.c.zlib.inflate(&zs, Z_NO_FLUSH);
-        if (ret == Z_STREAM_END) {
-            auto produced = outBuf.length - zs.avail_out;
-            if (produced > 0)
-                result ~= outBuf[0 .. produced];
-            break;
-        }
-        if (ret != Z_OK)
-            throw new DarkArchiveException("ZIP: inflate failed");
 
         auto produced = outBuf.length - zs.avail_out;
-        if (produced > 0)
+        if (produced > 0) {
+            if (result[].length + produced > cap)
+                throw new DarkArchiveException(
+                    "ZIP: decompressed data exceeds declared uncompressed size");
             result ~= outBuf[0 .. produced];
+        }
+
+        if (ret == Z_STREAM_END)
+            break;
+        if (ret != Z_OK)
+            throw new DarkArchiveException("ZIP: inflate failed");
     }
 
     return result[];
@@ -1063,6 +1089,91 @@ version(unittest) {
     }
 
     // -------------------------------------------------------------------
+    // Zip-bomb / OOM hardening tests
+    // -------------------------------------------------------------------
+
+    @("zip security: zip bomb — readData throws when declared uncompressedSize exceeds cap")
+    unittest {
+        // A crafted CD that claims uncompressedSize = 300 MB must be rejected by
+        // readData() before any decompression attempt, preventing OOM.
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : read, write, exists, remove;
+
+        auto tmpPath = testDataDir ~ "/test-zipr-bomb-src.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
+        writer.addBuffer("file.txt", cast(const(ubyte)[]) "hi");
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
+        auto eocdPos = data.length - 22;
+        uint cdOffset = data[eocdPos + 16]
+                      | (cast(uint) data[eocdPos + 17] << 8)
+                      | (cast(uint) data[eocdPos + 18] << 16)
+                      | (cast(uint) data[eocdPos + 19] << 24);
+        // Patch uncompressedSize (CD+24, 4 bytes LE) to 300 MB = 0x12C00000
+        data[cdOffset + 24] = 0x00; data[cdOffset + 25] = 0x00;
+        data[cdOffset + 26] = 0xC0; data[cdOffset + 27] = 0x12;
+        auto patchedPath = testDataDir ~ "/test-zipr-bomb.zip";
+        scope(exit) if (exists(patchedPath)) remove(patchedPath);
+        write(patchedPath, data);
+
+        auto reader = ZipReader(patchedPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.readData(0); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("zip security: inflate cap — output exceeding declared uncompressedSize throws")
+    unittest {
+        // When inflate produces more bytes than the declared uncompressedSize,
+        // it must throw rather than growing the output buffer without bound.
+        // Craft: 2 KB of compressible data, then patch CD uncompressedSize to 50.
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : read, write, exists, remove;
+
+        auto content = new ubyte[](2048);
+        foreach (i, ref b; content) b = cast(ubyte)('A' + (i % 26));
+
+        auto tmpPath = testDataDir ~ "/test-zipr-inflatecap-src.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
+        writer.addBuffer("data.bin", content);
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
+        auto eocdPos = data.length - 22;
+        uint cdOffset = data[eocdPos + 16]
+                      | (cast(uint) data[eocdPos + 17] << 8)
+                      | (cast(uint) data[eocdPos + 18] << 16)
+                      | (cast(uint) data[eocdPos + 19] << 24);
+        // Only test this when deflate was actually used (compressed < original)
+        ushort method = data[cdOffset + 10] | (cast(ushort) data[cdOffset + 11] << 8);
+        if (method != 8) return; // deflate not used — skip
+
+        // Patch uncompressedSize to 50 (less than actual 2048).
+        // The readData() cap (256 MB) won't fire, so inflate's own cap must catch it.
+        data[cdOffset + 24] = 50; data[cdOffset + 25] = 0;
+        data[cdOffset + 26] = 0;  data[cdOffset + 27] = 0;
+        auto patchedPath = testDataDir ~ "/test-zipr-inflatecap.zip";
+        scope(exit) if (exists(patchedPath)) remove(patchedPath);
+        write(patchedPath, data);
+
+        auto reader = ZipReader(patchedPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.readData(0); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
     // Overflow / DoS hardening tests
     // -------------------------------------------------------------------
 
@@ -1092,6 +1203,114 @@ version(unittest) {
         scope(exit) reader.close();
         reader.length.shouldEqual(1);
         reader.readText(0).shouldEqual("x");
+    }
+
+    // -------------------------------------------------------------------
+    // Fuzz / randomised-corruption tests
+    // -------------------------------------------------------------------
+
+    @("zip fuzz: systematic truncation sweep — only DarkArchiveException escapes")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : exists, remove, read, write;
+        import std.conv : to;
+
+        // Build a minimal single-file archive
+        auto srcPath = testDataDir ~ "/test-zipr-fuzz-src.zip";
+        scope(exit) if (exists(srcPath)) remove(srcPath);
+        auto writer = ZipWriter.createToFile(srcPath);
+        scope(exit) writer.close();
+        writer.addBuffer("a.txt", cast(const(ubyte)[]) "hi");
+        writer.finish();
+        auto fullBytes = cast(ubyte[]) read(srcPath);
+
+        auto truncPath = testDataDir ~ "/test-zipr-fuzz-trunc.zip";
+        scope(exit) if (exists(truncPath)) remove(truncPath);
+
+        foreach (len; 0 .. fullBytes.length) {
+            write(truncPath, fullBytes[0 .. len]);
+            try {
+                auto reader = ZipReader(truncPath);
+                scope(exit) reader.close();
+                foreach (i; 0 .. reader.length) {
+                    try { reader.readData(i); }
+                    catch (DarkArchiveException) {} // expected on truncated data
+                }
+            } catch (DarkArchiveException) {
+                // expected — truncated archive detected on open
+            } catch (Exception e) {
+                assert(false, "Non-DarkArchiveException at len=" ~ len.to!string
+                    ~ ": " ~ e.classinfo.name ~ ": " ~ e.msg);
+            }
+        }
+    }
+
+    @("zip security: unsupported compression method throws DarkArchiveException")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : read, write, exists, remove;
+
+        // Create a valid ZIP, then patch the compression method in the central dir to 99
+        auto tmpPath = testDataDir ~ "/test-zipr-badmethod-src.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
+        writer.addBuffer("file.txt", cast(const(ubyte)[]) "content");
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
+        // EOCD is at the end; central dir offset at eocd+16 (little-endian 32-bit)
+        auto eocdPos = data.length - 22;
+        uint cdOffset = data[eocdPos + 16]
+                      | (cast(uint) data[eocdPos + 17] << 8)
+                      | (cast(uint) data[eocdPos + 18] << 16)
+                      | (cast(uint) data[eocdPos + 19] << 24);
+        // Patch compression method in central directory entry (field at CD+10)
+        data[cdOffset + 10] = 99; data[cdOffset + 11] = 0;
+        auto patchedPath = testDataDir ~ "/test-zipr-badmethod.zip";
+        scope(exit) if (exists(patchedPath)) remove(patchedPath);
+        write(patchedPath, data);
+
+        // ZipReader can open the archive (CD parsing doesn't validate method)
+        // readData must throw DarkArchiveException for the unsupported method
+        auto reader = ZipReader(patchedPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.readData(0); }
+        catch (DarkArchiveException) { caught = true; }
+        assert(caught, "readData with unsupported compression method must throw DarkArchiveException");
+    }
+
+    @("zip security: central dir with huge filename length throws bounds check")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : read, write, exists, remove;
+
+        auto tmpPath = testDataDir ~ "/test-zipr-hugefnlen-src.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
+        writer.addBuffer("x.txt", cast(const(ubyte)[]) "data");
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
+        // Patch fnLen in central directory to 0xFFFF (65535)
+        auto eocdPos = data.length - 22;
+        uint cdOffset = data[eocdPos + 16]
+                      | (cast(uint) data[eocdPos + 17] << 8)
+                      | (cast(uint) data[eocdPos + 18] << 16)
+                      | (cast(uint) data[eocdPos + 19] << 24);
+        data[cdOffset + 28] = 0xFF; data[cdOffset + 29] = 0xFF; // fnLen = 65535
+        auto patchedPath = testDataDir ~ "/test-zipr-hugefnlen.zip";
+        scope(exit) if (exists(patchedPath)) remove(patchedPath);
+        write(patchedPath, data);
+
+        // parseCentralDirectory should throw because fnStart + 65535 > file length
+        bool caught;
+        try { auto reader = ZipReader(patchedPath); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
     }
 
     @("zip security: overflow in dataStart calculation throws")
