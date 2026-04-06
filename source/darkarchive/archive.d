@@ -242,6 +242,69 @@ private string formatMemSize(ulong bytes) {
 
 
 // ---------------------------------------------------------------------------
+// DarkArchiveItemReader / DarkArchiveItem
+// ---------------------------------------------------------------------------
+
+/// Data accessor for a single archive entry — obtained via `DarkArchiveItem.data`.
+///
+/// For TAR and TAR.GZ this is only valid during the current `foreach` iteration
+/// step; calling read methods after `popFront` is undefined behaviour.
+/// For ZIP the accessor is position-independent (random access), but the same
+/// rule should be assumed for portability.
+///
+/// Non-copyable by design: copy `item.meta` (a plain `DarkArchiveEntry`) if you
+/// need to retain metadata across iterations.
+struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
+    private DarkArchiveReader!fmt* _parent;
+    static if (fmt == DarkArchiveFormat.zip)
+        private size_t _idx;
+
+    @disable this(this);
+
+    /// Read the full entry data into memory.
+    ubyte[] readAll() {
+        static if (fmt == DarkArchiveFormat.zip)
+            return cast(ubyte[]) _parent._reader.readData(_idx).dup;
+        else {
+            auto d = _parent._reader.readData();
+            return d is null ? [] : cast(ubyte[]) d;
+        }
+    }
+
+    /// Convenience: readAll as a UTF-8 string.
+    string readText() { return cast(string) readAll(); }
+
+    /// Stream entry data in chunks without buffering the full entry in memory.
+    void readChunks(scope void delegate(const(ubyte)[] chunk) sink,
+                     size_t chunkSize = 8192) {
+        static if (fmt == DarkArchiveFormat.zip)
+            _parent._reader.readDataChunked(_idx, sink, chunkSize);
+        else
+            _parent._reader.readDataChunked(sink, chunkSize);
+    }
+}
+
+/// A single archive entry as yielded by `DarkArchiveReader.entries()`.
+///
+/// `meta` holds the entry metadata (`DarkArchiveEntry` — pathname, size, type …).
+/// `data` is the data accessor; call `data.readAll()`, `data.readText()`, or
+/// `data.readChunks(sink)` to consume the entry's bytes.
+///
+/// Non-copyable.  To retain metadata past the current iteration, copy `item.meta`:
+/// ---
+/// DarkArchiveEntry saved;
+/// foreach (ref item; reader.entries)
+///     if (item.meta.isFile) saved = item.meta;
+/// ---
+struct DarkArchiveItem(DarkArchiveFormat fmt) {
+    DarkArchiveEntry          meta;
+    DarkArchiveItemReader!fmt data;
+
+    @disable this(this);
+}
+
+
+// ---------------------------------------------------------------------------
 // DarkArchiveReader
 // ---------------------------------------------------------------------------
 
@@ -256,7 +319,6 @@ private string formatMemSize(ulong bytes) {
 struct DarkArchiveReader(DarkArchiveFormat fmt) {
     static if (fmt == DarkArchiveFormat.zip) {
         private ZipReader* _reader;
-        private size_t _currentIdx;
     } else static if (fmt == DarkArchiveFormat.tar) {
         private TarReader!(ChunkReader!FileChunkSource)* _reader;
     } else { // tarGz
@@ -289,73 +351,15 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
     /// Iterate over entries.
     auto entries() { return EntryRange(&this); }
 
-    /// Read current entry's full data into memory.
-    ubyte[] readAll() {
-        static if (fmt == DarkArchiveFormat.zip) {
-            return cast(ubyte[]) _reader.readData(_currentIdx).dup;
-        } else {
-            auto d = _reader.readData();
-            return d is null ? [] : cast(ubyte[]) d;
-        }
-    }
-
-    /// Read current entry as text.
-    string readText() { return cast(string) readAll(); }
-
-    /// Skip current entry's data. No-op for ZIP (random access).
-    void skipData() {
-        static if (fmt != DarkArchiveFormat.zip)
-            _reader.skipData();
-    }
-
-    // -- EntryDataReader --
-
-    /// Data accessor passed to processEntries delegates.
-    static struct EntryDataReader {
-        private DarkArchiveReader!fmt* _parent;
-        static if (fmt == DarkArchiveFormat.zip)
-            private size_t _idx;
-
-        ubyte[] readAll() {
-            static if (fmt == DarkArchiveFormat.zip)
-                return cast(ubyte[]) _parent._reader.readData(_idx).dup;
-            else {
-                auto d = _parent._reader.readData();
-                return d is null ? [] : cast(ubyte[]) d;
-            }
-        }
-
-        string readText() { return cast(string) readAll(); }
-
-        void readChunks(scope void delegate(const(ubyte)[] chunk) sink,
-                         size_t chunkSize = 8192) {
-            static if (fmt == DarkArchiveFormat.zip)
-                _parent._reader.readDataChunked(_idx, sink, chunkSize);
-            else
-                _parent._reader.readDataChunked(sink, chunkSize);
-        }
-    }
-
     // -- processEntries --
 
     /// Process all entries, calling processor for each.
     size_t processEntries(
-            scope void delegate(const ref DarkArchiveEntry entry,
-                                scope EntryDataReader dataReader) processor) {
+            scope void delegate(scope ref DarkArchiveItem!fmt item) processor) {
         size_t count;
-        static if (fmt == DarkArchiveFormat.zip) {
-            foreach (i; 0 .. _reader.length) {
-                auto entry = _reader.entryAt(i);
-                auto dr = EntryDataReader(&this, i);
-                processor(entry, dr);
-                count++;
-            }
-        } else {
-            foreach (entry; _reader.entries()) {
-                auto dr = EntryDataReader(&this);
-                processor(entry, dr);
-                count++;
-            }
+        foreach (ref item; entries()) {
+            processor(item);
+            count++;
         }
         return count;
     }
@@ -363,32 +367,17 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
     /// Process specific entries by pathname. Stops early when all are found.
     size_t processEntries(
             const(string)[] names,
-            scope void delegate(const ref DarkArchiveEntry entry,
-                                scope EntryDataReader dataReader) processor) {
+            scope void delegate(scope ref DarkArchiveItem!fmt item) processor) {
         if (names.length == 0) return 0;
         bool[string] remaining;
         foreach (name; names) remaining[name] = true;
         size_t count;
-        static if (fmt == DarkArchiveFormat.zip) {
-            foreach (i; 0 .. _reader.length) {
-                auto entry = _reader.entryAt(i);
-                if (entry.pathname in remaining) {
-                    auto dr = EntryDataReader(&this, i);
-                    processor(entry, dr);
-                    count++;
-                    remaining.remove(entry.pathname);
-                    if (remaining.length == 0) break;
-                }
-            }
-        } else {
-            foreach (entry; _reader.entries()) {
-                if (entry.pathname in remaining) {
-                    auto dr = EntryDataReader(&this);
-                    processor(entry, dr);
-                    count++;
-                    remaining.remove(entry.pathname);
-                    if (remaining.length == 0) break;
-                }
+        foreach (ref item; entries()) {
+            if (item.meta.pathname in remaining) {
+                processor(item);
+                count++;
+                remaining.remove(item.meta.pathname);
+                if (remaining.length == 0) break;
             }
         }
         return count;
@@ -426,13 +415,13 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
         ulong totalBytes;
         ulong entryCount;
 
-        foreach (entry; entries()) {
+        foreach (ref item; entries()) {
             ExtractParams params;
-            params.destPath = entry.pathname;
-            params.sourceEntry = &entry;
+            params.destPath = item.meta.pathname;
+            params.sourceEntry = &item.meta;
 
             if (preprocess !is null) {
-                if (!preprocess(params)) { skipData(); continue; }
+                if (!preprocess(params)) continue; // popFront auto-skips data
             }
 
             entryCount++;
@@ -461,16 +450,16 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
 
             if (entryPath.length >= 2 && entryPath[0 .. 2] == "./")
                 entryPath = entryPath[2 .. $];
-            if (entryPath.length == 0) { skipData(); continue; }
+            if (entryPath.length == 0) continue; // popFront auto-skips data
 
             auto fullPath = Path(destStr, entryPath);
 
-            if (entry.isDir) {
+            if (item.meta.isDir) {
                 fullPath.mkdir(true);
-                skipData();
-            } else if (entry.isSymlink) {
-                if (!(flags & DarkExtractFlags.symlinks)) { skipData(); continue; }
-                auto target = entry.symlinkTarget;
+                // dirs have no data — popFront auto-skips
+            } else if (item.meta.isSymlink) {
+                if (!(flags & DarkExtractFlags.symlinks)) continue;
+                auto target = item.meta.symlinkTarget;
                 if (target.length > 0 && target[0] == '/')
                     throw new DarkArchiveException(
                         "Refusing to create symlink with absolute target: " ~ target);
@@ -483,15 +472,15 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 if (!parent.exists)
                     parent.mkdir(true);
                 version(Posix) {
-                    Path(entry.symlinkTarget).symlink(fullPath);
+                    Path(item.meta.symlinkTarget).symlink(fullPath);
                 } else {
                     throw new DarkArchiveException(
                         "Symlink extraction is not supported on this platform: " ~ entryPath);
                 }
-                skipData();
-            } else if (entry.isHardlink) {
-                if (!(flags & DarkExtractFlags.symlinks)) { skipData(); continue; }
-                auto target = entry.symlinkTarget;
+                // symlinks have no data — popFront auto-skips
+            } else if (item.meta.isHardlink) {
+                if (!(flags & DarkExtractFlags.symlinks)) continue;
+                auto target = item.meta.symlinkTarget;
                 if (target.length > 0 && target[0] == '/')
                     throw new DarkArchiveException(
                         "Refusing to create hardlink with absolute target: " ~ target);
@@ -500,7 +489,6 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                         throw new DarkArchiveException(
                             "Refusing to create hardlink with '..' in target: " ~ target);
                 }
-                skipData();
                 version(Posix) {
                     import core.sys.posix.unistd : posixLink = link;
                     import std.string : toStringz;
@@ -517,59 +505,49 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                     throw new DarkArchiveException(
                         "Hardlink extraction is not supported on this platform: " ~ entryPath);
                 }
+                // hardlinks have no data — popFront auto-skips
             } else {
                 auto parent = fullPath.parent;
                 if (!parent.exists)
                     parent.mkdir(true);
                 if (flags & DarkExtractFlags.securePaths)
                     verifyPathWithinRoot(parent.toString(), destStr);
-                writeEntryToFile(fullPath.toString(), limits, totalBytes);
-                applyFilePermissions(fullPath.toString(), entry.permissions);
+                extractEntryToFile(item.data, fullPath.toString(), limits, totalBytes);
+                applyFilePermissions(fullPath.toString(), item.meta.permissions);
             }
         }
     }
 
-    private void writeEntryToFile(string outPath, ExtractionLimits limits,
-                                   ref ulong totalBytes) {
+    private void extractEntryToFile(ref DarkArchiveItemReader!fmt dataReader,
+                                     string outPath, ExtractionLimits limits,
+                                     ref ulong totalBytes) {
         import std.stdio : File;
         import std.format : format;
         auto f = File(outPath, "wb");
         ulong entryBytes;
-        static if (fmt == DarkArchiveFormat.zip) {
-            _reader.readDataChunked(_currentIdx, (const(ubyte)[] chunk) {
-                entryBytes += chunk.length;
-                totalBytes += chunk.length;
-                if (entryBytes > limits.maxEntryBytes)
-                    throw new DarkArchiveException(
-                        "Extraction limit exceeded: entry exceeds %s bytes"
-                        .format(limits.maxEntryBytes));
-                if (totalBytes > limits.maxTotalBytes)
-                    throw new DarkArchiveException(
-                        "Extraction limit exceeded: total extracted bytes exceed %s"
-                        .format(limits.maxTotalBytes));
-                f.rawWrite(chunk);
-            });
-        } else {
-            _reader.readDataChunked((const(ubyte)[] chunk) {
-                entryBytes += chunk.length;
-                totalBytes += chunk.length;
-                if (entryBytes > limits.maxEntryBytes)
-                    throw new DarkArchiveException(
-                        "Extraction limit exceeded: entry exceeds %s bytes"
-                        .format(limits.maxEntryBytes));
-                if (totalBytes > limits.maxTotalBytes)
-                    throw new DarkArchiveException(
-                        "Extraction limit exceeded: total extracted bytes exceed %s"
-                        .format(limits.maxTotalBytes));
-                f.rawWrite(chunk);
-            });
-        }
+        dataReader.readChunks((const(ubyte)[] chunk) {
+            entryBytes += chunk.length;
+            totalBytes += chunk.length;
+            if (entryBytes > limits.maxEntryBytes)
+                throw new DarkArchiveException(
+                    "Extraction limit exceeded: entry exceeds %s bytes"
+                    .format(limits.maxEntryBytes));
+            if (totalBytes > limits.maxTotalBytes)
+                throw new DarkArchiveException(
+                    "Extraction limit exceeded: total extracted bytes exceed %s"
+                    .format(limits.maxTotalBytes));
+            f.rawWrite(chunk);
+        });
     }
 
     // -- EntryRange --
 
     private static struct EntryRange {
         private DarkArchiveReader!fmt* _parent;
+        private DarkArchiveItem!fmt _current;
+
+        // Non-copyable because DarkArchiveItem is non-copyable.
+        @disable this(this);
 
         static if (fmt == DarkArchiveFormat.zip) {
             private size_t _idx;
@@ -579,16 +557,23 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 _parent = parent;
                 _idx = 0;
                 _len = parent._reader.length;
+                _current.data._parent = parent;
+                if (!empty) _loadCurrent();
             }
 
             bool empty() { return _idx >= _len; }
 
-            DarkArchiveEntry front() {
-                _parent._currentIdx = _idx;
-                return _parent._reader.entryAt(_idx);
+            ref DarkArchiveItem!fmt front() { return _current; }
+
+            void popFront() {
+                _idx++;
+                if (!empty) _loadCurrent();
             }
 
-            void popFront() { _idx++; }
+            private void _loadCurrent() {
+                _current.meta = _parent._reader.entryAt(_idx);
+                _current.data._idx = _idx;
+            }
 
         } else {
             static if (fmt == DarkArchiveFormat.tar)
@@ -601,11 +586,18 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
             this(DarkArchiveReader!fmt* parent) {
                 _parent = parent;
                 _range = parent._reader.entries();
+                _current.data._parent = parent;
+                if (!empty) _current.meta = _range.front();
             }
 
             bool empty() { return _range.empty(); }
-            DarkArchiveEntry front() { return _range.front(); }
-            void popFront() { _range.popFront(); }
+
+            ref DarkArchiveItem!fmt front() { return _current; }
+
+            void popFront() {
+                _range.popFront();
+                if (!empty) _current.meta = _range.front();
+            }
         }
     }
 }
@@ -903,7 +895,7 @@ version(unittest) {
         auto reader = RTar(testDataDir ~ "/test-zip.zip");
         scope(exit) reader.close();
         size_t count;
-        reader.processEntries((const ref e, scope dr) { count++; });
+        reader.processEntries((scope ref item) { count++; });
         count.shouldEqual(0);
     }
 
@@ -976,12 +968,10 @@ version(unittest) {
         auto reader = RZip(Path(testDataDir, "test-zip.zip"));
         scope(exit) reader.close();
         string[] names;
-        foreach (entry; reader.entries) {
-            names ~= entry.pathname;
-            if (entry.pathname == "file1.txt")
-                reader.readText().shouldEqual("Hello from file1\n");
-            else
-                reader.skipData();
+        foreach (ref item; reader.entries) {
+            names ~= item.meta.pathname;
+            if (item.meta.pathname == "file1.txt")
+                item.data.readText().shouldEqual("Hello from file1\n");
         }
         assert(names.length > 0);
     }
@@ -991,11 +981,9 @@ version(unittest) {
         import unit_threaded.assertions : shouldEqual;
         auto reader = RTarGz(Path(testDataDir, "test.tar.gz"));
         scope(exit) reader.close();
-        foreach (entry; reader.entries) {
-            if (entry.pathname == "./file1.txt")
-                reader.readText().shouldEqual("Hello from file1\n");
-            else
-                reader.skipData();
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "./file1.txt")
+                item.data.readText().shouldEqual("Hello from file1\n");
         }
     }
 
@@ -1017,12 +1005,10 @@ version(unittest) {
             if (outPath.exists) outPath.remove();
         }
         bool foundHello;
-        foreach (entry; reader.entries) {
-            if (entry.pathname == "hello.txt") {
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "hello.txt") {
                 foundHello = true;
-                reader.readText().shouldEqual("Hello World!");
-            } else {
-                reader.skipData();
+                item.data.readText().shouldEqual("Hello World!");
             }
         }
         foundHello.shouldBeTrue;
@@ -1042,14 +1028,12 @@ version(unittest) {
             if (outPath.exists) outPath.remove();
         }
         int count;
-        foreach (entry; reader.entries) {
+        foreach (ref item; reader.entries) {
             count++;
-            if (entry.pathname == "file-a.txt")
-                reader.readText().shouldEqual("Content A");
-            else if (entry.pathname == "file-b.txt")
-                reader.readText().shouldEqual("Content B");
-            else
-                reader.skipData();
+            if (item.meta.pathname == "file-a.txt")
+                item.data.readText().shouldEqual("Content A");
+            else if (item.meta.pathname == "file-b.txt")
+                item.data.readText().shouldEqual("Content B");
         }
         count.shouldEqual(2);
     }
@@ -1069,16 +1053,16 @@ version(unittest) {
 
         auto r1 = RZip(zipPath);
         scope(exit) r1.close();
-        foreach (e; r1.entries) {
-            if (e.pathname == "cross.txt") r1.readText().shouldEqual("Cross-format test");
-            else r1.skipData();
+        foreach (ref item; r1.entries) {
+            if (item.meta.pathname == "cross.txt")
+                item.data.readText().shouldEqual("Cross-format test");
         }
 
         auto r2 = RTarGz(tarPath);
         scope(exit) r2.close();
-        foreach (e; r2.entries) {
-            if (e.pathname == "cross.txt") r2.readText().shouldEqual("Cross-format test");
-            else r2.skipData();
+        foreach (ref item; r2.entries) {
+            if (item.meta.pathname == "cross.txt")
+                item.data.readText().shouldEqual("Cross-format test");
         }
     }
 
@@ -1115,11 +1099,9 @@ version(unittest) {
             .finish();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
-        foreach (entry; reader.entries) {
-            if (entry.pathname == "mem.txt")
-                reader.readText().shouldEqual("from memory");
-            else
-                reader.skipData();
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "mem.txt")
+                item.data.readText().shouldEqual("from memory");
         }
     }
 
@@ -1136,7 +1118,7 @@ version(unittest) {
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         int count;
-        foreach (entry; reader.entries) { count++; reader.skipData(); }
+        foreach (ref item; reader.entries) { count++; }
         count.shouldEqual(3);
     }
 
@@ -1831,7 +1813,7 @@ version(unittest) {
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         string foundName;
-        foreach (entry; reader.entries) { foundName = entry.pathname; reader.skipData(); }
+        foreach (ref item; reader.entries) { foundName = item.meta.pathname; }
         assert(foundName.length > 0 && foundName[8] == '\0',
             "entry.pathname should contain the NUL byte");
 
@@ -1974,9 +1956,9 @@ version(unittest) {
         auto reader2 = RZip(tmpPath);
         scope(exit) reader2.close();
         int count;
-        foreach (entry; reader2.entries) {
+        foreach (ref item; reader2.entries) {
             count++;
-            entry.pathname.shouldEqual(".");
+            item.meta.pathname.shouldEqual(".");
         }
         count.shouldEqual(1);
     }
@@ -2006,9 +1988,9 @@ version(unittest) {
         scope(exit) reader.close();
         string foundName, foundContent;
         reader.processEntries(
-            (const ref entry, scope dataReader) {
-                foundName = entry.pathname;
-                foundContent = dataReader.readText();
+            (scope ref item) {
+                foundName = item.meta.pathname;
+                foundContent = item.data.readText();
             });
         foundName.shouldEqual(longPath);
         foundContent.shouldEqual("deep");
@@ -2031,7 +2013,7 @@ version(unittest) {
         auto reader2 = RZip(tmpPath);
         scope(exit) reader2.close();
         int count;
-        foreach (entry; reader2.entries) { count++; assert(entry.pathname.length > 0); }
+        foreach (ref item; reader2.entries) { count++; assert(item.meta.pathname.length > 0); }
         count.shouldEqual(2);
     }
 
@@ -2046,7 +2028,7 @@ version(unittest) {
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         int count;
-        foreach (entry; reader.entries) { count++; assert(entry.pathname.length > 0); }
+        foreach (ref item; reader.entries) { count++; assert(item.meta.pathname.length > 0); }
         count.shouldEqual(1);
     }
 
@@ -2105,9 +2087,9 @@ version(unittest) {
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         int count;
-        foreach (entry; reader.entries) {
+        foreach (ref item; reader.entries) {
             count++;
-            assert(entry.pathname == "file.txt:hidden");
+            assert(item.meta.pathname == "file.txt:hidden");
         }
         count.shouldEqual(1);
     }
@@ -2130,7 +2112,7 @@ version(unittest) {
         scope(exit) reader.close();
         string found;
         auto count = reader.processEntries(["b.txt"],
-            (const ref entry, scope dataReader) { found = dataReader.readText(); });
+            (scope ref item) { found = item.data.readText(); });
         count.shouldEqual(1);
         found.shouldEqual("content B");
     }
@@ -2151,7 +2133,7 @@ version(unittest) {
         scope(exit) reader.close();
         string found;
         auto count = reader.processEntries(["second.txt"],
-            (const ref entry, scope dataReader) { found = dataReader.readText(); });
+            (scope ref item) { found = item.data.readText(); });
         count.shouldEqual(1);
         found.shouldEqual("second");
     }
@@ -2166,7 +2148,7 @@ version(unittest) {
         scope(exit) reader.close();
         bool delegateCalled;
         auto count = reader.processEntries(["nonexistent.txt"],
-            (const ref entry, scope dataReader) { delegateCalled = true; });
+            (scope ref item) { delegateCalled = true; });
         count.shouldEqual(0);
         delegateCalled.shouldBeFalse;
     }
@@ -2185,7 +2167,7 @@ version(unittest) {
         scope(exit) reader.close();
         string[] found;
         auto count = reader.processEntries(["z.txt", "x.txt"],
-            (const ref entry, scope dataReader) { found ~= dataReader.readText(); });
+            (scope ref item) { found ~= item.data.readText(); });
         count.shouldEqual(2);
         import std.algorithm : canFind;
         assert(found.canFind("X"));
@@ -2202,7 +2184,7 @@ version(unittest) {
         scope(exit) reader.close();
         string found;
         auto count = reader.processEntries(["gz-file.txt"],
-            (const ref entry, scope dataReader) { found = dataReader.readText(); });
+            (scope ref item) { found = item.data.readText(); });
         count.shouldEqual(1);
         found.shouldEqual("gzipped content");
     }
@@ -2220,7 +2202,7 @@ version(unittest) {
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         int count;
-        reader.processEntries((const ref entry, scope dataReader) { count++; });
+        reader.processEntries((scope ref item) { count++; });
         count.shouldEqual(3);
     }
 
@@ -2236,7 +2218,7 @@ version(unittest) {
         scope(exit) reader.close();
         ubyte[] found;
         reader.processEntries(["binary.bin"],
-            (const ref entry, scope dataReader) { found = dataReader.readAll(); });
+            (scope ref item) { found = item.data.readAll(); });
         found.length.shouldEqual(1024);
         found.shouldEqual(testData);
     }
@@ -2247,7 +2229,7 @@ version(unittest) {
         auto reader = RZip(Path(testDataDir, "test-zip.zip"));
         string content;
         auto count = reader.processEntries(["file1.txt"],
-            (const ref entry, scope dataReader) { content = dataReader.readText(); });
+            (scope ref item) { content = item.data.readText(); });
         count.shouldEqual(1);
         content.shouldEqual("Hello from file1\n");
     }
@@ -2258,7 +2240,7 @@ version(unittest) {
         auto reader = RTarGz(Path(testDataDir, "test.tar.gz"));
         string content;
         auto count = reader.processEntries(["./file2.txt"],
-            (const ref entry, scope dataReader) { content = dataReader.readText(); });
+            (scope ref item) { content = item.data.readText(); });
         count.shouldEqual(1);
         content.shouldEqual("Hello from file2\n");
     }
@@ -2275,8 +2257,8 @@ version(unittest) {
         scope(exit) reader.close();
         size_t totalBytes, chunkCount;
         reader.processEntries(["large.bin"],
-            (const ref entry, scope dataReader) {
-                dataReader.readChunks((const(ubyte)[] chunk) {
+            (scope ref item) {
+                item.data.readChunks((const(ubyte)[] chunk) {
                     totalBytes += chunk.length;
                     chunkCount++;
                     assert(chunk.length > 0);
@@ -2303,8 +2285,8 @@ version(unittest) {
         scope(exit) reader.close();
         size_t totalBytes;
         reader.processEntries(["tardata.bin"],
-            (const ref entry, scope dataReader) {
-                dataReader.readChunks((const(ubyte)[] chunk) { totalBytes += chunk.length; });
+            (scope ref item) {
+                item.data.readChunks((const(ubyte)[] chunk) { totalBytes += chunk.length; });
             });
         totalBytes.shouldEqual(16384);
     }
@@ -2337,8 +2319,8 @@ version(unittest) {
         scope(exit) reader.close();
         int chunkCount;
         reader.processEntries(["empty.txt"],
-            (const ref entry, scope dataReader) {
-                dataReader.readChunks((const(ubyte)[] chunk) { chunkCount++; });
+            (scope ref item) {
+                item.data.readChunks((const(ubyte)[] chunk) { chunkCount++; });
             });
         chunkCount.shouldEqual(0);
     }
@@ -2553,12 +2535,12 @@ version(unittest) {
             auto reader = RZip(tmpZip);
             scope(exit) reader.close();
             bool foundLink;
-            foreach (entry; reader.entries) {
+            foreach (ref item; reader.entries) {
                 import std.algorithm : endsWith;
-                if (entry.pathname.endsWith("link.txt")) {
+                if (item.meta.pathname.endsWith("link.txt")) {
                     foundLink = true;
-                    entry.isFile.shouldBeTrue;
-                    entry.isSymlink.shouldBeFalse;
+                    item.meta.isFile.shouldBeTrue;
+                    item.meta.isSymlink.shouldBeFalse;
                 }
             }
             foundLink.shouldBeTrue;
@@ -2581,12 +2563,12 @@ version(unittest) {
             auto reader = RTar(tmpTar);
             scope(exit) reader.close();
             bool foundSymlink;
-            foreach (entry; reader.entries) {
+            foreach (ref item; reader.entries) {
                 import std.algorithm : endsWith;
-                if (entry.pathname.endsWith("preserved.txt")) {
+                if (item.meta.pathname.endsWith("preserved.txt")) {
                     foundSymlink = true;
-                    entry.isSymlink.shouldBeTrue;
-                    entry.symlinkTarget.shouldEqual("target.txt");
+                    item.meta.isSymlink.shouldBeTrue;
+                    item.meta.symlinkTarget.shouldEqual("target.txt");
                 }
             }
             foundSymlink.shouldBeTrue;
@@ -2607,7 +2589,7 @@ version(unittest) {
         auto reader = RZip(tmpZip);
         scope(exit) reader.close();
         int fileCount;
-        foreach (entry; reader.entries) { if (entry.isFile) fileCount++; }
+        foreach (ref item; reader.entries) { if (item.meta.isFile) fileCount++; }
         assert(fileCount >= 2);
     }
 
@@ -2789,12 +2771,10 @@ version(unittest) {
         auto reader = RTar(tmpPath);
         scope(exit) reader.close();
         bool found;
-        foreach (entry; reader.entries) {
-            if (entry.pathname == "hello.txt") {
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "hello.txt") {
                 found = true;
-                reader.readText().shouldEqual("sink content");
-            } else {
-                reader.skipData();
+                item.data.readText().shouldEqual("sink content");
             }
         }
         found.shouldBeTrue;
@@ -2815,12 +2795,10 @@ version(unittest) {
         auto reader = RTarGz(tmpPath);
         scope(exit) reader.close();
         bool found;
-        foreach (entry; reader.entries) {
-            if (entry.pathname == "hello.txt") {
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "hello.txt") {
                 found = true;
-                reader.readText().shouldEqual("gzip sink content");
-            } else {
-                reader.skipData();
+                item.data.readText().shouldEqual("gzip sink content");
             }
         }
         found.shouldBeTrue;
@@ -2853,13 +2831,8 @@ version(unittest) {
         auto reader = RTarGz(tmpPath);
         scope(exit) reader.close();
         int count;
-        foreach (entry; reader.entries) {
-            if (entry.isFile) {
-                count++;
-                reader.skipData();
-            } else {
-                reader.skipData();
-            }
+        foreach (ref item; reader.entries) {
+            if (item.meta.isFile) count++;
         }
         count.shouldEqual(2);
     }
@@ -2880,13 +2853,10 @@ version(unittest) {
         auto reader = RTar(tmpPath);
         scope(exit) reader.close();
         bool found;
-        foreach (entry; reader.entries) {
-            if (entry.pathname == "payload.bin") {
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "payload.bin") {
                 found = true;
-                entry.size.shouldEqual(Path(srcFile).getSize());
-                reader.skipData();
-            } else {
-                reader.skipData();
+                item.meta.size.shouldEqual(Path(srcFile).getSize());
             }
         }
         found.shouldBeTrue;
@@ -2985,10 +2955,10 @@ version(unittest) {
         auto reader = RTar(outPath);
         scope(exit) reader.close();
         int count;
-        foreach (entry; reader.entries) {
+        foreach (ref item; reader.entries) {
             count++;
-            if (entry.pathname == "hello.txt") reader.readText().shouldEqual("Hello!");
-            else if (entry.pathname == "world.txt") reader.readText().shouldEqual("World!");
+            if (item.meta.pathname == "hello.txt") item.data.readText().shouldEqual("Hello!");
+            else if (item.meta.pathname == "world.txt") item.data.readText().shouldEqual("World!");
         }
         count.shouldEqual(2);
     }
