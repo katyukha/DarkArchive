@@ -286,6 +286,28 @@ version(unittest) {
         assert(names.length > 0, "should find entries via tarGzReader");
     }
 
+    /// Multi-member gzip: second member is silently ignored (std.zlib stops at Z_STREAM_END).
+    /// This documents the current behavior — it is not wrong, just a known limitation.
+    @("gzip: multi-member gzip — second member silently ignored, first returned intact")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import darkarchive.formats.tar.writer : gzipCompress;
+
+        auto data1 = cast(const(ubyte)[]) "first member";
+        auto data2 = cast(const(ubyte)[]) "second member";
+        auto member1 = gzipCompress(data1);
+        auto member2 = gzipCompress(data2);
+
+        // Concatenate to form a multi-member gzip stream
+        auto multiMember = member1 ~ member2;
+
+        // gunzip returns the first member's content and ignores the second
+        auto result = gunzip(multiMember);
+        assert(result == data1, "first member data should be returned correctly");
+        // Note: second member ("second member") is silently discarded by std.zlib.
+        // Callers that need multi-member support must use a streaming zlib wrapper.
+    }
+
     /// Memory consistency: streaming through tar.gz should not accumulate memory
     @("gzip: streaming does not accumulate memory")
     unittest {

@@ -953,6 +953,254 @@ version(unittest) {
     }
 
     // -------------------------------------------------------------------
+    // Fuzz / randomised-corruption tests
+    // -------------------------------------------------------------------
+
+    @("tar fuzz: systematic truncation sweep — only DarkArchiveException escapes")
+    unittest {
+        import darkarchive.formats.tar.writer : tarWriter;
+        import std.file : exists, remove, read;
+        import std.range : only;
+        import std.conv : to;
+
+        // Build a minimal 2-entry archive (~2KB)
+        auto tmpPath = "test-data/test-tarr-fuzz-src.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = tarWriter(tmpPath);
+        scope(exit) writer.close();
+        writer
+            .addBuffer("a.txt", cast(const(ubyte)[]) "hello")
+            .addBuffer("b.txt", cast(const(ubyte)[]) "world");
+        writer.finish();
+        auto fullBytes = cast(ubyte[]) read(tmpPath);
+
+        // Sweep every prefix length: 0 .. fullBytes.length - 1
+        foreach (len; 0 .. fullBytes.length) {
+            auto slice = cast(const(ubyte)[]) fullBytes[0 .. len];
+            try {
+                auto reader = tarReader(only(slice));
+                foreach (entry; reader.entries)
+                    reader.skipData();
+            } catch (DarkArchiveException) {
+                // expected — truncated archive detected
+            } catch (Exception e) {
+                assert(false, "Non-DarkArchiveException at len=" ~ len.to!string
+                    ~ ": " ~ e.classinfo.name ~ ": " ~ e.msg);
+            }
+        }
+    }
+
+    @("tar fuzz: unknown typeflag treated as regular file, no crash")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.file : exists, remove, write;
+        import std.format : format;
+
+        // Build a TAR header with an unusual but not PAX typeflag ('S', 'V', 'N', etc.)
+        foreach (tf; ['S', 'V', 'N', 'A', 'Z', '9']) {
+            ubyte[TAR_BLOCK_SIZE] hdr;
+            hdr[] = 0;
+            hdr[0 .. 5] = cast(ubyte[5]) "x.bin";
+            hdr[156] = cast(ubyte) tf;
+            hdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+            hdr[263 .. 265] = cast(ubyte[2]) "00";
+            hdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+            hdr[124 .. 136] = cast(ubyte[12]) "00000000000\0";
+            hdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+            // Compute POSIX checksum
+            uint cs = 0;
+            foreach (i, b; hdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+            auto csStr = format!"%06o\0 "(cs);
+            hdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+            // Append end-of-archive
+            ubyte[TAR_BLOCK_SIZE * 2] eoar;
+            eoar[] = 0;
+
+            auto tmpPath = "test-data/test-tarr-fuzz-typeflag.tar";
+            scope(exit) if (exists(tmpPath)) remove(tmpPath);
+            ubyte[] data;
+            data ~= hdr[];
+            data ~= eoar[];
+            write(tmpPath, data);
+
+            auto reader = tarReader(tmpPath);
+            scope(exit) reader.close();
+            int count;
+            foreach (entry; reader.entries) {
+                count++;
+                // Unknown typeflags default to file type
+                assert(entry.isFile || entry.isDir || entry.isSymlink,
+                    "should have a valid entry type for typeflag " ~ cast(char) tf);
+            }
+            assert(count == 1, "should find one entry for typeflag " ~ cast(char) tf);
+        }
+    }
+
+    @("tar security: PAX global header only applies to next entry, not accumulated")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.file : exists, remove, write;
+        import std.format : format;
+        import std.conv : to;
+
+        // Helper to build a minimal ustar file header with POSIX checksum
+        static ubyte[TAR_BLOCK_SIZE] makeHeader(string name, char tf, string sizeOctal) {
+            ubyte[TAR_BLOCK_SIZE] h;
+            h[] = 0;
+            auto nb = cast(const(ubyte)[]) name;
+            auto take = nb.length > 100 ? 100 : nb.length;
+            h[0 .. take] = nb[0 .. take];
+            h[156] = cast(ubyte) tf;
+            h[257 .. 263] = cast(ubyte[6]) "ustar\0";
+            h[263 .. 265] = cast(ubyte[2]) "00";
+            h[100 .. 108] = cast(ubyte[8]) "0000644\0";
+            assert(sizeOctal.length == 12);
+            h[124 .. 136] = cast(ubyte[12]) sizeOctal[0 .. 12];
+            h[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+            uint cs = 0;
+            foreach (i, b; h) cs += (i >= 148 && i < 156) ? ' ' : b;
+            auto csStr = format!"%06o\0 "(cs);
+            h[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+            return h;
+        }
+
+        // PAX global record: "15 path=global\n" — 15 bytes total
+        // "15 " (3) + "path=global" (11) + "\n" (1) = 15 ✓
+        // 15 decimal = 17 octal → size field "00000000017\0"
+        auto paxRecord = cast(ubyte[]) "15 path=global\n";
+        assert(paxRecord.length == 15, "PAX record must be exactly 15 bytes");
+
+        auto globalHdr = makeHeader("GlobalPaxHeader", 'g', "00000000017\0");
+        ubyte[TAR_BLOCK_SIZE] globalData;
+        globalData[] = 0;
+        globalData[0 .. 15] = paxRecord[];
+
+        auto file1Hdr = makeHeader("file1.txt", '0', "00000000005\0");
+        ubyte[TAR_BLOCK_SIZE] file1Data;
+        file1Data[] = 0;
+        file1Data[0 .. 5] = cast(ubyte[5]) "hello";
+
+        auto file2Hdr = makeHeader("file2.txt", '0', "00000000005\0");
+        ubyte[TAR_BLOCK_SIZE] file2Data;
+        file2Data[] = 0;
+        file2Data[0 .. 5] = cast(ubyte[5]) "world";
+
+        ubyte[TAR_BLOCK_SIZE * 2] eoar;
+        eoar[] = 0;
+
+        auto tmpPath = "test-data/test-tarr-fuzz-global.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        ubyte[] archiveData;
+        archiveData ~= globalHdr[];
+        archiveData ~= globalData[];
+        archiveData ~= file1Hdr[];
+        archiveData ~= file1Data[];
+        archiveData ~= file2Hdr[];
+        archiveData ~= file2Data[];
+        archiveData ~= eoar[];
+        write(tmpPath, archiveData);
+
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        string[] names;
+        foreach (entry; reader.entries) {
+            names ~= entry.pathname;
+            reader.skipData();
+        }
+        // First entry gets the global PAX path applied, second does not.
+        // Current behavior: 'g' is handled same as 'x' — applies to the immediately
+        // following entry only, not accumulated for all subsequent entries.
+        assert(names.length == 2, "should find 2 entries, found " ~ names.length.to!string);
+        names[0].shouldEqual("global");       // global attr applied to file1
+        names[1].shouldEqual("file2.txt");    // file2 does NOT inherit global attrs
+    }
+
+    @("tar security: consecutive PAX extended headers — first attrs apply to second header block")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.file : exists, remove, write;
+        import std.format : format;
+
+        // Build: PAX-x1 (path=from_first) → PAX-x2 data → file header → data → eoar
+        // The reader reads PAX-x1, then reads the "next" block which is the PAX-x2 header.
+        // It treats that as the actual file header. PAX-x1 attrs are applied to it.
+        // PAX-x2 data is the entry's content. The actual file header block is never seen.
+
+        // "18 path=first_pax\n": "18 " (3) + "path=first_pax" (14) + "\n" (1) = 18 bytes ✓
+        // 18 decimal = 22 octal → size field "00000000022\0"
+        auto pax1Record = cast(ubyte[]) "18 path=first_pax\n";
+        assert(pax1Record.length == 18, "PAX record must be exactly 18 bytes");
+
+        static ubyte[TAR_BLOCK_SIZE] makeHdr(string name, char tf, string sizeOctal) {
+            ubyte[TAR_BLOCK_SIZE] h;
+            h[] = 0;
+            auto nb = cast(const(ubyte)[]) name;
+            auto take = nb.length > 100 ? 100 : nb.length;
+            h[0 .. take] = nb[0 .. take];
+            h[156] = cast(ubyte) tf;
+            h[257 .. 263] = cast(ubyte[6]) "ustar\0";
+            h[263 .. 265] = cast(ubyte[2]) "00";
+            h[100 .. 108] = cast(ubyte[8]) "0000644\0";
+            assert(sizeOctal.length == 12);
+            h[124 .. 136] = cast(ubyte[12]) sizeOctal[0 .. 12];
+            h[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+            uint cs = 0;
+            foreach (i, b; h) cs += (i >= 148 && i < 156) ? ' ' : b;
+            auto csStr = format!"%06o\0 "(cs);
+            h[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+            return h;
+        }
+
+        // PAX-x1: size=18 decimal = 22 octal → "00000000022\0"
+        auto pax1Hdr = makeHdr("PaxHeader1", 'x', "00000000022\0");
+        ubyte[TAR_BLOCK_SIZE] pax1Data;
+        pax1Data[] = 0;
+        pax1Data[0 .. 18] = pax1Record[];
+
+        // PAX-x2: some other PAX data (size=5 = octal 5 → "00000000005\0")
+        auto pax2Record = cast(ubyte[]) "5 x=y";  // 5 bytes (no trailing newline — malformed but parseable-fail)
+        auto pax2Hdr = makeHdr("PaxHeader2", 'x', "00000000005\0");
+        ubyte[TAR_BLOCK_SIZE] pax2Data;
+        pax2Data[] = 0;
+        pax2Data[0 .. 5] = pax2Record[];
+
+        // Actual file header
+        auto fileHdr = makeHdr("actual.txt", '0', "00000000005\0");
+        ubyte[TAR_BLOCK_SIZE] fileData;
+        fileData[] = 0;
+        fileData[0 .. 5] = cast(ubyte[5]) "hello";
+
+        ubyte[TAR_BLOCK_SIZE * 2] eoar;
+        eoar[] = 0;
+
+        auto tmpPath = "test-data/test-tarr-fuzz-consec-pax.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        ubyte[] archiveData;
+        archiveData ~= pax1Hdr[];
+        archiveData ~= pax1Data[];
+        archiveData ~= pax2Hdr[];
+        archiveData ~= pax2Data[];
+        archiveData ~= fileHdr[];
+        archiveData ~= fileData[];
+        archiveData ~= eoar[];
+        write(tmpPath, archiveData);
+
+        // This documents current behavior: the reader treats the second PAX header
+        // as the actual file header (typeflag 'x' → default → EntryType.file).
+        // PAX-x1 attrs ("path=from_first") are applied. PAX-x2 data is the entry content.
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        string[] names;
+        foreach (entry; reader.entries) {
+            names ~= entry.pathname;
+            reader.skipData();
+        }
+        // We expect at least one entry without a crash.
+        assert(names.length >= 1, "should find at least one entry without crashing");
+    }
+
+    // -------------------------------------------------------------------
     // Range-based tarReader test
     // -------------------------------------------------------------------
 

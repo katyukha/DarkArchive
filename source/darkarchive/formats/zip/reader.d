@@ -1096,6 +1096,114 @@ version(unittest) {
         reader.readText(0).shouldEqual("x");
     }
 
+    // -------------------------------------------------------------------
+    // Fuzz / randomised-corruption tests
+    // -------------------------------------------------------------------
+
+    @("zip fuzz: systematic truncation sweep — only DarkArchiveException escapes")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : exists, remove, read, write;
+        import std.conv : to;
+
+        // Build a minimal single-file archive
+        auto srcPath = testDataDir ~ "/test-zipr-fuzz-src.zip";
+        scope(exit) if (exists(srcPath)) remove(srcPath);
+        auto writer = ZipWriter.createToFile(srcPath);
+        scope(exit) writer.close();
+        writer.addBuffer("a.txt", cast(const(ubyte)[]) "hi");
+        writer.finish();
+        auto fullBytes = cast(ubyte[]) read(srcPath);
+
+        auto truncPath = testDataDir ~ "/test-zipr-fuzz-trunc.zip";
+        scope(exit) if (exists(truncPath)) remove(truncPath);
+
+        foreach (len; 0 .. fullBytes.length) {
+            write(truncPath, fullBytes[0 .. len]);
+            try {
+                auto reader = ZipReader(truncPath);
+                scope(exit) reader.close();
+                foreach (i; 0 .. reader.length) {
+                    try { reader.readData(i); }
+                    catch (DarkArchiveException) {} // expected on truncated data
+                }
+            } catch (DarkArchiveException) {
+                // expected — truncated archive detected on open
+            } catch (Exception e) {
+                assert(false, "Non-DarkArchiveException at len=" ~ len.to!string
+                    ~ ": " ~ e.classinfo.name ~ ": " ~ e.msg);
+            }
+        }
+    }
+
+    @("zip security: unsupported compression method throws DarkArchiveException")
+    unittest {
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : read, write, exists, remove;
+
+        // Create a valid ZIP, then patch the compression method in the central dir to 99
+        auto tmpPath = testDataDir ~ "/test-zipr-badmethod-src.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
+        writer.addBuffer("file.txt", cast(const(ubyte)[]) "content");
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
+        // EOCD is at the end; central dir offset at eocd+16 (little-endian 32-bit)
+        auto eocdPos = data.length - 22;
+        uint cdOffset = data[eocdPos + 16]
+                      | (cast(uint) data[eocdPos + 17] << 8)
+                      | (cast(uint) data[eocdPos + 18] << 16)
+                      | (cast(uint) data[eocdPos + 19] << 24);
+        // Patch compression method in central directory entry (field at CD+10)
+        data[cdOffset + 10] = 99; data[cdOffset + 11] = 0;
+        auto patchedPath = testDataDir ~ "/test-zipr-badmethod.zip";
+        scope(exit) if (exists(patchedPath)) remove(patchedPath);
+        write(patchedPath, data);
+
+        // ZipReader can open the archive (CD parsing doesn't validate method)
+        // readData must throw DarkArchiveException for the unsupported method
+        auto reader = ZipReader(patchedPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.readData(0); }
+        catch (DarkArchiveException) { caught = true; }
+        assert(caught, "readData with unsupported compression method must throw DarkArchiveException");
+    }
+
+    @("zip security: central dir with huge filename length throws bounds check")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        import std.file : read, write, exists, remove;
+
+        auto tmpPath = testDataDir ~ "/test-zipr-hugefnlen-src.zip";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = ZipWriter.createToFile(tmpPath);
+        scope(exit) writer.close();
+        writer.addBuffer("x.txt", cast(const(ubyte)[]) "data");
+        writer.finish();
+
+        auto data = cast(ubyte[]) read(tmpPath);
+        // Patch fnLen in central directory to 0xFFFF (65535)
+        auto eocdPos = data.length - 22;
+        uint cdOffset = data[eocdPos + 16]
+                      | (cast(uint) data[eocdPos + 17] << 8)
+                      | (cast(uint) data[eocdPos + 18] << 16)
+                      | (cast(uint) data[eocdPos + 19] << 24);
+        data[cdOffset + 28] = 0xFF; data[cdOffset + 29] = 0xFF; // fnLen = 65535
+        auto patchedPath = testDataDir ~ "/test-zipr-hugefnlen.zip";
+        scope(exit) if (exists(patchedPath)) remove(patchedPath);
+        write(patchedPath, data);
+
+        // parseCentralDirectory should throw because fnStart + 65535 > file length
+        bool caught;
+        try { auto reader = ZipReader(patchedPath); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
     @("zip security: overflow in dataStart calculation throws")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
