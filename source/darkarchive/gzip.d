@@ -129,6 +129,7 @@ auto gzipSink(R)(R sink)
 // Unit tests
 // ===========================================================================
 
+version(unittest) import thepath : Path;
 version(unittest) {
     import darkarchive.formats.tar.reader : tarReader, tarGzReader;
 
@@ -138,8 +139,7 @@ version(unittest) {
     @("gzip read: plain gzip single file")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : read;
-        auto data = cast(const(ubyte)[]) read(testDataDir ~ "/test-single-file.gz");
+        auto data = cast(const(ubyte)[]) Path(testDataDir ~ "/test-single-file.gz").readFile();
         auto decompressed = gunzip(data);
         auto text = cast(string) decompressed;
         text.shouldEqual("This is a plain gzip compressed file, not a tar archive.\n");
@@ -149,13 +149,12 @@ version(unittest) {
     @("gzip+tar read: tar.gz iterate and verify")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : read, write, exists, remove;
-        auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test.tar.gz");
+        auto gzData = cast(const(ubyte)[]) Path(testDataDir ~ "/test.tar.gz").readFile();
         auto tarData = gunzip(gzData);
         // Write decompressed tar to temp file for TarReader
         auto tmpPath = "test-data/test-gzip-tar-iterate.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        write(tmpPath, tarData);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(tarData);
 
         auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
@@ -177,13 +176,12 @@ version(unittest) {
     @("gzip+tar read: empty archive, zero entries")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : read, write, exists, remove;
-        auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-empty.tar.gz");
+        auto gzData = cast(const(ubyte)[]) Path(testDataDir ~ "/test-empty.tar.gz").readFile();
         auto tarData = gunzip(gzData);
         // Write decompressed tar to temp file for TarReader
         auto tmpPath = "test-data/test-gzip-empty-archive.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        write(tmpPath, tarData);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(tarData);
 
         auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
@@ -199,13 +197,12 @@ version(unittest) {
     @("gzip+tar read: 128KB file, multi-chunk")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : read, write, exists, remove;
-        auto gzData = cast(const(ubyte)[]) read(testDataDir ~ "/test-large-entry.tar.gz");
+        auto gzData = cast(const(ubyte)[]) Path(testDataDir ~ "/test-large-entry.tar.gz").readFile();
         auto tarData = gunzip(gzData);
         // Write decompressed tar to temp file for TarReader
         auto tmpPath = "test-data/test-gzip-large-entry.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        write(tmpPath, tarData);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(tarData);
 
         auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
@@ -223,10 +220,9 @@ version(unittest) {
     @("gzip security: corrupted data detected")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : read;
         import darkarchive.exception : DarkArchiveException;
 
-        auto data = (cast(ubyte[]) read(testDataDir ~ "/test-gzip-verify.gz")).dup;
+        auto data = (cast(ubyte[]) Path(testDataDir ~ "/test-gzip-verify.gz").readFile()).dup;
         // Corrupt a byte in the compressed data area (after 10-byte header)
         if (data.length > 15)
             data[12] ^= 0xFF;
@@ -314,11 +310,10 @@ version(unittest) {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter, gzipCompress;
         import core.memory : GC;
-        import std.file : write, read, remove, exists;
 
         // Create tar with many entries totaling ~1MB via temp file
         auto tarTmpPath = "test-data/test-mem-consistency-inner.tar";
-        scope(exit) if (exists(tarTmpPath)) remove(tarTmpPath);
+        scope(exit) if (Path(tarTmpPath).exists) Path(tarTmpPath).remove();
         auto tw = tarWriter(tarTmpPath);
         scope(exit) tw.close();
         auto chunk = new ubyte[](4096); // 4KB per entry
@@ -327,13 +322,13 @@ version(unittest) {
             tw.addBuffer("entry_%04d.bin".format(i), chunk);
         }
         tw.finish();
-        auto tarBytes = cast(const(ubyte)[]) read(tarTmpPath);
+        auto tarBytes = cast(const(ubyte)[]) Path(tarTmpPath).readFile();
         auto gzData = gzipCompress(tarBytes);
 
         // Write gzip to temp file
         auto tmpPath = "test-data/test-mem-consistency.tar.gz";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        write(tmpPath, gzData);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(gzData);
 
         // Force GC before measuring
         GC.collect();

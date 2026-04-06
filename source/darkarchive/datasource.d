@@ -449,15 +449,16 @@ private {
 // Unit tests
 // ===========================================================================
 
+version(unittest) import thepath : Path;
+
 version(unittest) {
 
     @("datasource: readSlice at offset")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : write, remove;
         enum path = "test-data/tmp-datasource-read.bin";
-        write(path, "Hello, World!");
-        scope(exit) remove(path);
+        Path(path).writeFile("Hello, World!");
+        scope(exit) Path(path).remove();
         auto ds = DataSource.fromFile(path);
         scope(exit) ds.close();
         ds.length.shouldEqual(13);
@@ -479,10 +480,9 @@ version(unittest) {
     @("datasource: readLE")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : write, remove;
         enum path = "test-data/tmp-datasource-readle.bin";
-        write(path, cast(const(ubyte)[]) [0x50, 0x4B, 0x03, 0x04, 0x00]);
-        scope(exit) remove(path);
+        Path(path).writeFile(cast(const(ubyte)[]) [0x50, 0x4B, 0x03, 0x04, 0x00]);
+        scope(exit) Path(path).remove();
         auto ds = DataSource.fromFile(path);
         scope(exit) ds.close();
         ds.readLE!uint(0).shouldEqual(0x04034b50);
@@ -502,11 +502,10 @@ version(unittest) {
     @("datasource: out-of-bounds read throws")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : write, remove;
         import darkarchive.exception : DarkArchiveException;
         enum path = "test-data/tmp-datasource-oob.bin";
-        write(path, "short");
-        scope(exit) remove(path);
+        Path(path).writeFile("short");
+        scope(exit) Path(path).remove();
         auto ds = DataSource.fromFile(path);
         scope(exit) ds.close();
         bool caught;
@@ -525,10 +524,9 @@ version(unittest) {
     @("FileChunkSource: empty file is immediately empty")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : write, remove;
         enum path = "test-data/tmp-fcs-empty.bin";
-        write(path, cast(ubyte[]) []);
-        scope(exit) remove(path);
+        Path(path).writeFile(cast(ubyte[]) []);
+        scope(exit) Path(path).remove();
         auto src = FileChunkSource(path);
         scope(exit) src.close();
         src.empty.shouldBeTrue;

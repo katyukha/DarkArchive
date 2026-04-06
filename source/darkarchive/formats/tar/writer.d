@@ -321,20 +321,20 @@ ubyte[] gzipCompress(const(ubyte)[] data) {
 // Unit tests
 // ===========================================================================
 
+version(unittest) import thepath : Path;
 version(unittest) {
     import darkarchive.formats.tar.reader : tarReader, tarGzReader;
 
     @("tar write: checksum field is POSIX format (6 octal + NUL + space)")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove, read;
         auto tmpPath = "test-data/test-tarw-checksum-posix.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
         writer.finish();
-        auto data = cast(ubyte[]) read(tmpPath);
+        auto data = cast(ubyte[]) Path(tmpPath).readFile();
         assert(data.length >= 512, "TAR should have at least 1 block");
         // POSIX checksum layout in bytes 148..156: XXXXXX\0<space>
         auto cf = data[148 .. 156];
@@ -365,9 +365,8 @@ version(unittest) {
     @("tar write: round-trip with addBuffer")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-roundtrip.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -395,9 +394,8 @@ version(unittest) {
     @("tar write: addDirectory")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-dir.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -414,9 +412,8 @@ version(unittest) {
     @("tar write: addSymlink")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-symlink.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -437,9 +434,8 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
         import std.array : replicate;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-pax-utf8.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto longName = "深层目录/" ~ "子目录/".replicate(20) ~ "文件.txt";
         auto writer = tarWriter(tmpPath);
@@ -461,9 +457,8 @@ version(unittest) {
     @("tar write: method chaining")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-chaining.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -483,10 +478,9 @@ version(unittest) {
     @("tar.gz write: round-trip via tarGzWriter + tarGzReader")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
 
         auto gzTmpPath = "test-data/test-tarw-gz-roundtrip.tar.gz";
-        scope(exit) if (exists(gzTmpPath)) remove(gzTmpPath);
+        scope(exit) if (Path(gzTmpPath).exists) Path(gzTmpPath).remove();
 
         auto writer = tarGzWriter(gzTmpPath);
         scope(exit) writer.close();
@@ -511,9 +505,8 @@ version(unittest) {
     @("tar write: single file, verify content")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarw-single.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -534,11 +527,10 @@ version(unittest) {
     @("tar interop: written tar.gz readable by system tar")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : write, remove, exists, read;
         import std.process : execute;
 
         auto outPath = "test-data/test-tarw-interop.tar.gz";
-        scope(exit) if (exists(outPath)) remove(outPath);
+        scope(exit) if (Path(outPath).exists) Path(outPath).remove();
 
         auto writer = tarGzWriter(outPath);
         scope(exit) writer.close();
@@ -573,11 +565,10 @@ version(unittest) {
     @("tar write security: addStream throws on size underflow")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         import darkarchive.exception : DarkArchiveException;
 
         auto tmpPath = "test-data/test-tarw-underflow.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -596,11 +587,10 @@ version(unittest) {
     @("tar write security: addStream throws on size overflow")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         import darkarchive.exception : DarkArchiveException;
 
         auto tmpPath = "test-data/test-tarw-overflow.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -620,10 +610,9 @@ version(unittest) {
     @("tar write: file-backed streaming round-trip")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
 
         auto outPath = "test-data/test-file-writer.tar";
-        scope(exit) if (exists(outPath)) remove(outPath);
+        scope(exit) if (Path(outPath).exists) Path(outPath).remove();
 
         auto writer = tarWriter(outPath);
         scope(exit) writer.close();
@@ -648,11 +637,10 @@ version(unittest) {
     @("tar write: UTF-8 filenames round-trip")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         import std.algorithm : canFind;
 
         auto tmpPath = "test-data/test-tarw-utf8.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -677,11 +665,10 @@ version(unittest) {
     @("tar write: 150 entries round-trip")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         import std.format : format;
 
         auto tmpPath = "test-data/test-tarw-many.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -701,11 +688,10 @@ version(unittest) {
     @("tar write: permission values preserved")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;
-        import std.file : exists, remove;
         import std.conv : octal;
 
         auto tmpPath = "test-data/test-tarw-perms.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
@@ -738,7 +724,6 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.datasource : DelegateSink;
-        import std.file : write, remove, exists;
 
         ubyte[] buf;
         auto writer = tarGzWriter(DelegateSink((const(ubyte)[] chunk) { buf ~= chunk; }));
@@ -747,8 +732,8 @@ version(unittest) {
             .finish();
 
         auto tmpPath = "test-data/test-tarw-gz-delegate-sink.tar.gz";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        write(tmpPath, buf);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(buf);
 
         auto reader = tarGzReader(tmpPath);
         scope(exit) reader.close();

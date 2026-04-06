@@ -96,12 +96,12 @@ struct ExtractionLimits {
 
 /// Detect the archive format of a file by reading its magic bytes.
 DarkArchiveFormat probeArchive(string path) {
-    import std.file : read, getSize;
-    auto fileSize = getSize(path);
+    auto p = Path(path);
+    auto fileSize = p.getSize();
     if (fileSize < 4)
         throw new DarkArchiveException("Archive file too small to detect format");
     auto headerLen = fileSize > 264 ? 264 : cast(size_t) fileSize;
-    return probeArchive(cast(const(ubyte)[]) read(path, headerLen));
+    return probeArchive(cast(const(ubyte)[]) p.readFile(headerLen));
 }
 
 /// ditto — probe from a pre-read header byte slice (at least 4 bytes required).
@@ -203,7 +203,7 @@ private void applyFilePermissions(string path, uint archivePerms) {
 private void verifyPathWithinRoot(string path, string root) {
     auto resolved = resolveRealPath(path);
     auto normalRoot = resolveRealPath(root);
-    if (!pathStartsWith(resolved, normalRoot))
+    if (!Path(resolved).isInside(Path(normalRoot)))
         throw new DarkArchiveException(
             "Refusing to write file: resolved path escapes extraction directory");
 }
@@ -234,12 +234,6 @@ private string resolveRealPath(string path) {
     }
 }
 
-private bool pathStartsWith(string s, string prefix) {
-    if (s.length < prefix.length) return false;
-    if (s[0 .. prefix.length] != prefix) return false;
-    if (s.length == prefix.length) return true;
-    return s[prefix.length] == '/' || s[prefix.length] == '\\';
-}
 
 private string formatMemSize(ulong bytes) {
     import std.format : format;
@@ -430,7 +424,6 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
             DarkExtractFlags flags,
             ExtractionLimits limits,
             scope bool delegate(ref ExtractParams params) preprocess) {
-        import std.file : mkdirRecurse, write, exists;
         import std.format : format;
 
         auto destStr = destination.toString();
@@ -477,7 +470,7 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
             auto fullPath = Path(destStr, entryPath);
 
             if (entry.isDir) {
-                mkdirRecurse(fullPath.toString());
+                fullPath.mkdir(true);
                 skipData();
             } else if (entry.isSymlink) {
                 if (!(flags & DarkExtractFlags.symlinks)) { skipData(); continue; }
@@ -491,11 +484,10 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                             "Refusing to create symlink with '..' in target: " ~ target);
                 }
                 auto parent = fullPath.parent;
-                if (!exists(parent.toString()))
-                    mkdirRecurse(parent.toString());
+                if (!parent.exists)
+                    parent.mkdir(true);
                 version(Posix) {
-                    import std.file : symlink;
-                    symlink(entry.symlinkTarget, fullPath.toString());
+                    Path(entry.symlinkTarget).symlink(fullPath);
                 } else {
                     throw new DarkArchiveException(
                         "Symlink extraction is not supported on this platform: " ~ entryPath);
@@ -520,8 +512,8 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                     if (flags & DarkExtractFlags.securePaths)
                         verifyPathWithinRoot(targetFull, destStr);
                     auto parent = fullPath.parent;
-                    if (!exists(parent.toString()))
-                        mkdirRecurse(parent.toString());
+                    if (!parent.exists)
+                        parent.mkdir(true);
                     if (posixLink(targetFull.toStringz, fullPath.toString.toStringz) != 0)
                         throw new DarkArchiveException(
                             "Failed to create hardlink: " ~ fullPath.toString);
@@ -531,8 +523,8 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 }
             } else {
                 auto parent = fullPath.parent;
-                if (!exists(parent.toString()))
-                    mkdirRecurse(parent.toString());
+                if (!parent.exists)
+                    parent.mkdir(true);
                 if (flags & DarkExtractFlags.securePaths)
                     verifyPathWithinRoot(parent.toString(), destStr);
                 writeEntryToFile(fullPath.toString(), limits, totalBytes);
@@ -678,11 +670,10 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt) {
     /// ditto
     ref DarkArchiveWriter!fmt add(string sourcePath,
                                    string archiveName = null) return {
-        import std.file : getSize;
         import std.stdio : File;
         if (archiveName is null)
             archiveName = Path(sourcePath).baseName;
-        auto fileSize = getSize(sourcePath);
+        auto fileSize = Path(sourcePath).getSize();
         auto f = File(sourcePath, "rb");
         addStream(archiveName, (scope sink) {
             ubyte[8192] buf;
@@ -706,21 +697,18 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt) {
     ref DarkArchiveWriter!fmt addTree(
             string rootPath, string prefix = null,
             FollowSymlinks followSym = FollowSymlinks.yes) return {
-        import std.file : dirEntries, SpanMode, isDir, isFile;
         auto root = Path(rootPath);
         if (prefix is null) prefix = root.baseName;
-        foreach (de; dirEntries(rootPath, SpanMode.depth)) {
-            auto relPath = Path(de.name).relativeTo(root);
+        foreach (de; root.walkDepth(followSym == FollowSymlinks.yes)) {
+            auto relPath = de.relativeTo(root);
             auto archName = prefix ~ "/" ~ relPath;
             version(Posix) {
-                import std.file : isSymlink, readLink;
                 if (de.isSymlink) {
                     if (followSym == FollowSymlinks.no) {
-                        auto target = readLink(de.name);
-                        addSymlink(archName, target);
+                        addSymlink(archName, de.readLink.toString());
                     } else {
                         if (de.isDir) addDirectory(archName);
-                        else          add(de.name, archName);
+                        else          add(de.toString(), archName);
                     }
                     continue;
                 }
@@ -730,7 +718,7 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt) {
                         "FollowSymlinks.no is not supported on this platform");
             }
             if (de.isDir)       addDirectory(archName);
-            else if (de.isFile) add(de.name, archName);
+            else if (de.isFile) add(de.toString(), archName);
         }
         return this;
     }
@@ -971,7 +959,6 @@ version(unittest) {
     @("high-level: write zip round-trip")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : remove, exists;
         auto outPath = Path(testDataDir, "test-hl-write.zip");
         WZip(outPath)
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
@@ -980,7 +967,7 @@ version(unittest) {
         auto reader = RZip(outPath);
         scope(exit) {
             reader.close();
-            if (exists(outPath.toString)) remove(outPath.toString);
+            if (outPath.exists) outPath.remove();
         }
         bool foundHello;
         foreach (entry; reader.entries) {
@@ -997,7 +984,6 @@ version(unittest) {
     @("high-level: write tar.gz round-trip")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : remove, exists;
         auto outPath = Path(testDataDir, "test-hl-write.tar.gz");
         WTarGz(outPath)
             .addBuffer("file-a.txt", cast(const(ubyte)[]) "Content A")
@@ -1006,7 +992,7 @@ version(unittest) {
         auto reader = RTarGz(outPath);
         scope(exit) {
             reader.close();
-            if (exists(outPath.toString)) remove(outPath.toString);
+            if (outPath.exists) outPath.remove();
         }
         int count;
         foreach (entry; reader.entries) {
@@ -1024,12 +1010,11 @@ version(unittest) {
     @("high-level: cross-format round-trip")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : remove, exists;
         auto zipPath = Path(testDataDir, "test-hl-cross.zip");
         auto tarPath = Path(testDataDir, "test-hl-cross.tar.gz");
         scope(exit) {
-            if (exists(zipPath.toString)) remove(zipPath.toString);
-            if (exists(tarPath.toString)) remove(tarPath.toString);
+            if (zipPath.exists) zipPath.remove();
+            if (tarPath.exists) tarPath.remove();
         }
         auto content = cast(const(ubyte)[]) "Cross-format test";
         WZip(zipPath).addBuffer("cross.txt", content).finish();
@@ -1062,24 +1047,22 @@ version(unittest) {
     @("high-level: extractTo")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, readText, rmdirRecurse;
         auto extractDir = Path(testDataDir, "extract-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(Path(testDataDir, "test-zip.zip"));
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(exists((extractDir ~ "file1.txt").toString));
-        readText((extractDir ~ "file1.txt").toString).shouldEqual("Hello from file1\n");
-        assert(exists((extractDir ~ "subdir/nested.txt").toString));
-        readText((extractDir ~ "subdir/nested.txt").toString).shouldEqual("Nested file content\n");
+        assert((extractDir ~ "file1.txt").exists);
+        (extractDir ~ "file1.txt").readFileText().shouldEqual("Hello from file1\n");
+        assert((extractDir ~ "subdir/nested.txt").exists);
+        (extractDir ~ "subdir/nested.txt").readFileText().shouldEqual("Nested file content\n");
     }
 
     @("high-level: write to file, read back")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-hl-mem.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("mem.txt", cast(const(ubyte)[]) "from memory")
             .finish();
@@ -1096,9 +1079,8 @@ version(unittest) {
     @("high-level: method chaining")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-hl-chain.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
@@ -1118,30 +1100,28 @@ version(unittest) {
     @("security: extractTo rejects path with '..' components")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-sec-dotdot.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("../escape.txt", cast(const(ubyte)[]) "escaped!").finish();
         auto extractDir = Path(testDataDir, "sec-dotdot-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
         try { reader.extractTo(extractDir); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
-        assert(!exists(Path(testDataDir, "escape.txt").toString));
+        assert(!Path(testDataDir, "escape.txt").exists);
     }
 
     @("security: extractTo rejects nested '..' traversal")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-sec-nested-dotdot.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("foo/../../escape2.txt", cast(const(ubyte)[]) "escaped!").finish();
         auto extractDir = Path(testDataDir, "sec-nested-dotdot-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1153,12 +1133,11 @@ version(unittest) {
     @("security: extractTo rejects absolute paths")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-sec-abs.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("/tmp/evil.txt", cast(const(ubyte)[]) "evil!").finish();
         auto extractDir = Path(testDataDir, "sec-abs-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1170,35 +1149,33 @@ version(unittest) {
     @("security: extractTo skips symlink with absolute target by default")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-symlink-abs.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("evil-link", "/etc/passwd");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-symlink-abs-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(!exists((extractDir ~ "evil-link").toString));
+        assert(!(extractDir ~ "evil-link").exists);
     }
 
     version(Posix) @("security: extractTo rejects absolute symlink when symlinks enabled")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-symlink-abs-en.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("evil-link", "/etc/passwd");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-symlink-abs-enabled-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1210,35 +1187,33 @@ version(unittest) {
     @("security: extractTo skips symlink with traversal target by default")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-symlink-trav.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("escape-link", "../../../../etc/shadow");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-symlink-trav-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(!exists((extractDir ~ "escape-link").toString));
+        assert(!(extractDir ~ "escape-link").exists);
     }
 
     version(Posix) @("security: extractTo rejects traversal symlink when symlinks enabled")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-symlink-trav-en.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("escape-link", "../../../../etc/shadow");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-symlink-trav-enabled-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1250,12 +1225,11 @@ version(unittest) {
     @("security: extractTo rejects entry named '..'")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-sec-dotdot-name.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("..", cast(const(ubyte)[]) "dot dot").finish();
         auto extractDir = Path(testDataDir, "sec-dotdot-name-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1270,79 +1244,75 @@ version(unittest) {
 
     @("CVE: two-step symlink+file — safe by default (symlinks skipped)")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-cve-twostep.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("escape-dir", "/tmp");
         tw.addBuffer("escape-dir/pwned.txt", cast(const(ubyte)[]) "pwned!");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-twostep-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(!exists("/tmp/pwned.txt"));
+        assert(!Path("/tmp/pwned.txt").exists);
     }
 
     version(Posix) @("CVE: two-step symlink+file — absolute target rejected with symlinks enabled")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-cve-twostep-en.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("escape-dir", "/tmp");
         tw.addBuffer("escape-dir/pwned.txt", cast(const(ubyte)[]) "pwned!");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-twostep-enabled-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
         try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
-        assert(!exists("/tmp/pwned.txt"));
+        assert(!Path("/tmp/pwned.txt").exists);
     }
 
     @("CVE: two-step relative symlink — safe by default (symlinks skipped)")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-cve-twostep-rel.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("linkdir", "../../");
         tw.addBuffer("linkdir/escape.txt", cast(const(ubyte)[]) "escaped!");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-twostep-rel-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(!exists(Path(testDataDir, "escape.txt").toString));
+        assert(!Path(testDataDir, "escape.txt").exists);
     }
 
     version(Posix) @("CVE: two-step relative symlink — rejected with symlinks enabled")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-cve-twostep-rel-en.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("linkdir", "../../");
         tw.addBuffer("linkdir/escape.txt", cast(const(ubyte)[]) "escaped!");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-twostep-rel-en-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1353,31 +1323,29 @@ version(unittest) {
 
     @("CVE: Zip Slip - file..name.txt is legitimate, not rejected")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-cve-legit-dotdot.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("file..name.txt", cast(const(ubyte)[]) "legitimate").finish();
         auto extractDir = Path(testDataDir, "sec-legit-dotdot-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(exists((extractDir ~ "file..name.txt").toString));
+        assert((extractDir ~ "file..name.txt").exists);
     }
 
     @("CVE: pax path override with traversal")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-cve-pax-trav.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("../../pax-evil.txt", cast(const(ubyte)[]) "pax attack");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-pax-trav-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1388,35 +1356,33 @@ version(unittest) {
 
     @("security: absolute symlink skipped with DarkExtractFlags.none")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-abs-sym-uncond.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("danger", "/etc/passwd");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-abs-sym-unconditional");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.none);
-        assert(!exists((extractDir ~ "danger").toString));
+        assert(!(extractDir ~ "danger").exists);
     }
 
     version(Posix) @("security: absolute symlink rejected unconditionally with symlinks flag")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-abs-sym-flag.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("danger", "/etc/passwd");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-abs-sym-flag-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1431,60 +1397,57 @@ version(unittest) {
 
     @("security: symlinks skipped by default during extraction")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-sym-skip.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("real-file.txt", cast(const(ubyte)[]) "I exist");
         tw.addSymlink("safe-link", "real-file.txt");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-sym-skip-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(exists((extractDir ~ "real-file.txt").toString));
-        assert(!exists((extractDir ~ "safe-link").toString));
+        assert((extractDir ~ "real-file.txt").exists);
+        assert(!(extractDir ~ "safe-link").exists);
     }
 
     version(Posix) @("security: symlinks created when flag is set")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, isSymlink, readText, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-sym-create.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("target.txt", cast(const(ubyte)[]) "target content");
         tw.addSymlink("link.txt", "target.txt");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-sym-create-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
-        assert(exists((extractDir ~ "target.txt").toString));
-        assert(exists((extractDir ~ "link.txt").toString));
-        assert(isSymlink((extractDir ~ "link.txt").toString));
-        readText((extractDir ~ "link.txt").toString).shouldEqual("target content");
+        assert((extractDir ~ "target.txt").exists);
+        assert((extractDir ~ "link.txt").exists);
+        assert((extractDir ~ "link.txt").isSymlink());
+        (extractDir ~ "link.txt").readFileText().shouldEqual("target content");
     }
 
     version(Posix) @("security: absolute symlink still rejected even with symlinks flag")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-sec-sym-abs-flag.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("evil", "/etc/passwd");
         tw.finish();
         auto extractDir = Path(testDataDir, "sec-sym-abs-flag-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1501,7 +1464,6 @@ version(unittest) {
     @("security: chained symlink escaping extractDir is blocked by resolveRealPath")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove, mkdir;
         import darkarchive.formats.tar.writer : tarWriter;
 
         // extractDir/link2 is a PRE-EXISTING symlink pointing OUTSIDE extractDir.
@@ -1510,17 +1472,16 @@ version(unittest) {
         auto extractDir = Path(testDataDir, "sec-chained-sym-extract");
         auto outsideDir = Path(testDataDir, "sec-chained-sym-outside");
         scope(exit) {
-            if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
-            if (exists(outsideDir.toString)) rmdirRecurse(outsideDir.toString);
+            if (extractDir.exists) extractDir.remove();
+            if (outsideDir.exists) outsideDir.remove();
         }
-        mkdir(extractDir.toString);
-        mkdir(outsideDir.toString);
+        extractDir.mkdir();
+        outsideDir.mkdir();
         // Inside extractDir: link2 → ../sec-chained-sym-outside (outside)
-        import std.file : symlink;
-        symlink("../sec-chained-sym-outside", (extractDir ~ "link2").toString);
+        Path("../sec-chained-sym-outside").symlink(extractDir ~ "link2");
 
         auto tmpTar = "test-data/test-sec-chained-sym.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addSymlink("link1", "link2");                               // one-hop, looks safe
@@ -1536,7 +1497,7 @@ version(unittest) {
         } catch (DarkArchiveException) { caught = true; }
 
         caught.shouldBeTrue;
-        assert(!exists((outsideDir ~ "evil.txt").toString),
+        assert(!(outsideDir ~ "evil.txt").exists,
             "evil.txt must not escape to the outside directory via chained symlinks");
     }
 
@@ -1547,12 +1508,11 @@ version(unittest) {
     version(Posix) @("hardlink: extractTo creates hardlink when symlinks flag set")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove, readText, getAttributes;
         import darkarchive.formats.tar.writer : tarWriter;
         import core.sys.posix.sys.stat : stat_t, stat;
 
         auto tmpTar = "test-data/test-hardlink-extract.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("original.txt", cast(const(ubyte)[]) "hardlink content");
@@ -1560,14 +1520,14 @@ version(unittest) {
         tw.finish();
 
         auto extractDir = Path(testDataDir, "hardlink-extract-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.symlinks);
 
-        assert(exists((extractDir ~ "original.txt").toString));
-        assert(exists((extractDir ~ "link.txt").toString));
-        readText((extractDir ~ "link.txt").toString).shouldEqual("hardlink content");
+        assert((extractDir ~ "original.txt").exists);
+        assert((extractDir ~ "link.txt").exists);
+        (extractDir ~ "link.txt").readFileText().shouldEqual("hardlink content");
 
         // Verify same inode — confirms it's a real hardlink, not a copy
         stat_t s1, s2;
@@ -1579,11 +1539,10 @@ version(unittest) {
     @("hardlink: skipped by default when symlinks flag not set")
     unittest {
         import unit_threaded.assertions : shouldBeFalse;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
 
         auto tmpTar = "test-data/test-hardlink-skip.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("original.txt", cast(const(ubyte)[]) "content");
@@ -1591,30 +1550,29 @@ version(unittest) {
         tw.finish();
 
         auto extractDir = Path(testDataDir, "hardlink-skip-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir); // default flags — symlinks flag not set
 
-        assert(exists((extractDir ~ "original.txt").toString));
-        exists((extractDir ~ "link.txt").toString).shouldBeFalse;
+        assert((extractDir ~ "original.txt").exists);
+        (extractDir ~ "link.txt").exists.shouldBeFalse;
     }
 
     @("hardlink: absolute target throws")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
 
         auto tmpTar = "test-data/test-hardlink-abs.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addHardlink("link.txt", "/etc/passwd");
         tw.finish();
 
         auto extractDir = Path(testDataDir, "hardlink-abs-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1627,11 +1585,10 @@ version(unittest) {
     @("hardlink: non-Posix platform throws DarkArchiveException when symlinks flag is set")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
 
         auto tmpTar = "test-data/test-hardlink-nonposix.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("original.txt", cast(const(ubyte)[]) "content");
@@ -1639,7 +1596,7 @@ version(unittest) {
         tw.finish();
 
         auto extractDir = Path(testDataDir, "hardlink-nonposix-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1653,18 +1610,17 @@ version(unittest) {
     @("hardlink: traversal target throws")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         import darkarchive.formats.tar.writer : tarWriter;
 
         auto tmpTar = "test-data/test-hardlink-traversal.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addHardlink("link.txt", "../outside.txt");
         tw.finish();
 
         auto extractDir = Path(testDataDir, "hardlink-traversal-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
@@ -1680,10 +1636,9 @@ version(unittest) {
     @("limits: maxEntries throws when exceeded")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-limits-entries.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
@@ -1691,7 +1646,7 @@ version(unittest) {
             .finish();
 
         auto extractDir = Path(testDataDir, "limits-entries-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1704,16 +1659,15 @@ version(unittest) {
     @("limits: maxEntryBytes throws when exceeded")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-limits-entrybytes.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("big.bin", new ubyte[](1024))
             .finish();
 
         auto extractDir = Path(testDataDir, "limits-entrybytes-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1726,17 +1680,16 @@ version(unittest) {
     @("limits: maxTotalBytes throws when exceeded")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-limits-totalbytes.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("a.bin", new ubyte[](512))
             .addBuffer("b.bin", new ubyte[](512))
             .finish();
 
         auto extractDir = Path(testDataDir, "limits-totalbytes-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1753,10 +1706,9 @@ version(unittest) {
     @("limits: TAR maxEntries throws when exceeded")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-limits-tar-entries.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WTar(tmpPath)
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
@@ -1764,7 +1716,7 @@ version(unittest) {
             .finish();
 
         auto extractDir = Path(testDataDir, "limits-tar-entries-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1777,16 +1729,15 @@ version(unittest) {
     @("limits: TAR maxEntryBytes throws when exceeded")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-limits-tar-entrybytes.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WTar(tmpPath)
             .addBuffer("big.bin", new ubyte[](1024))
             .finish();
 
         auto extractDir = Path(testDataDir, "limits-tar-entrybytes-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1799,17 +1750,16 @@ version(unittest) {
     @("limits: TAR maxTotalBytes throws when exceeded")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
 
         auto tmpPath = "test-data/test-limits-tar-totalbytes.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WTar(tmpPath)
             .addBuffer("a.bin", new ubyte[](512))
             .addBuffer("b.bin", new ubyte[](512))
             .finish();
 
         auto extractDir = Path(testDataDir, "limits-tar-totalbytes-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -1826,9 +1776,8 @@ version(unittest) {
     @("attack: null byte in ZIP filename — archive listable, extraction throws")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-atk-null-byte.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("safe.txt\x00hidden", cast(const(ubyte)[]) "trick").finish();
 
         // Archive can be opened and entries listed — NUL preserved in pathname.
@@ -1841,14 +1790,14 @@ version(unittest) {
 
         // Extraction must throw — NUL in path is rejected unconditionally.
         auto extractDir = Path(testDataDir, "sec-null-byte-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader2 = RZip(tmpPath);
         scope(exit) reader2.close();
         bool caught;
         try { reader2.extractTo(extractDir); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
-        assert(!exists((extractDir ~ "hidden").toString), "hidden must not be written");
+        assert(!(extractDir ~ "hidden").exists, "hidden must not be written");
     }
 
     @("attack: NUL in TAR header name field is truncated (fixed-width C-string convention)")
@@ -1858,27 +1807,26 @@ version(unittest) {
         // correct, not a silent failure.  Variable-length PAX paths that contain
         // NUL are rejected at extraction time (see reader.d unit tests for that).
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove, read, write;
         import darkarchive.formats.tar.writer : tarWriter;
         import darkarchive.formats.tar.reader : tarReader;
         import std.format : format;
 
         auto tmpTar = "test-data/test-atk-null-hdr.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("safe.txt", cast(const(ubyte)[]) "content");
         tw.finish();
 
         // Inject NUL at position 4: "safe.txt" → "safe\0txt", recompute checksum.
-        auto data = cast(ubyte[]) read(tmpTar);
+        auto data = cast(ubyte[]) Path(tmpTar).readFile();
         assert(data.length >= 512);
         data[4] = 0;
         uint cs = 0;
         foreach (i; 0 .. 512) cs += (i >= 148 && i < 156) ? ' ' : data[i];
         auto csStr = format!"%06o\0 "(cs);
         data[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
-        write(tmpTar, data);
+        Path(tmpTar).writeFile(data);
 
         auto reader = tarReader(tmpTar);
         scope(exit) reader.close();
@@ -1893,7 +1841,6 @@ version(unittest) {
         // PAX paths are variable-length strings; NUL has no defined meaning.
         // The entry can be listed but extraction must throw.
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove, write;
         import darkarchive.formats.tar.reader : tarReader;
         import std.format : format;
 
@@ -1939,13 +1886,13 @@ version(unittest) {
         ubyte[1024] eoar; eoar[] = 0;
 
         auto tmpTar = "test-data/test-atk-null-pax.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         ubyte[] archiveData;
         archiveData ~= paxHdr[];
         archiveData ~= paxDataBlock[];
         archiveData ~= fileHdr[];
         archiveData ~= eoar[];
-        write(tmpTar, archiveData);
+        Path(tmpTar).writeFile(archiveData);
 
         // Listing works — entry has NUL in its pathname.
         auto reader = tarReader(tmpTar);
@@ -1957,7 +1904,7 @@ version(unittest) {
 
         // Extraction must throw.
         auto extractDir = Path(testDataDir, "sec-null-pax-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader2 = RTar(tmpTar);
         scope(exit) reader2.close();
         bool caught;
@@ -1969,12 +1916,11 @@ version(unittest) {
     @("attack: filename is just '.'")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-atk-dot-name.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer(".", cast(const(ubyte)[]) "overwrite root?").finish();
         auto extractDir = Path(testDataDir, "sec-dot-name-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         try { reader.extractTo(extractDir); } catch (Exception) {}
@@ -1990,26 +1936,24 @@ version(unittest) {
 
     @("attack: duplicate filenames in archive")
     unittest {
-        import std.file : exists, rmdirRecurse, readText;
         auto extractDir = Path(testDataDir, "sec-dupe-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(Path(testDataDir, "test-duplicate-names.zip"));
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        assert(exists((extractDir ~ "dupe.txt").toString));
-        auto content = readText((extractDir ~ "dupe.txt").toString);
+        assert((extractDir ~ "dupe.txt").exists);
+        auto content = (extractDir ~ "dupe.txt").readFileText();
         assert(content == "first version\n" || content == "second version\n");
     }
 
     @("attack: very long pathname")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         import std.array : replicate;
         auto segments = "abcdefghijklmnopqrstuvwxyz01234567890123456789abcd/";
         auto longPath = segments.replicate(20) ~ "file.txt";
         auto tmpPath = "test-data/test-atk-longpath.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer(longPath, cast(const(ubyte)[]) "deep").finish();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
@@ -2026,15 +1970,14 @@ version(unittest) {
     @("attack: control characters in filename")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-atk-ctrl-char.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("line1\nline2.txt", cast(const(ubyte)[]) "newline name")
             .addBuffer("tab\there.txt", cast(const(ubyte)[]) "tab name")
             .finish();
         auto extractDir = Path(testDataDir, "sec-control-char-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader1 = RZip(tmpPath);
         scope(exit) reader1.close();
         try { reader1.extractTo(extractDir); } catch (Exception) {}
@@ -2048,9 +1991,8 @@ version(unittest) {
     @("attack: RTL override in filename")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-atk-rtl.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("readme\xE2\x80\xAEtxt.exe", cast(const(ubyte)[]) "spoofed extension")
             .finish();
@@ -2064,12 +2006,11 @@ version(unittest) {
     @("attack: deflate bomb (high compression ratio)")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         import darkarchive.formats.zip.writer : ZipWriter;
         import darkarchive.formats.zip.reader : ZipReader;
         auto zeros = new ubyte[](1024 * 1024);
         auto tmpPath = "test-data/test-atk-bomb.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = ZipWriter.createToFile(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("bomb.bin", zeros);
@@ -2095,15 +2036,14 @@ version(unittest) {
 
     @("attack: file and directory with same name")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-atk-conflict.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addDirectory("conflict")
             .addBuffer("conflict", cast(const(ubyte)[]) "file wins?")
             .finish();
         auto extractDir = Path(testDataDir, "sec-conflict-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         try { reader.extractTo(extractDir); } catch (Exception) {}
@@ -2112,9 +2052,8 @@ version(unittest) {
     @("attack: colon in filename (NTFS ADS)")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-atk-colon.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("file.txt:hidden", cast(const(ubyte)[]) "ADS data").finish();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
@@ -2133,9 +2072,8 @@ version(unittest) {
     @("processEntries: ZIP find and read specific entry")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-pe-zip-find.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("a.txt", cast(const(ubyte)[]) "content A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "content B")
@@ -2153,10 +2091,9 @@ version(unittest) {
     @("processEntries: TAR find and read specific entry")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-pe-tar-find.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("first.txt", cast(const(ubyte)[]) "first");
@@ -2175,9 +2112,8 @@ version(unittest) {
     @("processEntries: returns 0 when no match")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeFalse;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-pe-no-match.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("exists.txt", cast(const(ubyte)[]) "data").finish();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
@@ -2191,9 +2127,8 @@ version(unittest) {
     @("processEntries: multiple entries all found")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-pe-multi-found.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("x.txt", cast(const(ubyte)[]) "X")
             .addBuffer("y.txt", cast(const(ubyte)[]) "Y")
@@ -2213,9 +2148,8 @@ version(unittest) {
     @("processEntries: TAR.GZ through gzip layer")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : remove, exists;
         auto tmpTarGz = "test-data/test-pe-targz.tar.gz";
-        scope(exit) if (exists(tmpTarGz)) remove(tmpTarGz);
+        scope(exit) if (Path(tmpTarGz).exists) Path(tmpTarGz).remove();
         WTarGz(tmpTarGz).addBuffer("gz-file.txt", cast(const(ubyte)[]) "gzipped content").finish();
         auto reader = RTarGz(tmpTarGz);
         scope(exit) reader.close();
@@ -2229,9 +2163,8 @@ version(unittest) {
     @("processEntries: all-entries overload")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-pe-all-entries.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("one.txt", cast(const(ubyte)[]) "1")
             .addBuffer("two.txt", cast(const(ubyte)[]) "2")
@@ -2247,11 +2180,10 @@ version(unittest) {
     @("processEntries: delegate reads binary data via readAll")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto testData = new ubyte[](1024);
         foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
         auto tmpPath = "test-data/test-pe-binary.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("binary.bin", testData).finish();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
@@ -2287,11 +2219,10 @@ version(unittest) {
     @("processEntries: chunked read avoids full memory load")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto testData = new ubyte[](32768);
         foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
         auto tmpPath = "test-data/test-pe-chunked.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("large.bin", testData).finish();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
@@ -2312,12 +2243,11 @@ version(unittest) {
     @("processEntries: chunked read on TAR")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         import darkarchive.formats.tar.writer : tarWriter;
         auto testData = new ubyte[](16384);
         foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
         auto tmpTar = "test-data/test-pe-chunked-tar.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("tardata.bin", testData);
@@ -2335,28 +2265,26 @@ version(unittest) {
     @("processEntries: extractTo uses streaming write")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, getSize, remove;
         auto testData = new ubyte[](65536);
         foreach (i, ref b; testData) b = cast(ubyte)(i & 0xFF);
         auto tmpPath = "test-data/test-pe-streaming.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("big.bin", testData).finish();
         auto extractDir = Path(testDataDir, "streaming-extract-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
         auto extractedPath = (extractDir ~ "big.bin").toString;
-        assert(exists(extractedPath));
-        getSize(extractedPath).shouldEqual(65536);
+        assert(Path(extractedPath).exists);
+        Path(extractedPath).getSize().shouldEqual(65536);
     }
 
     @("processEntries: chunked read on empty entry")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-pe-empty.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("empty.txt", cast(const(ubyte)[]) "").finish();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
@@ -2375,16 +2303,15 @@ version(unittest) {
     @("extractTo delegate: strip prefix (unfoldPath)")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, readText, remove;
         auto tmpPath = "test-data/test-dlg-unfold.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("odoo-18.0/README.txt", cast(const(ubyte)[]) "readme")
             .addBuffer("odoo-18.0/setup.py", cast(const(ubyte)[]) "setup")
             .addDirectory("odoo-18.0/addons")
             .finish();
         auto extractDir = Path(testDataDir, "unfold-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.defaults,
@@ -2394,43 +2321,41 @@ version(unittest) {
                     params.destPath = params.destPath["odoo-18.0/".length .. $];
                 return true;
             });
-        assert(exists((extractDir ~ "README.txt").toString));
-        readText((extractDir ~ "README.txt").toString).shouldEqual("readme");
-        assert(exists((extractDir ~ "setup.py").toString));
-        assert(!exists((extractDir ~ "odoo-18.0").toString));
+        assert((extractDir ~ "README.txt").exists);
+        (extractDir ~ "README.txt").readFileText().shouldEqual("readme");
+        assert((extractDir ~ "setup.py").exists);
+        assert(!(extractDir ~ "odoo-18.0").exists);
     }
 
     @("extractTo delegate: skip .pyc files")
     unittest {
-        import std.file : exists, rmdirRecurse, remove;
         import std.algorithm : endsWith;
         auto tmpPath = "test-data/test-dlg-skip-pyc.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("module.py", cast(const(ubyte)[]) "python source")
             .addBuffer("module.pyc", cast(const(ubyte)[]) "bytecode")
             .addBuffer("other.txt", cast(const(ubyte)[]) "text")
             .finish();
         auto extractDir = Path(testDataDir, "skip-pyc-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.defaults,
             (ref params) { return !params.destPath.endsWith(".pyc"); });
-        assert(exists((extractDir ~ "module.py").toString));
-        assert(exists((extractDir ~ "other.txt").toString));
-        assert(!exists((extractDir ~ "module.pyc").toString));
+        assert((extractDir ~ "module.py").exists);
+        assert((extractDir ~ "other.txt").exists);
+        assert(!(extractDir ~ "module.pyc").exists);
     }
 
     @("extractTo delegate: security catches delegate-introduced traversal")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-dlg-sec-trav.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("safe.txt", cast(const(ubyte)[]) "data").finish();
         auto extractDir = Path(testDataDir, "delegate-sec-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -2444,12 +2369,11 @@ version(unittest) {
     @("extractTo delegate: security catches delegate-introduced absolute path")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-dlg-sec-abs.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("safe.txt", cast(const(ubyte)[]) "data").finish();
         auto extractDir = Path(testDataDir, "delegate-abs-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         bool caught;
@@ -2463,38 +2387,36 @@ version(unittest) {
     @("extractTo delegate: null delegate same as default")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, readText, remove;
         auto tmpPath = "test-data/test-dlg-null.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("test.txt", cast(const(ubyte)[]) "content").finish();
         auto extractDir = Path(testDataDir, "null-delegate-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.defaults, null);
-        assert(exists((extractDir ~ "test.txt").toString));
-        readText((extractDir ~ "test.txt").toString).shouldEqual("content");
+        assert((extractDir ~ "test.txt").exists);
+        (extractDir ~ "test.txt").readFileText().shouldEqual("content");
     }
 
     @("extractTo delegate: skip all entries")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, dirEntries, SpanMode, remove;
         auto tmpPath = "test-data/test-dlg-skip-all.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
             .addBuffer("b.txt", cast(const(ubyte)[]) "B")
             .finish();
         auto extractDir = Path(testDataDir, "skip-all-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.defaults,
             (ref params) { return false; });
-        if (exists(extractDir.toString)) {
+        if (extractDir.exists) {
             int fileCount;
-            foreach (de; dirEntries(extractDir.toString, SpanMode.depth)) fileCount++;
+            foreach (de; extractDir.walkDepth()) fileCount++;
             fileCount.shouldEqual(0);
         }
     }
@@ -2502,36 +2424,34 @@ version(unittest) {
     @("extractTo delegate: backward compatibility")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, readText, remove;
         auto tmpPath = "test-data/test-dlg-compat.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("compat.txt", cast(const(ubyte)[]) "works").finish();
         auto extractDir1 = Path(testDataDir, "compat-test-1");
-        scope(exit) if (exists(extractDir1.toString)) rmdirRecurse(extractDir1.toString);
+        scope(exit) if (extractDir1.exists) extractDir1.remove();
         auto reader1 = RZip(tmpPath);
         scope(exit) reader1.close();
         reader1.extractTo(extractDir1);
-        readText((extractDir1 ~ "compat.txt").toString).shouldEqual("works");
+        (extractDir1 ~ "compat.txt").readFileText().shouldEqual("works");
         auto extractDir2 = Path(testDataDir, "compat-test-2");
-        scope(exit) if (exists(extractDir2.toString)) rmdirRecurse(extractDir2.toString);
+        scope(exit) if (extractDir2.exists) extractDir2.remove();
         auto reader2 = RZip(tmpPath);
         scope(exit) reader2.close();
         reader2.extractTo(extractDir2, DarkExtractFlags.defaults);
-        readText((extractDir2 ~ "compat.txt").toString).shouldEqual("works");
+        (extractDir2 ~ "compat.txt").readFileText().shouldEqual("works");
     }
 
     @("extractTo delegate: read sourceEntry metadata")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-dlg-metadata.zip";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath)
             .addBuffer("file.txt", cast(const(ubyte)[]) "content")
             .addDirectory("dir")
             .finish();
         auto extractDir = Path(testDataDir, "source-entry-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         bool sawFile, sawDir;
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
@@ -2548,12 +2468,11 @@ version(unittest) {
     @("extractTo delegate: works on TAR.GZ")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, rmdirRecurse, readText, remove;
         auto tmpTarGz = "test-data/test-dlg-targz.tar.gz";
-        scope(exit) if (exists(tmpTarGz)) remove(tmpTarGz);
+        scope(exit) if (Path(tmpTarGz).exists) Path(tmpTarGz).remove();
         WTarGz(tmpTarGz).addBuffer("prefix/data.txt", cast(const(ubyte)[]) "tar data").finish();
         auto extractDir = Path(testDataDir, "delegate-targz-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTarGz(tmpTarGz);
         scope(exit) reader.close();
         reader.extractTo(extractDir, DarkExtractFlags.defaults,
@@ -2563,8 +2482,8 @@ version(unittest) {
                     params.destPath = params.destPath["prefix/".length .. $];
                 return true;
             });
-        assert(exists((extractDir ~ "data.txt").toString));
-        readText((extractDir ~ "data.txt").toString).shouldEqual("tar data");
+        assert((extractDir ~ "data.txt").exists);
+        (extractDir ~ "data.txt").readFileText().shouldEqual("tar data");
     }
 
     // -------------------------------------------------------------------
@@ -2574,16 +2493,15 @@ version(unittest) {
     @("addTree: follows symlinks by default")
     unittest {
         import unit_threaded.assertions : shouldBeTrue, shouldBeFalse;
+
         version(Posix) {
-            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
-                symlink, getcwd, remove;
-            auto srcDir = Path(getcwd(), testDataDir, "symlink-follow-src");
-            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
-            mkdirRecurse(srcDir.toString);
-            write((srcDir ~ "real.txt").toString, "real content");
-            symlink("real.txt", (srcDir ~ "link.txt").toString);
+            auto srcDir = Path.current().join(testDataDir, "symlink-follow-src");
+            scope(exit) if (srcDir.exists) srcDir.remove();
+            srcDir.mkdir(true);
+            (srcDir ~ "real.txt").writeFile("real content");
+            Path("real.txt").symlink(srcDir ~ "link.txt");
             auto tmpZip = "test-data/test-tree-follow-sym.zip";
-            scope(exit) if (exists(tmpZip)) remove(tmpZip);
+            scope(exit) if (Path(tmpZip).exists) Path(tmpZip).remove();
             WZip(tmpZip).addTree(srcDir).finish();
             auto reader = RZip(tmpZip);
             scope(exit) reader.close();
@@ -2603,16 +2521,15 @@ version(unittest) {
     @("addTree: FollowSymlinks.no preserves symlinks")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+
         version(Posix) {
-            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
-                symlink, getcwd, remove;
-            auto srcDir = Path(getcwd(), testDataDir, "symlink-preserve-src");
-            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
-            mkdirRecurse(srcDir.toString);
-            write((srcDir ~ "target.txt").toString, "target content");
-            symlink("target.txt", (srcDir ~ "preserved.txt").toString);
+            auto srcDir = Path.current().join(testDataDir, "symlink-preserve-src");
+            scope(exit) if (srcDir.exists) srcDir.remove();
+            srcDir.mkdir(true);
+            (srcDir ~ "target.txt").writeFile("target content");
+            Path("target.txt").symlink(srcDir ~ "preserved.txt");
             auto tmpTar = "test-data/test-tree-preserve-sym.tar";
-            scope(exit) if (exists(tmpTar)) remove(tmpTar);
+            scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
             WTar(tmpTar).addTree(srcDir, null, FollowSymlinks.no).finish();
             auto reader = RTar(tmpTar);
             scope(exit) reader.close();
@@ -2631,14 +2548,14 @@ version(unittest) {
 
     @("addTree: no symlinks in source works normally")
     unittest {
-        import std.file : exists, rmdirRecurse, mkdirRecurse, write, getcwd, remove;
-        auto srcDir = Path(getcwd(), testDataDir, "nosym-tree-src");
-        scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
-        mkdirRecurse((srcDir ~ "sub").toString);
-        write((srcDir ~ "a.txt").toString, "aaa");
-        write((srcDir ~ "sub/b.txt").toString, "bbb");
+
+        auto srcDir = Path.current().join(testDataDir, "nosym-tree-src");
+        scope(exit) if (srcDir.exists) srcDir.remove();
+        (srcDir ~ "sub").mkdir(true);
+        (srcDir ~ "a.txt").writeFile("aaa");
+        (srcDir ~ "sub/b.txt").writeFile("bbb");
         auto tmpZip = "test-data/test-tree-nosym.zip";
-        scope(exit) if (exists(tmpZip)) remove(tmpZip);
+        scope(exit) if (Path(tmpZip).exists) Path(tmpZip).remove();
         WZip(tmpZip).addTree(srcDir).finish();
         auto reader = RZip(tmpZip);
         scope(exit) reader.close();
@@ -2650,16 +2567,15 @@ version(unittest) {
     @("addTree: dangling symlink throws")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
+
         version(Posix) {
-            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
-                symlink, getcwd, remove;
-            auto srcDir = Path(getcwd(), testDataDir, "dangling-sym-src");
-            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
-            mkdirRecurse(srcDir.toString);
-            write((srcDir ~ "real.txt").toString, "real content");
-            symlink("nonexistent-target.txt", (srcDir ~ "dangling.txt").toString);
+            auto srcDir = Path.current().join(testDataDir, "dangling-sym-src");
+            scope(exit) if (srcDir.exists) srcDir.remove();
+            srcDir.mkdir(true);
+            (srcDir ~ "real.txt").writeFile("real content");
+            Path("nonexistent-target.txt").symlink(srcDir ~ "dangling.txt");
             auto tmpZip = "test-data/test-tree-dangling.zip";
-            scope(exit) if (exists(tmpZip)) remove(tmpZip);
+            scope(exit) if (Path(tmpZip).exists) Path(tmpZip).remove();
             auto writer = WZip(tmpZip);
             bool threw;
             try { writer.addTree(srcDir); } catch (Exception) { threw = true; }
@@ -2670,17 +2586,16 @@ version(unittest) {
     @("addTree: circular symlinks throw, not hang")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
+
         version(Posix) {
-            import std.file : exists, rmdirRecurse, mkdirRecurse, write,
-                symlink, getcwd, remove;
-            auto srcDir = Path(getcwd(), testDataDir, "circular-sym-src");
-            scope(exit) if (exists(srcDir.toString)) rmdirRecurse(srcDir.toString);
-            mkdirRecurse(srcDir.toString);
-            write((srcDir ~ "real.txt").toString, "real content");
-            symlink("circular-b.txt", (srcDir ~ "circular-a.txt").toString);
-            symlink("circular-a.txt", (srcDir ~ "circular-b.txt").toString);
+            auto srcDir = Path.current().join(testDataDir, "circular-sym-src");
+            scope(exit) if (srcDir.exists) srcDir.remove();
+            srcDir.mkdir(true);
+            (srcDir ~ "real.txt").writeFile("real content");
+            Path("circular-b.txt").symlink(srcDir ~ "circular-a.txt");
+            Path("circular-a.txt").symlink(srcDir ~ "circular-b.txt");
             auto tmpZip = "test-data/test-tree-circular.zip";
-            scope(exit) if (exists(tmpZip)) remove(tmpZip);
+            scope(exit) if (Path(tmpZip).exists) Path(tmpZip).remove();
             auto writer = WZip(tmpZip);
             bool threw;
             try { writer.addTree(srcDir); } catch (Exception) { threw = true; }
@@ -2694,59 +2609,56 @@ version(unittest) {
 
     version(Posix) @("extractTo: preserves execute permission by default")
     unittest {
-        import std.file : exists, rmdirRecurse, getAttributes, remove;
         import std.conv : octal;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-perm-exec.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("script.sh", cast(const(ubyte)[]) "#!/bin/sh\necho hello", octal!755);
         tw.addBuffer("data.txt",  cast(const(ubyte)[]) "just data",             octal!644);
         tw.finish();
         auto extractDir = Path(testDataDir, "perm-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        auto scriptAttrs = getAttributes((extractDir ~ "script.sh").toString);
+        auto scriptAttrs = (extractDir ~ "script.sh").getAttributes();
         assert(scriptAttrs & octal!100);
-        auto dataAttrs = getAttributes((extractDir ~ "data.txt").toString);
+        auto dataAttrs = (extractDir ~ "data.txt").getAttributes();
         assert(!(dataAttrs & octal!100));
     }
 
     version(Posix) @("extractTo: strips setuid/setgid/sticky bits")
     unittest {
-        import std.file : exists, rmdirRecurse, getAttributes, remove;
         import std.conv : octal;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-perm-dangerous.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("setuid.sh", cast(const(ubyte)[]) "#!/bin/sh", octal!4755);
         tw.addBuffer("setgid.sh", cast(const(ubyte)[]) "#!/bin/sh", octal!2755);
         tw.finish();
         auto extractDir = Path(testDataDir, "perm-dangerous-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        auto attrs1 = getAttributes((extractDir ~ "setuid.sh").toString);
+        auto attrs1 = (extractDir ~ "setuid.sh").getAttributes();
         assert(attrs1 & octal!100);
         assert(!(attrs1 & octal!4000));
-        auto attrs2 = getAttributes((extractDir ~ "setgid.sh").toString);
+        auto attrs2 = (extractDir ~ "setgid.sh").getAttributes();
         assert(attrs2 & octal!100);
         assert(!(attrs2 & octal!2000));
     }
 
     version(Posix) @("extractTo: caps group/other write bits")
     unittest {
-        import std.file : exists, rmdirRecurse, getAttributes, remove;
         import std.conv : octal;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpTar = "test-data/test-perm-cap.tar";
-        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
         auto tw = tarWriter(tmpTar);
         scope(exit) tw.close();
         tw.addBuffer("world-writable.txt", cast(const(ubyte)[]) "data",       octal!666);
@@ -2755,18 +2667,18 @@ version(unittest) {
         tw.addBuffer("owner-only.sh",       cast(const(ubyte)[]) "#!/bin/sh", octal!700);
         tw.finish();
         auto extractDir = Path(testDataDir, "perm-cap-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         reader.extractTo(extractDir);
-        auto a1 = getAttributes((extractDir ~ "world-writable.txt").toString);
+        auto a1 = (extractDir ~ "world-writable.txt").getAttributes();
         assert(!(a1 & octal!20)); assert(!(a1 & octal!2)); assert(a1 & octal!400);
-        auto a2 = getAttributes((extractDir ~ "full-perm.sh").toString);
+        auto a2 = (extractDir ~ "full-perm.sh").getAttributes();
         assert(a2 & octal!100); assert(a2 & octal!10);
         assert(!(a2 & octal!20)); assert(!(a2 & octal!2));
-        auto a3 = getAttributes((extractDir ~ "normal.txt").toString);
+        auto a3 = (extractDir ~ "normal.txt").getAttributes();
         assert(a3 & octal!400); assert(!(a3 & octal!100));
-        auto a4 = getAttributes((extractDir ~ "owner-only.sh").toString);
+        auto a4 = (extractDir ~ "owner-only.sh").getAttributes();
         assert(a4 & octal!100); assert(!(a4 & octal!40));
     }
 
@@ -2777,9 +2689,8 @@ version(unittest) {
     @("streaming read: darkArchiveReader(tarGz, range) reads entries correctly")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : read;
         import darkarchive.datasource : byChunks;
-        auto compressed = cast(const(ubyte)[]) read(testDataDir ~ "/test.tar.gz");
+        auto compressed = cast(const(ubyte)[]) Path(testDataDir ~ "/test.tar.gz").readFile();
         auto reader = darkArchiveReader!(DarkArchiveFormat.tarGz)(byChunks(compressed, 4096));
         scope(exit) reader.close();
         bool found;
@@ -2797,12 +2708,11 @@ version(unittest) {
     @("streaming read: darkArchiveReader(tar, range) reads entries correctly")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : read, write, remove, exists;
         import darkarchive.datasource : byChunks;
         auto tarPath = testDataDir ~ "/test-stream-src.tar";
-        scope(exit) if (exists(tarPath)) remove(tarPath);
+        scope(exit) if (Path(tarPath).exists) Path(tarPath).remove();
         WTar(tarPath).addBuffer("hello.txt", cast(const(ubyte)[]) "stream content").finish();
-        auto raw = cast(const(ubyte)[]) read(tarPath);
+        auto raw = cast(const(ubyte)[]) Path(tarPath).readFile();
         auto reader = darkArchiveReader!(DarkArchiveFormat.tar)(byChunks(raw, 512));
         scope(exit) reader.close();
         bool found;
@@ -2820,7 +2730,6 @@ version(unittest) {
     @("streaming write: darkArchiveWriter(tar, DelegateSink) produces readable TAR")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : write, remove, exists;
         import darkarchive.datasource : DelegateSink;
         ubyte[] buf;
         darkArchiveWriter!(DarkArchiveFormat.tar)(
@@ -2828,8 +2737,8 @@ version(unittest) {
             .addBuffer("hello.txt", cast(const(ubyte)[]) "sink content")
             .finish();
         auto tmpPath = testDataDir ~ "/test-sink-tar.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        write(tmpPath, buf);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(buf);
         auto reader = RTar(tmpPath);
         scope(exit) reader.close();
         bool found;
@@ -2847,7 +2756,6 @@ version(unittest) {
     @("streaming write: darkArchiveWriter(tarGz, DelegateSink) produces readable TAR.GZ")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.file : write, remove, exists;
         import darkarchive.datasource : DelegateSink;
         ubyte[] buf;
         darkArchiveWriter!(DarkArchiveFormat.tarGz)(
@@ -2855,8 +2763,8 @@ version(unittest) {
             .addBuffer("hello.txt", cast(const(ubyte)[]) "gzip sink content")
             .finish();
         auto tmpPath = testDataDir ~ "/test-sink-tar.tar.gz";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
-        write(tmpPath, buf);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        Path(tmpPath).writeFile(buf);
         auto reader = RTarGz(tmpPath);
         scope(exit) reader.close();
         bool found;
@@ -2878,10 +2786,9 @@ version(unittest) {
     @("streaming write: TAR to file does not accumulate memory")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
-        import std.file : exists, remove, getSize;
         import core.memory : GC;
         auto outPath = Path(testDataDir, "mem-write-test.tar");
-        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+        scope(exit) if (outPath.exists) outPath.remove();
         auto chunk = new ubyte[](64 * 1024);
         GC.collect();
         auto memBefore = GC.stats.usedSize;
@@ -2896,16 +2803,15 @@ version(unittest) {
         auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
         assert(growth < 2 * 1024 * 1024,
             "TAR write: memory grew by " ~ formatMemSize(growth));
-        assert(exists(outPath.toString));
-        assert(getSize(outPath.toString) > 4 * 1024 * 1024);
+        assert(outPath.exists);
+        assert(outPath.getSize() > 4 * 1024 * 1024);
     }
 
     @("streaming write: ZIP to file does not accumulate memory")
     unittest {
-        import std.file : exists, remove, getSize;
         import core.memory : GC;
         auto outPath = Path(testDataDir, "mem-write-test.zip");
-        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+        scope(exit) if (outPath.exists) outPath.remove();
         auto chunk = new ubyte[](64 * 1024);
         GC.collect();
         auto memBefore = GC.stats.usedSize;
@@ -2920,16 +2826,15 @@ version(unittest) {
         auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
         assert(growth < 2 * 1024 * 1024,
             "ZIP write: memory grew by " ~ formatMemSize(growth));
-        assert(exists(outPath.toString));
-        assert(getSize(outPath.toString) > 0);
+        assert(outPath.exists);
+        assert(outPath.getSize() > 0);
     }
 
     @("streaming write: TAR.GZ to file does not accumulate memory")
     unittest {
-        import std.file : exists, remove, getSize;
         import core.memory : GC;
         auto outPath = Path(testDataDir, "mem-write-test.tar.gz");
-        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+        scope(exit) if (outPath.exists) outPath.remove();
         auto chunk = new ubyte[](64 * 1024);
         GC.collect();
         auto memBefore = GC.stats.usedSize;
@@ -2944,16 +2849,15 @@ version(unittest) {
         auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
         assert(growth < 2 * 1024 * 1024,
             "TAR.GZ write: memory grew by " ~ formatMemSize(growth));
-        assert(exists(outPath.toString));
-        assert(getSize(outPath.toString) > 0);
+        assert(outPath.exists);
+        assert(outPath.getSize() > 0);
     }
 
     @("streaming write: TAR round-trip via streaming write")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove;
         auto outPath = Path(testDataDir, "stream-write-roundtrip.tar");
-        scope(exit) if (exists(outPath.toString)) remove(outPath.toString);
+        scope(exit) if (outPath.exists) outPath.remove();
         WTar(outPath)
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello!")
             .addBuffer("world.txt", cast(const(ubyte)[]) "World!")
@@ -2971,10 +2875,9 @@ version(unittest) {
 
     @("streaming: TAR addStream with known size does not buffer full entry")
     unittest {
-        import std.file : exists, remove, getSize;
         import core.memory : GC;
         auto outPath = "test-data/mem-addstream-tar.tar";
-        scope(exit) if (exists(outPath)) remove(outPath);
+        scope(exit) if (Path(outPath).exists) Path(outPath).remove();
         enum ENTRY_SIZE = 4 * 1024 * 1024;
         auto chunk = new ubyte[](8192);
         foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
@@ -2990,15 +2893,14 @@ version(unittest) {
         auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
         assert(growth < 2 * 1024 * 1024,
             "TAR addStream(known size): memory grew by " ~ formatMemSize(growth));
-        assert(getSize(outPath) > ENTRY_SIZE);
+        assert(Path(outPath).getSize() > ENTRY_SIZE);
     }
 
     @("streaming: ZIP addStream with known size does not buffer full entry")
     unittest {
-        import std.file : exists, remove, getSize;
         import core.memory : GC;
         auto outPath = "test-data/mem-addstream-zip.zip";
-        scope(exit) if (exists(outPath)) remove(outPath);
+        scope(exit) if (Path(outPath).exists) Path(outPath).remove();
         enum ENTRY_SIZE = 4 * 1024 * 1024;
         auto chunk = new ubyte[](8192);
         foreach (i, ref b; chunk) b = cast(ubyte)(i & 0xFF);
@@ -3014,6 +2916,6 @@ version(unittest) {
         auto growth = memAfter > memBefore ? memAfter - memBefore : 0;
         assert(growth < 2 * 1024 * 1024,
             "ZIP addStream(known size): memory grew by " ~ formatMemSize(growth));
-        assert(getSize(outPath) > 0);
+        assert(Path(outPath).getSize() > 0);
     }
 }

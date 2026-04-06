@@ -465,6 +465,7 @@ private long unixTimeToStdTime(long unixTime) pure nothrow @nogc {
 // Unit tests
 // ===========================================================================
 
+version(unittest) import thepath : Path;
 version(unittest) {
 
     private immutable testDataDir = "test-data";
@@ -542,13 +543,12 @@ version(unittest) {
     @("tar security: non-tar data does not crash")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import std.file : exists, remove, write;
         auto tmpPath = "test-data/test-tarr-garbage.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto garbage = cast(const(ubyte)[]) "this is not a tar file";
         auto padded = new ubyte[](1024);
         padded[0 .. garbage.length] = garbage[];
-        write(tmpPath, padded);
+        Path(tmpPath).writeFile(padded);
         auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         int count;
@@ -560,19 +560,18 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-trunc-src.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "some content here");
         writer.finish();
 
-        auto fullData = cast(ubyte[]) read(tmpPath);
+        auto fullData = cast(ubyte[]) Path(tmpPath).readFile();
         auto truncated = fullData[0 .. 512 + 5];
         auto corruptPath = "test-data/test-tarr-trunc.tar";
-        scope(exit) if (exists(corruptPath)) remove(corruptPath);
-        write(corruptPath, truncated);
+        scope(exit) if (Path(corruptPath).exists) Path(corruptPath).remove();
+        Path(corruptPath).writeFile(truncated);
 
         auto reader = tarReader(corruptPath);
         scope(exit) reader.close();
@@ -618,12 +617,11 @@ version(unittest) {
     @("tar security: garbage header rejected by checksum")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        import std.file : exists, remove, write;
         auto tmpPath = "test-data/test-tarr-badchecksum.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         ubyte[512] header;
         foreach (i, ref b; header) b = cast(ubyte)((i * 37 + 13) & 0xFF);
-        write(tmpPath, header[]);
+        Path(tmpPath).writeFile(header[]);
 
         auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
@@ -640,9 +638,8 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-exact512.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto data = new ubyte[](512);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
 
@@ -668,9 +665,8 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-over512.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto data = new ubyte[](513);
         foreach (i, ref b; data) b = cast(ubyte)(i & 0xFF);
 
@@ -695,9 +691,8 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-onebyte.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("one.bin", [cast(ubyte) 0x42]);
@@ -732,9 +727,8 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-emptyname.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("", cast(const(ubyte)[]) "no name");
@@ -775,15 +769,14 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-hugesize-src.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("small.txt", cast(const(ubyte)[]) "tiny");
         writer.finish();
 
-        auto data = cast(ubyte[]) read(tmpPath);
+        auto data = cast(ubyte[]) Path(tmpPath).readFile();
         data[124 .. 136] = cast(ubyte[12]) "77777777777\0";
         uint sum = 0;
         foreach (i; 0 .. 512) {
@@ -794,8 +787,8 @@ version(unittest) {
         auto checksumStr = format!"%06o\0 "(sum);
         data[148 .. 156] = cast(ubyte[8]) checksumStr[0 .. 8];
         auto corruptPath = "test-data/test-tarr-hugesize.tar";
-        scope(exit) if (exists(corruptPath)) remove(corruptPath);
-        write(corruptPath, data);
+        scope(exit) if (Path(corruptPath).exists) Path(corruptPath).remove();
+        Path(corruptPath).writeFile(data);
 
         auto reader = tarReader(corruptPath);
         scope(exit) reader.close();
@@ -812,9 +805,8 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove;
         auto tmpPath = "test-data/test-tarr-zerosize.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("zero.txt", cast(const(ubyte)[]) "");
@@ -834,9 +826,8 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-corrupt-src.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer
@@ -844,14 +835,14 @@ version(unittest) {
             .addBuffer("file2.txt", cast(const(ubyte)[]) "content 2");
         writer.finish();
 
-        auto data = cast(ubyte[]) read(tmpPath);
+        auto data = cast(ubyte[]) Path(tmpPath).readFile();
         // Corrupt the checksum bytes of the SECOND header (at offset 1024)
         assert(data.length > 1024 + 156);
         data[1024 + 148] = 0xFF;
         data[1024 + 149] = 0xFF;
         auto corruptPath = "test-data/test-tarr-corrupt-mid.tar";
-        scope(exit) if (exists(corruptPath)) remove(corruptPath);
-        write(corruptPath, data);
+        scope(exit) if (Path(corruptPath).exists) Path(corruptPath).remove();
+        Path(corruptPath).writeFile(data);
 
         // First entry is valid, second has bad checksum → must throw, not silently stop.
         auto reader = tarReader(corruptPath);
@@ -872,7 +863,6 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
         import darkarchive.exception : DarkArchiveException;
-        import std.file : exists, remove, write;
         import std.conv : octal;
 
         // PAX record: "29 size=18446744073709551615\n"
@@ -924,13 +914,13 @@ version(unittest) {
         eoar[] = 0;
 
         auto tmpPath = "test-data/test-tarr-pax-overflow.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         ubyte[] archiveData;
         archiveData ~= paxHdr[];
         archiveData ~= paxDataBlock[];
         archiveData ~= fileHdr[];
         archiveData ~= eoar[];
-        write(tmpPath, archiveData);
+        Path(tmpPath).writeFile(archiveData);
 
         // The PAX 'size' attribute = ulong.max → paddedSize calculation overflows.
         // Our fix should throw DarkArchiveException instead of wrapping around.
@@ -970,20 +960,19 @@ version(unittest) {
     @("tar fuzz: systematic truncation sweep — only DarkArchiveException escapes")
     unittest {
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove, read;
         import std.range : only;
         import std.conv : to;
 
         // Build a minimal 2-entry archive (~2KB)
         auto tmpPath = "test-data/test-tarr-fuzz-src.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("a.txt", cast(const(ubyte)[]) "hello")
             .addBuffer("b.txt", cast(const(ubyte)[]) "world");
         writer.finish();
-        auto fullBytes = cast(ubyte[]) read(tmpPath);
+        auto fullBytes = cast(ubyte[]) Path(tmpPath).readFile();
 
         // Sweep every prefix length: 0 .. fullBytes.length - 1
         foreach (len; 0 .. fullBytes.length) {
@@ -1004,7 +993,6 @@ version(unittest) {
     @("tar fuzz: unknown typeflag treated as regular file, no crash")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove, write;
         import std.format : format;
 
         // Build a TAR header with an unusual but not PAX typeflag ('S', 'V', 'N', etc.)
@@ -1029,11 +1017,11 @@ version(unittest) {
             eoar[] = 0;
 
             auto tmpPath = "test-data/test-tarr-fuzz-typeflag.tar";
-            scope(exit) if (exists(tmpPath)) remove(tmpPath);
+            scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
             ubyte[] data;
             data ~= hdr[];
             data ~= eoar[];
-            write(tmpPath, data);
+            Path(tmpPath).writeFile(data);
 
             auto reader = tarReader(tmpPath);
             scope(exit) reader.close();
@@ -1051,7 +1039,6 @@ version(unittest) {
     @("tar security: PAX global header only applies to next entry, not accumulated")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove, write;
         import std.format : format;
         import std.conv : to;
 
@@ -1101,7 +1088,7 @@ version(unittest) {
         eoar[] = 0;
 
         auto tmpPath = "test-data/test-tarr-fuzz-global.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         ubyte[] archiveData;
         archiveData ~= globalHdr[];
         archiveData ~= globalData[];
@@ -1110,7 +1097,7 @@ version(unittest) {
         archiveData ~= file2Hdr[];
         archiveData ~= file2Data[];
         archiveData ~= eoar[];
-        write(tmpPath, archiveData);
+        Path(tmpPath).writeFile(archiveData);
 
         auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
@@ -1130,7 +1117,6 @@ version(unittest) {
     @("tar security: consecutive PAX extended headers — first attrs apply to second header block")
     unittest {
         import unit_threaded.assertions : shouldEqual;
-        import std.file : exists, remove, write;
         import std.format : format;
 
         // Build: PAX-x1 (path=from_first) → PAX-x2 data → file header → data → eoar
@@ -1186,7 +1172,7 @@ version(unittest) {
         eoar[] = 0;
 
         auto tmpPath = "test-data/test-tarr-fuzz-consec-pax.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         ubyte[] archiveData;
         archiveData ~= pax1Hdr[];
         archiveData ~= pax1Data[];
@@ -1195,7 +1181,7 @@ version(unittest) {
         archiveData ~= fileHdr[];
         archiveData ~= fileData[];
         archiveData ~= eoar[];
-        write(tmpPath, archiveData);
+        Path(tmpPath).writeFile(archiveData);
 
         // This documents current behavior: the reader treats the second PAX header
         // as the actual file header (typeflag 'x' → default → EntryType.file).
@@ -1219,10 +1205,9 @@ version(unittest) {
     unittest {
         import unit_threaded.assertions : shouldBeTrue, shouldEqual;
         import darkarchive.formats.tar.writer : tarWriter;
-        import std.file : exists, remove;
 
         auto tmpPath = "test-data/test-tarr-maxbytes.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto tw = tarWriter(tmpPath);
         scope(exit) tw.close();
@@ -1273,18 +1258,17 @@ version(unittest) {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
         import darkarchive.datasource : chunkSource;
-        import std.file : exists, remove, read;
         import std.range : only;
 
         auto tmpPath = "test-data/test-tarr-range.tar";
-        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
         auto writer = tarWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("range.txt", cast(const(ubyte)[]) "range content");
         writer.finish();
 
-        auto tarBytes = cast(ubyte[]) read(tmpPath);
+        auto tarBytes = cast(ubyte[]) Path(tmpPath).readFile();
         auto reader = tarReader(only(cast(const(ubyte)[]) tarBytes));
 
         bool found;
