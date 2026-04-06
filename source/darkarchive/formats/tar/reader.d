@@ -116,6 +116,7 @@ struct TarReader(R) if (isTarStream!R) {
     static struct EntryRange {
         private TarReader!R* _reader;
         private bool _done;
+        private bool _seenEntry;   /// true after the first valid entry is found
         private size_t _pendingSkip;
 
         this(TarReader!R* reader) {
@@ -160,6 +161,9 @@ struct TarReader(R) if (isTarStream!R) {
                 }
 
                 if (!verifyChecksum(headerBuf[])) {
+                    if (_seenEntry)
+                        throw new DarkArchiveException(
+                            "TAR: header checksum mismatch (corrupted or truncated archive)");
                     _done = true;
                     return;
                 }
@@ -169,6 +173,8 @@ struct TarReader(R) if (isTarStream!R) {
                 if (entrySize < 0) entrySize = 0;
 
                 auto dataSize = cast(size_t) entrySize;
+                if (dataSize > size_t.max - (TAR_BLOCK_SIZE - 1))
+                    throw new DarkArchiveException("TAR: entry size too large");
                 auto paddedSize = (dataSize + TAR_BLOCK_SIZE - 1)
                     / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE;
 
@@ -204,15 +210,23 @@ struct TarReader(R) if (isTarStream!R) {
                     entrySize = parseOctal(headerBuf[124 .. 136]);
                     if (entrySize < 0) entrySize = 0;
                     dataSize = cast(size_t) entrySize;
+                    if (dataSize > size_t.max - (TAR_BLOCK_SIZE - 1))
+                        throw new DarkArchiveException("TAR: entry size too large");
                     paddedSize = (dataSize + TAR_BLOCK_SIZE - 1)
                         / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE;
 
                     _reader._currentEntry = parseHeader(headerBuf[]);
                     applyPaxAttrs(_reader._currentEntry, paxAttrs);
                     if (auto s = "size" in paxAttrs) {
-                        import std.conv : to;
-                        dataSize = (*s).to!size_t;
-                        _reader._currentEntry.size = (*s).to!long;
+                        import std.conv : to, ConvOverflowException;
+                        try { dataSize = (*s).to!size_t; }
+                        catch (ConvOverflowException)
+                            { throw new DarkArchiveException("TAR: PAX size value too large"); }
+                        // size field in the entry is signed long; clamp if needed.
+                        _reader._currentEntry.size =
+                            dataSize > long.max ? long.max : cast(long) dataSize;
+                        if (dataSize > size_t.max - (TAR_BLOCK_SIZE - 1))
+                            throw new DarkArchiveException("TAR: PAX size too large");
                         paddedSize = (dataSize + TAR_BLOCK_SIZE - 1)
                             / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE;
                     }
@@ -225,6 +239,7 @@ struct TarReader(R) if (isTarStream!R) {
                 _reader._dataConsumed = false;
                 _pendingSkip = paddedSize > dataSize ? paddedSize - dataSize : 0;
 
+                _seenEntry = true;
                 _reader._hasEntry = true;
                 return;
             }
@@ -364,7 +379,10 @@ private string[string] parsePaxData(const(ubyte)[] data) {
 
         auto eqIdx = indexOf(record, '=');
         if (eqIdx >= 0) {
-            auto key = record[0 .. eqIdx].idup;
+            auto key   = record[0 .. eqIdx].idup;
+            // Preserve the raw value including any embedded NUL bytes.
+            // NUL in a PAX value is malicious/corrupt, but rejection happens
+            // at extraction time (extractToImpl) where the caller can act on it.
             auto value = record[eqIdx + 1 .. $].idup;
             result[key] = value;
         }
@@ -801,9 +819,9 @@ version(unittest) {
         }
     }
 
-    @("tar security: corrupted header mid-archive throws")
+    @("tar security: corrupted header mid-archive throws DarkArchiveException")
     unittest {
-        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
+        import unit_threaded.assertions : shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
         import std.file : exists, remove, read, write;
         auto tmpPath = "test-data/test-tarr-corrupt-src.tar";
@@ -816,19 +834,122 @@ version(unittest) {
         writer.finish();
 
         auto data = cast(ubyte[]) read(tmpPath);
-        if (data.length > 1024 + 156) {
-            data[1024 + 148] = 0xFF;
-            data[1024 + 149] = 0xFF;
-        }
+        // Corrupt the checksum bytes of the SECOND header (at offset 1024)
+        assert(data.length > 1024 + 156);
+        data[1024 + 148] = 0xFF;
+        data[1024 + 149] = 0xFF;
         auto corruptPath = "test-data/test-tarr-corrupt-mid.tar";
         scope(exit) if (exists(corruptPath)) remove(corruptPath);
         write(corruptPath, data);
 
+        // First entry is valid, second has bad checksum → must throw, not silently stop.
         auto reader = tarReader(corruptPath);
         scope(exit) reader.close();
+        bool caught;
         int count;
-        foreach (entry; reader.entries) count++;
-        count.shouldEqual(1);
+        try {
+            foreach (entry; reader.entries) {
+                count++;
+                reader.skipData();
+            }
+        } catch (DarkArchiveException) { caught = true; }
+        assert(count == 1, "should have seen exactly one valid entry before corruption");
+        caught.shouldBeTrue;
+    }
+
+    @("tar security: pax size near size_t.max throws overflow check")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.exception : DarkArchiveException;
+        import std.file : exists, remove, write;
+        import std.conv : octal;
+
+        // PAX record: "29 size=18446744073709551615\n"
+        // length = 2 + 1 + 26 = 29 bytes ✓  (ulong.max as decimal)
+        auto paxContent = cast(ubyte[]) "29 size=18446744073709551615\n";
+        assert(paxContent.length == 29);
+
+        // Build PAX extended header block (typeflag 'x')
+        ubyte[TAR_BLOCK_SIZE] paxHdr;
+        paxHdr[] = 0;
+        paxHdr[0 .. 9] = cast(ubyte[9]) "PaxHeader";
+        paxHdr[156] = 'x';
+        paxHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        paxHdr[263 .. 265] = cast(ubyte[2]) "00";
+        // permissions = 0644, size = 29, mtime = 0
+        paxHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        // size = 29 decimal = 035 octal → "0000000035\0" (12-byte field)
+        paxHdr[124 .. 136] = cast(ubyte[12]) "00000000035\0";
+        paxHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        // Compute checksum
+        uint cs = 0;
+        foreach (i, b; paxHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        import std.format : format;
+        auto csStr = format!"%06o\0 "(cs);
+        paxHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        // PAX data block
+        ubyte[TAR_BLOCK_SIZE] paxDataBlock;
+        paxDataBlock[] = 0;
+        paxDataBlock[0 .. 29] = paxContent[];
+
+        // Regular file header (name "a.txt", typeflag '0', size=0)
+        ubyte[TAR_BLOCK_SIZE] fileHdr;
+        fileHdr[] = 0;
+        fileHdr[0 .. 5] = cast(ubyte[5]) "a.txt";
+        fileHdr[156] = '0';
+        fileHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        fileHdr[263 .. 265] = cast(ubyte[2]) "00";
+        fileHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        fileHdr[124 .. 136] = cast(ubyte[12]) "00000000000\0";
+        fileHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        cs = 0;
+        foreach (i, b; fileHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        csStr = format!"%06o\0 "(cs);
+        fileHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        // End-of-archive
+        ubyte[TAR_BLOCK_SIZE * 2] eoar;
+        eoar[] = 0;
+
+        auto tmpPath = "test-data/test-tarr-pax-overflow.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        ubyte[] archiveData;
+        archiveData ~= paxHdr[];
+        archiveData ~= paxDataBlock[];
+        archiveData ~= fileHdr[];
+        archiveData ~= eoar[];
+        write(tmpPath, archiveData);
+
+        // The PAX 'size' attribute = ulong.max → paddedSize calculation overflows.
+        // Our fix should throw DarkArchiveException instead of wrapping around.
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { foreach (entry; reader.entries) {} }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("tar security: pax path value with NUL byte is preserved (throw at extract time)")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        // parsePaxData preserves NUL bytes in values.
+        // Rejection of such entries happens in extractToImpl, not here, so
+        // callers can still list / inspect the archive before deciding to extract.
+        // "18 path=evil\0safe\n" — 18 bytes total ✓
+        immutable ubyte[] paxData = [
+            '1','8',' ','p','a','t','h','=','e','v','i','l',
+            0, 's','a','f','e','\n'
+        ];
+        assert(paxData.length == 18);
+        auto attrs = parsePaxData(paxData);
+        assert("path" in attrs, "path key should be present");
+        // Full value is preserved including the NUL character.
+        assert(attrs["path"].length == 9);          // "evil\0safe" = 9 chars
+        assert(attrs["path"][4] == '\0');            // NUL at position 4
+        assert(attrs["path"][0 .. 4] == "evil");
+        assert(attrs["path"][5 .. $] == "safe");
     }
 
     // -------------------------------------------------------------------

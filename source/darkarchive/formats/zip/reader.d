@@ -124,7 +124,7 @@ struct ZipReader {
     /// incrementally across all chunks.
     void readDataChunked(size_t index,
                           scope void delegate(const(ubyte)[] chunk) sink,
-                          size_t chunkSize = 8192) {
+                          size_t chunkSize = 65536) {
         if (index >= _entries.length)
             throw new DarkArchiveException("ZIP: entry index out of bounds");
         auto ci = &_entries[index];
@@ -377,6 +377,8 @@ private T readLEStatic(T)(const(ubyte)[] data, size_t offset) {
 }
 
 /// Decode a filename from raw bytes, using UTF-8 flag or fallback.
+/// NUL bytes are preserved — rejection of NUL-containing names happens
+/// at extraction time (extractToImpl) so callers can still list entries.
 private string decodeFilename(const(ubyte)[] bytes, ushort flags) {
     if (bytes.length == 0)
         return "";

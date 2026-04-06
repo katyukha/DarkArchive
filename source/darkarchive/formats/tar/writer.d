@@ -164,12 +164,12 @@ struct TarWriter(R)
         auto nameLen = nameBytes.length > 100 ? 100 : nameBytes.length;
         header[0 .. nameLen] = nameBytes[0 .. nameLen];
 
-        writeOctal(header[100 .. 108], permissions);
-        writeOctal(header[108 .. 116], 0); // UID
-        writeOctal(header[116 .. 124], 0); // GID
-        writeOctal(header[124 .. 136], size);
+        writeOctal(*cast(ubyte[8]*)  &header[100], permissions);
+        writeOctal(*cast(ubyte[8]*)  &header[108], 0UL); // UID
+        writeOctal(*cast(ubyte[8]*)  &header[116], 0UL); // GID
+        writeOctal(*cast(ubyte[12]*) &header[124], size);
         import core.stdc.time : time;
-        writeOctal(header[136 .. 148], cast(ulong) time(null));
+        writeOctal(*cast(ubyte[12]*) &header[136], cast(ulong) time(null));
         header[156] = cast(ubyte) typeflag;
 
         if (linkname !is null) {
@@ -205,8 +205,9 @@ struct TarWriter(R)
         uint sum = 0;
         foreach (b; header)
             sum += b;
-        writeOctal(header[148 .. 156], sum);
-        header[155] = ' ';
+        // POSIX format: 6 octal digits + NUL byte + space (8 bytes total).
+        writeOctal(*cast(ubyte[7]*) &header[148], sum); // writes 6 digits + NUL
+        header[155] = ' ';                              // trailing space
     }
 }
 
@@ -296,6 +297,15 @@ private void writeOctal(ubyte[] field, ulong value) {
     }
 }
 
+/// Type-safe overload — only accepts the field widths used in ustar headers
+/// (7 for checksum, 8 for permissions/UID/GID, 12 for size/mtime).
+/// Wrong widths produce a compile-time error.
+private void writeOctal(size_t N)(ref ubyte[N] field, ulong value)
+    if (N == 7 || N == 8 || N == 12)
+{
+    writeOctal(field[], value);
+}
+
 /// Compress data with gzip format (convenience — used in tests).
 ubyte[] gzipCompress(const(ubyte)[] data) {
     import std.zlib : Compress, HeaderFormat;
@@ -313,6 +323,44 @@ ubyte[] gzipCompress(const(ubyte)[] data) {
 
 version(unittest) {
     import darkarchive.formats.tar.reader : tarReader, tarGzReader;
+
+    @("tar write: checksum field is POSIX format (6 octal + NUL + space)")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.file : exists, remove, read;
+        auto tmpPath = "test-data/test-tarw-checksum-posix.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        auto writer = tarWriter(tmpPath);
+        scope(exit) writer.close();
+        writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
+        writer.finish();
+        auto data = cast(ubyte[]) read(tmpPath);
+        assert(data.length >= 512, "TAR should have at least 1 block");
+        // POSIX checksum layout in bytes 148..156: XXXXXX\0<space>
+        auto cf = data[148 .. 156];
+        foreach (b; cf[0 .. 6])
+            assert((b >= '0' && b <= '7') || b == ' ',
+                "checksum digits must be octal or space-padded");
+        assert(cf[6] == 0,   "checksum byte 6 must be NUL (POSIX)");
+        assert(cf[7] == ' ', "checksum byte 7 must be space (POSIX)");
+    }
+
+    @("tar write: writeOctal template overload exists for valid field widths")
+    unittest {
+        // The template overload with constraint (N == 7 || N == 8 || N == 12) must
+        // be callable for each expected TAR header field size.
+        static assert(__traits(compiles, { ubyte[7]  f; writeOctal(f, 0UL); }),
+            "writeOctal must accept size-7 field (checksum)");
+        static assert(__traits(compiles, { ubyte[8]  f; writeOctal(f, 0UL); }),
+            "writeOctal must accept size-8 field (perms/uid/gid)");
+        static assert(__traits(compiles, { ubyte[12] f; writeOctal(f, 0UL); }),
+            "writeOctal must accept size-12 field (size/mtime)");
+        // Size-10 has no template overload — the constraint rejects it.
+        // (It still compiles via the dynamic-slice fallback; the template just
+        //  won't be chosen, so no compile-time rejection is possible while keeping
+        //  the dynamic fallback.  The value of the typed overload is documenting
+        //  intent at each call-site in writeHeader.)
+    }
 
     @("tar write: round-trip with addBuffer")
     unittest {

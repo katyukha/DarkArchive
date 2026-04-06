@@ -460,6 +460,14 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
 
             auto entryPath = params.destPath;
 
+            // NUL bytes in filenames are never valid — reject unconditionally
+            // regardless of securePaths flag.  Detection here (not at open/read
+            // time) lets callers still list or inspect entries before extracting.
+            foreach (c; entryPath)
+                if (c == '\0')
+                    throw new DarkArchiveException(
+                        "Refusing to extract entry: filename contains NUL byte");
+
             if (flags & DarkExtractFlags.securePaths) {
                 if (entryPath.length > 0 && entryPath[0] == '/')
                     throw new DarkArchiveException(
@@ -1669,21 +1677,223 @@ version(unittest) {
     }
 
     // -------------------------------------------------------------------
+    // ExtractionLimits tests — TAR
+    // -------------------------------------------------------------------
+
+    @("limits: TAR maxEntries throws when exceeded")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        auto tmpPath = "test-data/test-limits-tar-entries.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        WTar(tmpPath)
+            .addBuffer("a.txt", cast(const(ubyte)[]) "A")
+            .addBuffer("b.txt", cast(const(ubyte)[]) "B")
+            .addBuffer("c.txt", cast(const(ubyte)[]) "C")
+            .finish();
+
+        auto extractDir = Path(testDataDir, "limits-tar-entries-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                               ExtractionLimits(ulong.max, ulong.max, 2)); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("limits: TAR maxEntryBytes throws when exceeded")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        auto tmpPath = "test-data/test-limits-tar-entrybytes.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        WTar(tmpPath)
+            .addBuffer("big.bin", new ubyte[](1024))
+            .finish();
+
+        auto extractDir = Path(testDataDir, "limits-tar-entrybytes-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                               ExtractionLimits(ulong.max, 512, ulong.max)); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("limits: TAR maxTotalBytes throws when exceeded")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+
+        auto tmpPath = "test-data/test-limits-tar-totalbytes.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+        WTar(tmpPath)
+            .addBuffer("a.bin", new ubyte[](512))
+            .addBuffer("b.bin", new ubyte[](512))
+            .finish();
+
+        auto extractDir = Path(testDataDir, "limits-tar-totalbytes-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults,
+                               ExtractionLimits(768, ulong.max, ulong.max)); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
     // Creative attack vector tests
     // -------------------------------------------------------------------
 
-    @("attack: null byte in filename")
+    @("attack: null byte in ZIP filename — archive listable, extraction throws")
     unittest {
+        import unit_threaded.assertions : shouldBeTrue;
         import std.file : exists, rmdirRecurse, remove;
         auto tmpPath = "test-data/test-atk-null-byte.zip";
         scope(exit) if (exists(tmpPath)) remove(tmpPath);
         WZip(tmpPath).addBuffer("safe.txt\x00hidden", cast(const(ubyte)[]) "trick").finish();
-        auto extractDir = Path(testDataDir, "sec-null-byte-test");
-        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+
+        // Archive can be opened and entries listed — NUL preserved in pathname.
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
-        reader.extractTo(extractDir);
-        assert(!exists((extractDir ~ "hidden").toString));
+        string foundName;
+        foreach (entry; reader.entries) { foundName = entry.pathname; reader.skipData(); }
+        assert(foundName.length > 0 && foundName[8] == '\0',
+            "entry.pathname should contain the NUL byte");
+
+        // Extraction must throw — NUL in path is rejected unconditionally.
+        auto extractDir = Path(testDataDir, "sec-null-byte-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader2 = RZip(tmpPath);
+        scope(exit) reader2.close();
+        bool caught;
+        try { reader2.extractTo(extractDir); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+        assert(!exists((extractDir ~ "hidden").toString), "hidden must not be written");
+    }
+
+    @("attack: NUL in TAR header name field is truncated (fixed-width C-string convention)")
+    unittest {
+        // Fixed-width TAR header name fields use the C-string convention: NUL is
+        // the field terminator.  parseString already stops at NUL — this is
+        // correct, not a silent failure.  Variable-length PAX paths that contain
+        // NUL are rejected at extraction time (see reader.d unit tests for that).
+        import unit_threaded.assertions : shouldEqual;
+        import std.file : exists, remove, read, write;
+        import darkarchive.formats.tar.writer : tarWriter;
+        import darkarchive.formats.tar.reader : tarReader;
+        import std.format : format;
+
+        auto tmpTar = "test-data/test-atk-null-hdr.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addBuffer("safe.txt", cast(const(ubyte)[]) "content");
+        tw.finish();
+
+        // Inject NUL at position 4: "safe.txt" → "safe\0txt", recompute checksum.
+        auto data = cast(ubyte[]) read(tmpTar);
+        assert(data.length >= 512);
+        data[4] = 0;
+        uint cs = 0;
+        foreach (i; 0 .. 512) cs += (i >= 148 && i < 156) ? ' ' : data[i];
+        auto csStr = format!"%06o\0 "(cs);
+        data[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+        write(tmpTar, data);
+
+        auto reader = tarReader(tmpTar);
+        scope(exit) reader.close();
+        string foundName;
+        foreach (entry; reader.entries) { foundName = entry.pathname; reader.skipData(); }
+        // parseString stops at NUL → "safe" (C-string convention for fixed-width fields)
+        foundName.shouldEqual("safe");
+    }
+
+    version(Posix) @("attack: NUL in TAR PAX path — archive listable, extraction throws")
+    unittest {
+        // PAX paths are variable-length strings; NUL has no defined meaning.
+        // The entry can be listed but extraction must throw.
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove, write;
+        import darkarchive.formats.tar.reader : tarReader;
+        import std.format : format;
+
+        // Craft a minimal TAR: PAX header claiming path="evil\0safe", then file.
+        // PAX record: "18 path=evil\0safe\n"
+        // LENGTH=18: 2 + 1 + "path=evil\0safe\n"(15) = 18 ✓
+        immutable ubyte[] paxContent = [
+            '1','8',' ','p','a','t','h','=','e','v','i','l',
+            0,'s','a','f','e','\n'  // 18 bytes total
+        ];
+        assert(paxContent.length == 18);
+
+        ubyte[512] paxHdr;  paxHdr[] = 0;
+        paxHdr[0..9]    = cast(ubyte[9]) "PaxHeader";
+        paxHdr[156]     = 'x';
+        paxHdr[257..263] = cast(ubyte[6]) "ustar\0";
+        paxHdr[263..265] = cast(ubyte[2]) "00";
+        paxHdr[100..108] = cast(ubyte[8]) "0000644\0";
+        // size = 18 decimal (the PAX record without the trailing pad)
+        paxHdr[124..136] = cast(ubyte[12]) "00000000022\0"; // 18 in octal = 22
+        paxHdr[136..148] = cast(ubyte[12]) "00000000000\0";
+        uint cs = 0;
+        foreach (i; 0..512) cs += (i >= 148 && i < 156) ? ' ' : paxHdr[i];
+        auto csStr = format!"%06o\0 "(cs);
+        paxHdr[148..156] = cast(ubyte[8]) csStr[0..8];
+
+        ubyte[512] paxDataBlock; paxDataBlock[] = 0;
+        paxDataBlock[0..18] = paxContent[];
+
+        ubyte[512] fileHdr; fileHdr[] = 0;
+        fileHdr[0..5]    = cast(ubyte[5]) "a.txt";
+        fileHdr[156]     = '0';
+        fileHdr[257..263] = cast(ubyte[6]) "ustar\0";
+        fileHdr[263..265] = cast(ubyte[2]) "00";
+        fileHdr[100..108] = cast(ubyte[8]) "0000644\0";
+        fileHdr[124..136] = cast(ubyte[12]) "00000000000\0";
+        fileHdr[136..148] = cast(ubyte[12]) "00000000000\0";
+        cs = 0;
+        foreach (i; 0..512) cs += (i >= 148 && i < 156) ? ' ' : fileHdr[i];
+        csStr = format!"%06o\0 "(cs);
+        fileHdr[148..156] = cast(ubyte[8]) csStr[0..8];
+
+        ubyte[1024] eoar; eoar[] = 0;
+
+        auto tmpTar = "test-data/test-atk-null-pax.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        ubyte[] archiveData;
+        archiveData ~= paxHdr[];
+        archiveData ~= paxDataBlock[];
+        archiveData ~= fileHdr[];
+        archiveData ~= eoar[];
+        write(tmpTar, archiveData);
+
+        // Listing works — entry has NUL in its pathname.
+        auto reader = tarReader(tmpTar);
+        scope(exit) reader.close();
+        string foundName;
+        foreach (entry; reader.entries) { foundName = entry.pathname; reader.skipData(); }
+        assert(foundName.length > 4 && foundName[4] == '\0',
+            "pathname should contain the NUL byte from PAX override");
+
+        // Extraction must throw.
+        auto extractDir = Path(testDataDir, "sec-null-pax-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader2 = RTar(tmpTar);
+        scope(exit) reader2.close();
+        bool caught;
+        try { reader2.extractTo(extractDir); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
     }
 
     @("attack: filename is just '.'")
