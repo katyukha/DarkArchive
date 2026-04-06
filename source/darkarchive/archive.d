@@ -209,32 +209,28 @@ private void verifyPathWithinRoot(string path, string root) {
 }
 
 private string resolveRealPath(string path) {
-    import std.path : absolutePath, buildNormalizedPath, buildPath, dirName, baseName;
-    import std.file : exists;
-    auto normalized = buildNormalizedPath(absolutePath(path));
     version(Posix) {
-        // Walk up from normalized path to find the longest existing prefix, then
-        // call Path.realPath() (POSIX realpath(3)) on it to fully resolve all
-        // chained symlinks in one call.  Any non-existent tail is appended
-        // normalised but without further symlink resolution (files not yet written).
-        string existing = normalized;
+        // toAbsolute() = buildNormalizedPath(absolutePath(expandTilde(path)))
+        auto abs = Path(path).toAbsolute();
+        Path existing = abs;
         string[] tail;
-        while (existing.length > 0 && existing != "/") {
-            if (exists(existing)) break;
-            tail = baseName(existing) ~ tail;
-            existing = dirName(existing);
+        // Walk up to the longest existing prefix: Path.realPath() (POSIX realpath(3))
+        // throws ErrnoException on non-existent paths.  Files not yet extracted
+        // won't exist, so we must find what IS on disk first.
+        while (!existing.isRoot && !existing.exists) {
+            tail = existing.baseName ~ tail;
+            existing = existing.parent;
         }
-        if (existing.length == 0 || !exists(existing))
-            return normalized;
+        if (!existing.exists)
+            return abs.toString();
         try {
-            auto realBase = Path(existing).realPath().toString();
-            if (tail.length == 0) return realBase;
-            return buildNormalizedPath(realBase, buildPath(tail));
+            auto realBase = existing.realPath();
+            return (tail.length == 0 ? realBase : realBase.join(tail)).toString();
         } catch (Exception) {
-            return normalized;
+            return abs.toString();
         }
     } else {
-        return normalized;
+        return Path(path).toAbsolute().toString();
     }
 }
 
