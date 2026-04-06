@@ -262,6 +262,11 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     @disable this(this);
 
     /// Read the full entry data into memory.
+    ///
+    /// For TAR/TAR.GZ the underlying `TarReader.readData` caps the allocation at
+    /// 256 MB by default and throws `DarkArchiveException` if the entry is larger.
+    /// Use `readChunks` for entries that may exceed that limit, or for streaming
+    /// reads of large entries without buffering them in memory.
     ubyte[] readAll() {
         static if (fmt == DarkArchiveFormat.zip)
             return cast(ubyte[]) _parent._reader.readData(_idx).dup;
@@ -471,6 +476,8 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 auto parent = fullPath.parent;
                 if (!parent.exists)
                     parent.mkdir(true);
+                if (flags & DarkExtractFlags.securePaths)
+                    verifyPathWithinRoot(parent.toString(), destStr);
                 version(Posix) {
                     Path(item.meta.symlinkTarget).symlink(fullPath);
                 } else {
@@ -512,18 +519,21 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                     parent.mkdir(true);
                 if (flags & DarkExtractFlags.securePaths)
                     verifyPathWithinRoot(parent.toString(), destStr);
-                extractEntryToFile(item.data, fullPath.toString(), limits, totalBytes);
-                applyFilePermissions(fullPath.toString(), item.meta.permissions);
+                extractEntryToFile(item.data, fullPath.toString(),
+                                   item.meta.permissions, limits, totalBytes);
             }
         }
     }
 
     private void extractEntryToFile(ref DarkArchiveItemReader!fmt dataReader,
-                                     string outPath, ExtractionLimits limits,
-                                     ref ulong totalBytes) {
+                                     string outPath, uint permissions,
+                                     ExtractionLimits limits, ref ulong totalBytes) {
         import std.stdio : File;
         import std.format : format;
         auto f = File(outPath, "wb");
+        // Apply permissions before writing so the file never exists on disk with
+        // umask-default permissions.  applyFilePermissions is a no-op on non-Posix.
+        applyFilePermissions(outPath, permissions);
         ulong entryBytes;
         dataReader.readChunks((const(ubyte)[] chunk) {
             entryBytes += chunk.length;
@@ -1528,6 +1538,49 @@ version(unittest) {
         caught.shouldBeTrue;
         assert(!(outsideDir ~ "evil.txt").exists,
             "evil.txt must not escape to the outside directory via chained symlinks");
+    }
+
+    version(Posix)
+    @("security: symlink parent resolves outside extractDir — blocked by verifyPathWithinRoot")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        // extractDir/pivot is a PRE-EXISTING symlink pointing OUTSIDE extractDir.
+        // The archive then tries to create a symlink *inside* pivot/ — the parent
+        // path of that new symlink resolves outside the root, which
+        // verifyPathWithinRoot must catch.
+        auto extractDir = Path(testDataDir, "sec-sym-parent-extract");
+        auto outsideDir = Path(testDataDir, "sec-sym-parent-outside");
+        scope(exit) {
+            if (extractDir.exists) extractDir.remove();
+            if (outsideDir.exists) outsideDir.remove();
+        }
+        extractDir.mkdir();
+        outsideDir.mkdir();
+        // Inside extractDir: pivot → ../sec-sym-parent-outside (outside)
+        Path("../sec-sym-parent-outside").symlink(extractDir ~ "pivot");
+
+        auto tmpTar = "test-data/test-sec-sym-parent.tar";
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        // Archive creates a symlink whose parent directory is "pivot", which
+        // on disk routes through the pre-existing outside symlink.
+        tw.addSymlink("pivot/child-link", "target.txt");
+        tw.finish();
+
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        bool caught;
+        try {
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+        } catch (DarkArchiveException) { caught = true; }
+
+        caught.shouldBeTrue;
+        assert(!(outsideDir ~ "child-link").exists,
+            "child-link must not be created outside the extraction directory");
     }
 
     // -------------------------------------------------------------------

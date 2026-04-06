@@ -457,6 +457,12 @@ private bool verifyChecksum(const(ubyte)[] header) {
 }
 
 private long unixTimeToStdTime(long unixTime) pure nothrow @nogc {
+    // Clamp to prevent silent overflow in the conversion formula for crafted
+    // archives that supply extreme mtime values.
+    // Max safe input: (long.max / 10_000_000) - 62_135_596_800 ≈ 860_000_000_000
+    // (roughly year 29000 AD).  Min: year 1 AD ≈ -62_135_510_400 unix seconds.
+    if (unixTime >  860_000_000_000L) unixTime =  860_000_000_000L;
+    if (unixTime < -621_355_968_00L)  unixTime = -621_355_968_00L;
     return (unixTime + 621_355_968_00L) * 10_000_000L;
 }
 
@@ -598,6 +604,31 @@ version(unittest) {
         auto empty = cast(const(ubyte)[]) "";
         auto result3 = parsePaxData(empty);
         result3.length.shouldEqual(0);
+    }
+
+    @("tar security: unixTimeToStdTime clamps extreme values without overflow")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.datetime.systime : SysTime;
+        import std.datetime.timezone : UTC;
+        import std.datetime.date : Month;
+
+        // Known-good: Unix epoch → 1970-01-01
+        auto epoch = SysTime(unixTimeToStdTime(0), UTC());
+        epoch.year.shouldEqual(1970);
+        epoch.month.shouldEqual(Month.jan);
+        epoch.day.shouldEqual(1);
+
+        // long.max: must clamp to 860_000_000_000 ceiling, not overflow
+        auto ceilingStd = unixTimeToStdTime(860_000_000_000L);
+        unixTimeToStdTime(long.max).shouldEqual(ceilingStd);
+
+        // long.min: must clamp to -62_135_596_800 floor (stdTime = 0, year 1 AD)
+        auto floorStd = unixTimeToStdTime(-621_355_968_00L);
+        unixTimeToStdTime(long.min).shouldEqual(floorStd);
+
+        // Value just above the ceiling clamps the same as the ceiling itself
+        unixTimeToStdTime(860_000_000_001L).shouldEqual(ceilingStd);
     }
 
     @("tar security: octal overflow throws")

@@ -494,13 +494,16 @@ private void inflateChunked(ref DataSource ds, ulong dataStart,
     ulong compRemaining = compressedSize;
     ulong compPos = dataStart;
     enum INPUT_CHUNK = 64 * 1024; // 64KB compressed read chunks
+    // Declared outside the loop so the GC sees a live reference while zs.next_in
+    // points into it across iterations where zlib hasn't consumed all input yet.
+    const(ubyte)[] compChunk;
 
     while (true) {
         // Feed more compressed data if zlib needs it
         if (zs.avail_in == 0 && compRemaining > 0) {
             auto toRead = compRemaining > INPUT_CHUNK
                 ? INPUT_CHUNK : cast(size_t) compRemaining;
-            auto compChunk = ds.readSlice(compPos, toRead);
+            compChunk = ds.readSlice(compPos, toRead);
             zs.next_in = cast(ubyte*) compChunk.ptr;
             zs.avail_in = cast(uint) compChunk.length;
             compPos += toRead;
