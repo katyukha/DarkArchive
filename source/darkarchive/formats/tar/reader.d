@@ -60,14 +60,25 @@ struct TarReader(R) if (isTarStream!R) {
     }
 
     /// Read the current entry's full data into memory.
-    /// For large entries, use readDataChunked instead.
-    const(ubyte)[] readData() {
+    ///
+    /// `maxBytes` limits how large an entry can be loaded. The default (256 MB)
+    /// is a safe bound for most use cases. Pass `size_t.max` to remove the cap.
+    /// For entries larger than the cap, use `readDataChunked` instead.
+    ///
+    /// Throws `DarkArchiveException` when `_currentDataSize > maxBytes` — never
+    /// silently truncates, so legitimate multi-GB entries (e.g. a SQL dump) can be
+    /// extracted by setting an explicit limit or by using chunked reads.
+    const(ubyte)[] readData(size_t maxBytes = 256 * 1024 * 1024) {
         if (!_hasEntry || _currentDataSize == 0)
             return null;
         if (_currentData !is null)
             return _currentData;
         if (_dataConsumed)
             return null;
+        if (_currentDataSize > maxBytes)
+            throw new DarkArchiveException(
+                "TAR: entry too large for readData() — use readDataChunked() " ~
+                "or pass a larger maxBytes");
         auto buf = new ubyte[](_currentDataSize);
         try {
             _stream.readInto(buf[]);
@@ -1198,6 +1209,59 @@ version(unittest) {
         }
         // We expect at least one entry without a crash.
         assert(names.length >= 1, "should find at least one entry without crashing");
+    }
+
+    // -------------------------------------------------------------------
+    // readData maxBytes cap test
+    // -------------------------------------------------------------------
+
+    @("tar readData: maxBytes cap throws when entry exceeds limit, allows override")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue, shouldEqual;
+        import darkarchive.formats.tar.writer : tarWriter;
+        import std.file : exists, remove;
+
+        auto tmpPath = "test-data/test-tarr-maxbytes.tar";
+        scope(exit) if (exists(tmpPath)) remove(tmpPath);
+
+        auto tw = tarWriter(tmpPath);
+        scope(exit) tw.close();
+        tw.addBuffer("data.bin", new ubyte[](1024));  // 1 KB entry
+        tw.finish();
+
+        // Reading with a tight cap (512 bytes) must throw — never silently truncate.
+        {
+            auto reader = tarReader(tmpPath);
+            scope(exit) reader.close();
+            bool caught;
+            foreach (entry; reader.entries) {
+                try { reader.readData(512); }
+                catch (DarkArchiveException) { caught = true; }
+            }
+            caught.shouldBeTrue;
+        }
+
+        // Reading with size_t.max cap (no limit) must succeed and return full data.
+        {
+            auto reader2 = tarReader(tmpPath);
+            scope(exit) reader2.close();
+            foreach (entry; reader2.entries) {
+                auto data = reader2.readData(size_t.max);
+                assert(data !is null && data.length == 1024,
+                    "should return full 1024-byte entry when cap is size_t.max");
+            }
+        }
+
+        // Reading with the default cap must succeed for entries under 256 MB.
+        {
+            auto reader3 = tarReader(tmpPath);
+            scope(exit) reader3.close();
+            foreach (entry; reader3.entries) {
+                auto data = reader3.readData();
+                assert(data !is null && data.length == 1024,
+                    "default cap should not reject a 1 KB entry");
+            }
+        }
     }
 
     // -------------------------------------------------------------------

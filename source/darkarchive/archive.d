@@ -209,33 +209,30 @@ private void verifyPathWithinRoot(string path, string root) {
 }
 
 private string resolveRealPath(string path) {
-    import std.path : absolutePath, buildNormalizedPath, dirName, baseName;
+    import std.path : absolutePath, buildNormalizedPath, buildPath, dirName, baseName;
     import std.file : exists;
     auto normalized = buildNormalizedPath(absolutePath(path));
     version(Posix) {
-        import std.file : isSymlink, readLink;
-        string[] parts;
-        auto remaining = normalized;
-        while (remaining.length > 0 && remaining != "/" && remaining != ".") {
-            auto base = baseName(remaining);
-            auto parent = dirName(remaining);
-            if (parent == remaining) break;
-            parts = base ~ parts;
-            remaining = parent;
+        // Walk up from normalized path to find the longest existing prefix, then
+        // call Path.realPath() (POSIX realpath(3)) on it to fully resolve all
+        // chained symlinks in one call.  Any non-existent tail is appended
+        // normalised but without further symlink resolution (files not yet written).
+        string existing = normalized;
+        string[] tail;
+        while (existing.length > 0 && existing != "/") {
+            if (exists(existing)) break;
+            tail = baseName(existing) ~ tail;
+            existing = dirName(existing);
         }
-        parts = remaining ~ parts;
-        string resolved = parts[0];
-        foreach (part; parts[1 .. $]) {
-            resolved = buildNormalizedPath(resolved, part);
-            if (exists(resolved) && isSymlink(resolved)) {
-                auto target = readLink(resolved);
-                if (target.length > 0 && target[0] == '/')
-                    resolved = target;
-                else
-                    resolved = buildNormalizedPath(dirName(resolved), target);
-            }
+        if (existing.length == 0 || !exists(existing))
+            return normalized;
+        try {
+            auto realBase = Path(existing).realPath().toString();
+            if (tail.length == 0) return realBase;
+            return buildNormalizedPath(realBase, buildPath(tail));
+        } catch (Exception) {
+            return normalized;
         }
-        return buildNormalizedPath(resolved);
     } else {
         return normalized;
     }
@@ -532,6 +529,9 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                     if (posixLink(targetFull.toStringz, fullPath.toString.toStringz) != 0)
                         throw new DarkArchiveException(
                             "Failed to create hardlink: " ~ fullPath.toString);
+                } else {
+                    throw new DarkArchiveException(
+                        "Hardlink extraction is not supported on this platform: " ~ entryPath);
                 }
             } else {
                 auto parent = fullPath.parent;
@@ -1498,6 +1498,53 @@ version(unittest) {
     }
 
     // -------------------------------------------------------------------
+    // Chained-symlink bypass test
+    // -------------------------------------------------------------------
+
+    version(Posix)
+    @("security: chained symlink escaping extractDir is blocked by resolveRealPath")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove, mkdir;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        // extractDir/link2 is a PRE-EXISTING symlink pointing OUTSIDE extractDir.
+        // The archive then adds link1 → link2 (safe-looking one hop), plus a file
+        // under link1/.  The resolved chain is link1→link2→outside.
+        auto extractDir = Path(testDataDir, "sec-chained-sym-extract");
+        auto outsideDir = Path(testDataDir, "sec-chained-sym-outside");
+        scope(exit) {
+            if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+            if (exists(outsideDir.toString)) rmdirRecurse(outsideDir.toString);
+        }
+        mkdir(extractDir.toString);
+        mkdir(outsideDir.toString);
+        // Inside extractDir: link2 → ../sec-chained-sym-outside (outside)
+        import std.file : symlink;
+        symlink("../sec-chained-sym-outside", (extractDir ~ "link2").toString);
+
+        auto tmpTar = "test-data/test-sec-chained-sym.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addSymlink("link1", "link2");                               // one-hop, looks safe
+        tw.addBuffer("link1/evil.txt", cast(const(ubyte)[]) "escaped!");
+        tw.finish();
+
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        bool caught;
+        try {
+            reader.extractTo(extractDir,
+                DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+        } catch (DarkArchiveException) { caught = true; }
+
+        caught.shouldBeTrue;
+        assert(!exists((outsideDir ~ "evil.txt").toString),
+            "evil.txt must not escape to the outside directory via chained symlinks");
+    }
+
+    // -------------------------------------------------------------------
     // Hardlink extraction tests
     // -------------------------------------------------------------------
 
@@ -1575,6 +1622,33 @@ version(unittest) {
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.symlinks); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    version(Posix) {} else
+    @("hardlink: non-Posix platform throws DarkArchiveException when symlinks flag is set")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.file : exists, rmdirRecurse, remove;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        auto tmpTar = "test-data/test-hardlink-nonposix.tar";
+        scope(exit) if (exists(tmpTar)) remove(tmpTar);
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addBuffer("original.txt", cast(const(ubyte)[]) "content");
+        tw.addHardlink("link.txt", "original.txt");
+        tw.finish();
+
+        auto extractDir = Path(testDataDir, "hardlink-nonposix-test");
+        scope(exit) if (exists(extractDir.toString)) rmdirRecurse(extractDir.toString);
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        bool caught;
+        // With symlinks flag: on non-Posix, hardlink extraction must throw
+        // rather than silently dropping the entry (same behaviour as symlinks).
         try { reader.extractTo(extractDir, DarkExtractFlags.symlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
