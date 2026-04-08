@@ -256,7 +256,7 @@ private string formatMemSize(ulong bytes) {
 /// need to retain metadata across iterations.
 struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     private DarkArchiveReader!fmt* _parent;
-    static if (fmt == DarkArchiveFormat.zip)
+    static if (fmt.supports(ArchiveCapability.randomAccessRead))
         private size_t _idx;
 
     @disable this(this);
@@ -268,7 +268,7 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     /// Use `readChunks` for entries that may exceed that limit, or for streaming
     /// reads of large entries without buffering them in memory.
     ubyte[] readAll() {
-        static if (fmt == DarkArchiveFormat.zip)
+        static if (fmt.supports(ArchiveCapability.randomAccessRead))
             return cast(ubyte[]) _parent._reader.readData(_idx).dup;
         else {
             auto d = _parent._reader.readData();
@@ -282,7 +282,7 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     /// Stream entry data in chunks without buffering the full entry in memory.
     void readChunks(scope void delegate(const(ubyte)[] chunk) sink,
                      size_t chunkSize = 8192) {
-        static if (fmt == DarkArchiveFormat.zip)
+        static if (fmt.supports(ArchiveCapability.randomAccessRead))
             _parent._reader.readDataChunked(_idx, sink, chunkSize);
         else
             _parent._reader.readDataChunked(sink, chunkSize);
@@ -559,7 +559,7 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
         // Non-copyable because DarkArchiveItem is non-copyable.
         @disable this(this);
 
-        static if (fmt == DarkArchiveFormat.zip) {
+        static if (fmt.supports(ArchiveCapability.randomAccessRead)) {
             private size_t _idx;
             private size_t _len;
 
