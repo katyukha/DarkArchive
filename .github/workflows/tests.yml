@@ -27,7 +27,7 @@ jobs:
           - { os: windows-latest, compiler: ldc-latest }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install D compiler
         uses: dlang-community/setup-dlang@v2
@@ -46,7 +46,7 @@ jobs:
     needs: test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install D compiler
         uses: dlang-community/setup-dlang@v2
