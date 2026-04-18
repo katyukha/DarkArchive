@@ -284,24 +284,21 @@ version(unittest) {
 
     /// Multi-member gzip: second member is silently ignored (std.zlib stops at Z_STREAM_END).
     /// This documents the current behavior — it is not wrong, just a known limitation.
-    @("gzip: multi-member gzip — second member silently ignored, first returned intact")
+    @("gzip: gunzip() decompresses only the first gzip member (multi-member not supported)")
     unittest {
         import unit_threaded.assertions : shouldEqual;
         import darkarchive.formats.tar.writer : gzipCompress;
 
         auto data1 = cast(const(ubyte)[]) "first member";
         auto data2 = cast(const(ubyte)[]) "second member";
-        auto member1 = gzipCompress(data1);
-        auto member2 = gzipCompress(data2);
+        auto multiMember = gzipCompress(data1) ~ gzipCompress(data2);
 
-        // Concatenate to form a multi-member gzip stream
-        auto multiMember = member1 ~ member2;
-
-        // gunzip returns the first member's content and ignores the second
+        // gunzip() is a one-shot convenience function backed by std.zlib, which stops
+        // at Z_STREAM_END after the first member.  This is intentional best-effort
+        // behaviour: TAR.GZ files are never multi-member in practice.  Callers that
+        // need multi-member support must use GzipRange (the streaming path).
         auto result = gunzip(multiMember);
-        assert(result == data1, "first member data should be returned correctly");
-        // Note: second member ("second member") is silently discarded by std.zlib.
-        // Callers that need multi-member support must use a streaming zlib wrapper.
+        result.shouldEqual(data1);
     }
 
     /// Memory consistency: streaming through tar.gz should not accumulate memory

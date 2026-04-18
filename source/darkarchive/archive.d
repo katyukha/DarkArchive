@@ -2287,10 +2287,14 @@ version(unittest) {
         }
     }
 
-    @("attack: file and directory with same name")
+    @("attack: file and directory with same name — extractTo throws")
     unittest {
+        import unit_threaded.assertions : shouldBeTrue;
         auto tmpPath = "test-data/test-atk-conflict.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        // Directory "conflict/" is written first, then a file also named "conflict".
+        // On extraction the directory is created first; writing a file to the same
+        // path must fail — the OS rejects it (EISDIR) and we must not swallow that.
         WZip(tmpPath)
             .addDirectory("conflict")
             .addBuffer("conflict", cast(const(ubyte)[]) "file wins?")
@@ -2299,7 +2303,10 @@ version(unittest) {
         scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RZip(tmpPath);
         scope(exit) reader.close();
-        try { reader.extractTo(extractDir); } catch (Exception) {}
+        bool threw;
+        try { reader.extractTo(extractDir); }
+        catch (Exception) { threw = true; }
+        threw.shouldBeTrue();
     }
 
     @("attack: colon in filename (NTFS ADS)")
@@ -2674,18 +2681,22 @@ version(unittest) {
         }
     }
 
-    @("extractTo delegate: backward compatibility")
+    @("extractTo: both call signatures (no flags / explicit defaults) extract files correctly")
     unittest {
         import unit_threaded.assertions : shouldEqual;
         auto tmpPath = "test-data/test-dlg-compat.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         WZip(tmpPath).addBuffer("compat.txt", cast(const(ubyte)[]) "works").finish();
+
+        // extractTo(dir) — flags default to DarkExtractFlags.defaults
         auto extractDir1 = Path(testDataDir, "compat-test-1");
         scope(exit) if (extractDir1.exists) extractDir1.remove();
         auto reader1 = RZip(tmpPath);
         scope(exit) reader1.close();
         reader1.extractTo(extractDir1);
         (extractDir1 ~ "compat.txt").readFileText().shouldEqual("works");
+
+        // extractTo(dir, flags) — explicit DarkExtractFlags.defaults must behave identically
         auto extractDir2 = Path(testDataDir, "compat-test-2");
         scope(exit) if (extractDir2.exists) extractDir2.remove();
         auto reader2 = RZip(tmpPath);
