@@ -6,6 +6,7 @@
 module darkarchive.formats.tar.writer;
 
 import std.conv : octal;
+import std.datetime.systime : SysTime;
 import std.range : isOutputRange;
 
 import darkarchive.capabilities : ArchiveCapability;
@@ -40,29 +41,32 @@ struct TarWriter(R)
 
     /// Add a file from a memory buffer.
     ref TarWriter!R addBuffer(string archiveName, const(ubyte)[] fileData,
-                               uint permissions = octal!644) return {
+                               uint permissions = octal!644,
+                               SysTime mtime = SysTime.init) return {
         auto paxHandlesSize = writePaxIfNeeded(archiveName, fileData.length);
         writeHeader(archiveName, '0',
-            paxHandlesSize ? 0 : fileData.length, permissions, null);
+            paxHandlesSize ? 0 : fileData.length, permissions, null, mtime);
         writeData(fileData);
         return this;
     }
 
     /// Add an empty directory.
     ref TarWriter!R addDirectory(string archiveName,
-                                  uint permissions = octal!755) return {
+                                  uint permissions = octal!755,
+                                  SysTime mtime = SysTime.init) return {
         if (archiveName.length == 0 || archiveName[$ - 1] != '/')
             archiveName ~= '/';
         writePaxIfNeeded(archiveName, 0);
-        writeHeader(archiveName, '5', 0, permissions, null);
+        writeHeader(archiveName, '5', 0, permissions, null, mtime);
         return this;
     }
 
     /// Add a symlink.
     ref TarWriter!R addSymlink(string archiveName, string target,
-                                uint permissions = octal!777) return {
+                                uint permissions = octal!777,
+                                SysTime mtime = SysTime.init) return {
         writePaxIfNeeded(archiveName, 0, target);
-        writeHeader(archiveName, '2', 0, permissions, target);
+        writeHeader(archiveName, '2', 0, permissions, target, mtime);
         return this;
     }
 
@@ -70,9 +74,10 @@ struct TarWriter(R)
     /// original file as it appears in the archive — typically the same value
     /// that was passed to `addBuffer`/`addStream` for that entry.
     ref TarWriter!R addHardlink(string archiveName, string target,
-                                 uint permissions = octal!644) return {
+                                 uint permissions = octal!644,
+                                 SysTime mtime = SysTime.init) return {
         writePaxIfNeeded(archiveName, 0, target);
-        writeHeader(archiveName, '1', 0, permissions, target);
+        writeHeader(archiveName, '1', 0, permissions, target, mtime);
         return this;
     }
 
@@ -85,12 +90,13 @@ struct TarWriter(R)
     ref TarWriter!R addStream(string archiveName,
                                scope void delegate(scope void delegate(const(ubyte)[])) reader,
                                long size = -1,
-                               uint permissions = octal!644) return {
+                               uint permissions = octal!644,
+                               SysTime mtime = SysTime.init) return {
         if (size >= 0) {
             auto usize = cast(ulong) size;
             auto paxHandlesSize = writePaxIfNeeded(archiveName, usize);
             writeHeader(archiveName, '0',
-                paxHandlesSize ? 0 : usize, permissions, null);
+                paxHandlesSize ? 0 : usize, permissions, null, mtime);
 
             size_t totalWritten;
             reader((const(ubyte)[] chunk) {
@@ -116,7 +122,7 @@ struct TarWriter(R)
             import std.array : appender;
             auto buf = appender!(ubyte[])();
             reader((const(ubyte)[] chunk) { buf ~= chunk; });
-            addBuffer(archiveName, buf[], permissions);
+            addBuffer(archiveName, buf[], permissions, mtime);
         }
         return this;
     }
@@ -162,7 +168,8 @@ struct TarWriter(R)
     }
 
     private void writeHeader(string name, char typeflag, ulong size,
-                              uint permissions, string linkname) {
+                              uint permissions, string linkname,
+                              SysTime mtime = SysTime.init) {
         ubyte[TAR_BLOCK_SIZE] header;
         header[] = 0;
 
@@ -170,12 +177,19 @@ struct TarWriter(R)
         auto nameLen = nameBytes.length > 100 ? 100 : nameBytes.length;
         header[0 .. nameLen] = nameBytes[0 .. nameLen];
 
+        ulong mtimeSecs;
+        if (mtime == SysTime.init) {
+            import core.stdc.time : time;
+            mtimeSecs = cast(ulong) time(null);
+        } else {
+            mtimeSecs = cast(ulong) mtime.toUnixTime!long();
+        }
+
         writeOctal(*cast(ubyte[8]*)  &header[100], permissions);
         writeOctal(*cast(ubyte[8]*)  &header[108], 0UL); // UID
         writeOctal(*cast(ubyte[8]*)  &header[116], 0UL); // GID
         writeOctal(*cast(ubyte[12]*) &header[124], size);
-        import core.stdc.time : time;
-        writeOctal(*cast(ubyte[12]*) &header[136], cast(ulong) time(null));
+        writeOctal(*cast(ubyte[12]*) &header[136], mtimeSecs);
         header[156] = cast(ubyte) typeflag;
 
         if (linkname !is null) {
@@ -723,6 +737,67 @@ version(unittest) {
             else if (entry.pathname == "mydir/")
                 entry.permissions.shouldEqual(octal!755);
         }
+    }
+
+    @("tar write: mtime round-trip via addBuffer")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.datetime.systime : SysTime;
+        import std.datetime.date : DateTime;
+        import std.datetime.timezone : UTC;
+
+        // TAR stores mtime as Unix timestamp (1-second resolution)
+        auto mtime = SysTime(DateTime(2024, 6, 15, 10, 30, 22), UTC());
+
+        auto tmpPath = "test-data/test-tarw-mtime.tar";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = tarWriter(tmpPath);
+            writer.addBuffer("f.txt", cast(const(ubyte)[]) "hi", octal!644, mtime);
+            writer.finish();
+        }
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "f.txt") {
+                entry.mtime.shouldEqual(mtime);
+                found = true;
+            }
+        }
+        assert(found, "entry not found");
+    }
+
+    @("tar write: default mtime is approximately current time")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.datetime.systime : Clock;
+        import std.datetime.timezone : UTC;
+        import core.time : seconds;
+
+        // TAR mtime has 1-second resolution (stored as Unix timestamp via time(null)),
+        // so allow 1s slack on the before bound to avoid sub-second races.
+        auto before = Clock.currTime(UTC()) - 1.seconds;
+        auto tmpPath = "test-data/test-tarw-mtime-default.tar";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = tarWriter(tmpPath);
+            writer.addBuffer("f.txt", cast(const(ubyte)[]) "hi");
+            writer.finish();
+        }
+        auto after = Clock.currTime(UTC()) + 1.seconds;
+
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "f.txt") {
+                (entry.mtime >= before).shouldBeTrue;
+                (entry.mtime <= after).shouldBeTrue;
+                found = true;
+            }
+        }
+        assert(found, "entry not found");
     }
 
     /// tarGzWriter(sink) — streaming gzip via DelegateSink

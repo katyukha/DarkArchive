@@ -121,8 +121,12 @@ struct ZipReader {
                 "ZIP: unsupported compression method %d".format(method));
         }
 
-        // Verify CRC32 (skip if stored CRC is 0 — some tools omit it for directories)
-        if (ci.crc32 != 0) {
+        // Verify CRC32.  Directories have no data and always have CRC=0 —
+        // skip the check only for them.  For file entries always verify,
+        // even if the stored CRC is 0 (a zero CRC for a file is either a
+        // tool bug or a crafted bypass attempt).
+        bool isDir = ci.filename.length > 0 && ci.filename[$-1] == '/';
+        if (!isDir) {
             import std.digest.crc : crc32Of;
             auto computed = crc32Of(result);
             uint computedVal = (cast(uint) computed[0])
@@ -164,6 +168,8 @@ struct ZipReader {
         if (compressedSize > _ds.length || dataStart + compressedSize > _ds.length)
             throw new DarkArchiveException("ZIP: compressed data out of bounds");
 
+        bool isDir = ci.filename.length > 0 && ci.filename[$-1] == '/';
+
         if (method == ZIP_METHOD_STORE) {
             // Store: read from DataSource in chunks (no decompression)
             import std.digest.crc : CRC32;
@@ -180,10 +186,10 @@ struct ZipReader {
                 remaining -= toRead;
             }
 
-            verifyCRC(ci.crc32, crc);
+            if (!isDir) verifyCRC(ci.crc32, crc);
         } else if (method == ZIP_METHOD_DEFLATE) {
             // Deflate: read compressed data in chunks, inflate, yield decompressed chunks
-            inflateChunked(_ds, dataStart, compressedSize, ci.crc32, sink, chunkSize);
+            inflateChunked(_ds, dataStart, compressedSize, ci.crc32, sink, chunkSize, isDir);
         } else {
             import std.format : format;
             throw new DarkArchiveException(
@@ -487,7 +493,8 @@ private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
 private void inflateChunked(ref DataSource ds, ulong dataStart,
                              ulong compressedSize, uint expectedCRC,
                              scope void delegate(const(ubyte)[] chunk) sink,
-                             size_t chunkSize) {
+                             size_t chunkSize,
+                             bool skipCrc = false) {
     import etc.c.zlib;
     import std.digest.crc : CRC32;
 
@@ -537,20 +544,19 @@ private void inflateChunked(ref DataSource ds, ulong dataStart,
             throw new DarkArchiveException("ZIP: inflate failed");
     }
 
-    verifyCRC(expectedCRC, crc);
+    if (!skipCrc) verifyCRC(expectedCRC, crc);
 }
 
-/// Verify CRC32 against expected value.
+/// Verify CRC32.  Always checks — callers must not call this for
+/// directory entries (they have no data and always have CRC=0).
 private void verifyCRC(T)(uint expectedCRC, ref T crc) {
-    if (expectedCRC != 0) {
-        auto computed = crc.finish();
-        uint computedVal = (cast(uint) computed[0])
-                         | (cast(uint) computed[1] << 8)
-                         | (cast(uint) computed[2] << 16)
-                         | (cast(uint) computed[3] << 24);
-        if (computedVal != expectedCRC)
-            throw new DarkArchiveException("ZIP: CRC32 mismatch (data corrupted)");
-    }
+    auto computed = crc.finish();
+    uint computedVal = (cast(uint) computed[0])
+                     | (cast(uint) computed[1] << 8)
+                     | (cast(uint) computed[2] << 16)
+                     | (cast(uint) computed[3] << 24);
+    if (computedVal != expectedCRC)
+        throw new DarkArchiveException("ZIP: CRC32 mismatch (data corrupted)");
 }
 
 /// Convert DOS date/time to SysTime.
@@ -887,6 +893,69 @@ version(unittest) {
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
+    }
+
+    @("zip security: CRC32 zero in central directory for file entry throws")
+    unittest {
+        // Regression: old code skipped CRC check when central-dir CRC == 0.
+        // This allowed a crafted ZIP to bypass integrity verification.
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        auto tmpPath = testDataDir ~ "/test-zipr-zero-crc.zip";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = ZipWriter(tmpPath);
+            writer.addBuffer("file.txt", cast(const(ubyte)[]) "hello");
+            writer.finish();
+        }
+
+        // Zero out the CRC field in the central directory entry.
+        // Central directory starts after local file header + data.
+        // We parse the EOCD to find the central-directory offset, then
+        // zero bytes [cdStart+16 .. cdStart+20] (CRC field at offset 16).
+        auto data = cast(ubyte[]) Path(tmpPath).readFile();
+        // For a small single-entry ZIP, EOCD is the last 22 bytes.
+        assert(data.length >= 22);
+        size_t eocdOff = data.length - 22;
+        // EOCD: sig(4)+diskNum(2)+startDisk(2)+numOnDisk(2)+total(2)+cdSize(4)+cdOffset(4)+commentLen(2)
+        uint cdOffset = (cast(uint) data[eocdOff + 16])
+                      | (cast(uint) data[eocdOff + 17] << 8)
+                      | (cast(uint) data[eocdOff + 18] << 16)
+                      | (cast(uint) data[eocdOff + 19] << 24);
+        // CRC is at offset 16 inside the central directory entry
+        assert(cdOffset + 20 <= data.length);
+        data[cdOffset + 16 .. cdOffset + 20] = 0; // zero the CRC
+
+        auto corruptPath = testDataDir ~ "/test-zipr-zero-crc-bad.zip";
+        scope(exit) if (Path(corruptPath).exists) Path(corruptPath).remove();
+        Path(corruptPath).writeFile(data);
+
+        auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.readData(0); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("zip security: CRC32 zero in central directory for directory entry is allowed")
+    unittest {
+        // Directories always have CRC=0 — this must not throw.
+        import unit_threaded.assertions : shouldBeFalse;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        auto tmpPath = testDataDir ~ "/test-zipr-dir-zero-crc.zip";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = ZipWriter(tmpPath);
+            writer.addDirectory("subdir/");
+            writer.finish();
+        }
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { foreach (e; reader.entries) {} }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeFalse;
     }
 
     @("zip security: empty filename entry does not crash")

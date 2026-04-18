@@ -10,6 +10,7 @@
 module darkarchive.archive;
 
 import std.conv : octal;
+import std.datetime.systime : SysTime;
 
 import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
@@ -51,7 +52,10 @@ bool supports(DarkArchiveFormat fmt, ArchiveCapability cap) {
 enum DarkExtractFlags {
     none        = 0,
     securePaths = 1,
+    /// Allow symlink extraction (opt-in; skipped by default).
     symlinks    = 2,
+    /// Allow hardlink extraction (opt-in; skipped by default).
+    hardlinks   = 4,
     defaults    = securePaths,
 }
 
@@ -176,8 +180,13 @@ private void applyFilePermissions(string path, uint archivePerms) {
         auto safeBits = archivePerms & octal!777;
         safeBits &= ~octal!22;
         if (safeBits == 0) return;
-        import std.file : setAttributes;
-        try { setAttributes(path, safeBits); } catch (Exception) {}
+        import std.file : setAttributes, FileException;
+        try {
+            setAttributes(path, safeBits);
+        } catch (FileException e) {
+            throw new DarkArchiveException(
+                "Failed to set permissions on " ~ path ~ ": " ~ e.msg);
+        }
     }
 }
 
@@ -207,8 +216,10 @@ private string resolveRealPath(string path) {
         try {
             auto realBase = existing.realPath();
             return (tail.length == 0 ? realBase : realBase.join(tail)).toString();
-        } catch (Exception) {
-            return abs.toString();
+        } catch (Exception e) {
+            throw new DarkArchiveException(
+                "Cannot resolve path for safety check (permission denied or broken symlink): "
+                ~ e.msg);
         }
     } else {
         return Path(path).toAbsolute().toString();
@@ -477,10 +488,11 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                             "Refusing to create symlink with '..' in target: " ~ target);
                 }
                 auto parent = fullPath.parent;
-                if (!parent.exists)
-                    parent.mkdir(true);
+                // Verify before creating: a compromised path must not materialise on disk.
                 if (flags & DarkExtractFlags.securePaths)
                     verifyPathWithinRoot(parent.toString(), destStr);
+                if (!parent.exists)
+                    parent.mkdir(true);
                 version(Posix) {
                     Path(item.meta.symlinkTarget).symlink(fullPath);
                 } else {
@@ -489,7 +501,7 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 }
                 // symlinks have no data — popFront auto-skips
             } else if (item.meta.isHardlink) {
-                if (!(flags & DarkExtractFlags.symlinks)) continue;
+                if (!(flags & DarkExtractFlags.hardlinks)) continue;
                 auto target = item.meta.symlinkTarget;
                 if (target.length > 0 && target[0] == '/')
                     throw new DarkArchiveException(
@@ -506,6 +518,9 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                     if (flags & DarkExtractFlags.securePaths)
                         verifyPathWithinRoot(targetFull, destStr);
                     auto parent = fullPath.parent;
+                    // Verify before creating parent directories.
+                    if (flags & DarkExtractFlags.securePaths)
+                        verifyPathWithinRoot(parent.toString(), destStr);
                     if (!parent.exists)
                         parent.mkdir(true);
                     if (posixLink(targetFull.toStringz, fullPath.toString.toStringz) != 0)
@@ -518,10 +533,10 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 // hardlinks have no data — popFront auto-skips
             } else {
                 auto parent = fullPath.parent;
-                if (!parent.exists)
-                    parent.mkdir(true);
                 if (flags & DarkExtractFlags.securePaths)
                     verifyPathWithinRoot(parent.toString(), destStr);
+                if (!parent.exists)
+                    parent.mkdir(true);
                 extractEntryToFile(item.data, fullPath.toString(),
                                    item.meta.permissions, limits, totalBytes);
             }
@@ -735,9 +750,12 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     /// ditto
     ref Self add(string sourcePath, string archiveName = null) return {
         import std.stdio : File;
+        import std.file : getTimes;
         if (archiveName is null)
             archiveName = Path(sourcePath).baseName;
         auto fileSize = Path(sourcePath).getSize();
+        SysTime accessTime, mtime;
+        getTimes(sourcePath, accessTime, mtime);
         auto f = File(sourcePath, "rb");
         addStream(archiveName, (scope sink) {
             ubyte[8192] buf;
@@ -746,7 +764,7 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
                 if (got.length == 0) break;
                 sink(got);
             }
-        }, fileSize);
+        }, fileSize, octal!644, mtime);
         return this;
     }
 
@@ -759,6 +777,7 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     /// ditto
     ref Self addTree(string rootPath, string prefix = null,
                      FollowSymlinks followSym = FollowSymlinks.yes) return {
+        import std.file : getTimes;
         auto root = Path(rootPath).toAbsolute();
         if (prefix is null) prefix = root.baseName;
         foreach (de; root.walkDepth(followSym == FollowSymlinks.yes)) {
@@ -767,10 +786,17 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
             version(Posix) {
                 if (de.isSymlink) {
                     if (followSym == FollowSymlinks.no) {
-                        addSymlink(archName, de.readLink.toString());
+                        SysTime atime, mtime;
+                        getTimes(de.toString(), atime, mtime);
+                        addSymlink(archName, de.readLink.toString(), mtime);
                     } else {
-                        if (de.isDir) addDirectory(archName);
-                        else          add(de.toString(), archName);
+                        if (de.isDir) {
+                            SysTime atime, mtime;
+                            getTimes(de.toString(), atime, mtime);
+                            addDirectory(archName, octal!755, mtime);
+                        } else {
+                            add(de.toString(), archName);
+                        }
                     }
                     continue;
                 }
@@ -779,23 +805,30 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
                     throw new DarkArchiveException(
                         "FollowSymlinks.no is not supported on this platform");
             }
-            if (de.isDir)       addDirectory(archName);
-            else if (de.isFile) add(de.toString(), archName);
+            if (de.isDir) {
+                SysTime atime, mtime;
+                getTimes(de.toString(), atime, mtime);
+                addDirectory(archName, octal!755, mtime);
+            } else if (de.isFile) {
+                add(de.toString(), archName);
+            }
         }
         return this;
     }
 
     /// Add from in-memory buffer.
     ref Self addBuffer(string archiveName, const(ubyte)[] data,
-                       uint permissions = octal!644) return {
-        _writer.addBuffer(archiveName, data, permissions);
+                       uint permissions = octal!644,
+                       SysTime mtime = SysTime.init) return {
+        _writer.addBuffer(archiveName, data, permissions, mtime);
         return this;
     }
 
     /// Add empty directory.
     ref Self addDirectory(string archiveName,
-                          uint permissions = octal!755) return {
-        _writer.addDirectory(archiveName, permissions);
+                          uint permissions = octal!755,
+                          SysTime mtime = SysTime.init) return {
+        _writer.addDirectory(archiveName, permissions, mtime);
         return this;
     }
 
@@ -803,14 +836,16 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     ref Self addStream(string archiveName,
                        scope void delegate(scope void delegate(const(ubyte)[])) reader,
                        long size = -1,
-                       uint permissions = octal!644) return {
-        _writer.addStream(archiveName, reader, size, permissions);
+                       uint permissions = octal!644,
+                       SysTime mtime = SysTime.init) return {
+        _writer.addStream(archiveName, reader, size, permissions, mtime);
         return this;
     }
 
     /// Add symlink entry.
-    ref Self addSymlink(string archiveName, string target) return {
-        _writer.addSymlink(archiveName, target);
+    ref Self addSymlink(string archiveName, string target,
+                        SysTime mtime = SysTime.init) return {
+        _writer.addSymlink(archiveName, target, octal!777, mtime);
         return this;
     }
 
@@ -1098,6 +1133,39 @@ version(unittest) {
             if (item.meta.pathname == "cross.txt")
                 item.data.readText().shouldEqual("Cross-format test");
         }
+    }
+
+    @("high-level: add(file) preserves file mtime")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.file : getTimes, setTimes;
+        import std.datetime.systime : SysTime;
+        import std.datetime.date : DateTime;
+        import std.datetime.timezone : UTC;
+
+        auto srcPath = Path(testDataDir, "test-add-mtime-src.txt");
+        auto archPath = Path(testDataDir, "test-add-mtime.tar");
+        scope(exit) if (srcPath.exists) srcPath.remove();
+        scope(exit) if (archPath.exists) archPath.remove();
+
+        srcPath.writeFile(cast(ubyte[]) "hello");
+        // Set a specific mtime (even second avoids DOS 2s rounding issues)
+        auto mtime = SysTime(DateTime(2023, 3, 15, 12, 0, 0), UTC());
+        SysTime atime = mtime;
+        setTimes(srcPath.toString(), atime, mtime);
+
+        WTar(archPath).add(srcPath.toString(), "f.txt").finish();
+
+        auto reader = RTar(archPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "f.txt") {
+                item.meta.mtime.shouldEqual(mtime);
+                found = true;
+            }
+        }
+        assert(found, "entry f.txt not found in archive");
     }
 
     @("high-level: non-existent file throws")
@@ -1611,7 +1679,7 @@ version(unittest) {
     // Hardlink extraction tests
     // -------------------------------------------------------------------
 
-    version(Posix) @("hardlink: extractTo creates hardlink when symlinks flag set")
+    version(Posix) @("hardlink: extractTo creates hardlink when hardlinks flag set")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
@@ -1629,7 +1697,7 @@ version(unittest) {
         scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
-        reader.extractTo(extractDir, DarkExtractFlags.symlinks);
+        reader.extractTo(extractDir, DarkExtractFlags.hardlinks);
 
         assert((extractDir ~ "original.txt").exists);
         assert((extractDir ~ "link.txt").exists);
@@ -1682,13 +1750,13 @@ version(unittest) {
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
-        try { reader.extractTo(extractDir, DarkExtractFlags.symlinks); }
+        try { reader.extractTo(extractDir, DarkExtractFlags.hardlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
     }
 
     version(Posix) {} else
-    @("hardlink: non-Posix platform throws DarkArchiveException when symlinks flag is set")
+    @("hardlink: non-Posix platform throws DarkArchiveException when hardlinks flag is set")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
@@ -1706,9 +1774,9 @@ version(unittest) {
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
-        // With symlinks flag: on non-Posix, hardlink extraction must throw
-        // rather than silently dropping the entry (same behaviour as symlinks).
-        try { reader.extractTo(extractDir, DarkExtractFlags.symlinks); }
+        // With hardlinks flag: on non-Posix, hardlink extraction must throw
+        // rather than silently dropping the entry.
+        try { reader.extractTo(extractDir, DarkExtractFlags.hardlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
     }
@@ -1730,7 +1798,7 @@ version(unittest) {
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
-        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks); }
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.hardlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
     }
@@ -3061,6 +3129,80 @@ version(unittest) {
         assert(growth < 2 * 1024 * 1024,
             "TAR addStream(known size): memory grew by " ~ formatMemSize(growth));
         assert(Path(outPath).getSize() > ENTRY_SIZE);
+    }
+
+    version(Posix) @("security: hardlinks skipped without explicit hardlinks flag")
+    unittest {
+        // Hardlink extraction requires DarkExtractFlags.hardlinks; without it
+        // they must be silently skipped (same as symlinks without symlinks flag).
+        import unit_threaded.assertions : shouldBeFalse;
+        import darkarchive.formats.tar.writer : tarWriter;
+        auto tmpTar = "test-data/test-sec-hardlink-skip.tar";
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
+        {
+            auto tw = tarWriter(tmpTar);
+            tw.addBuffer("real.txt", cast(const(ubyte)[]) "data");
+            tw.addSymlink("link.txt", "real.txt", octal!777); // reuse writer; link type set internally
+            tw.finish();
+        }
+        // Build a TAR with a hardlink entry manually
+        // (tarWriter.addBuffer then addSymlink records a symlink; use raw bytes)
+        import darkarchive.formats.tar.types : TAR_BLOCK_SIZE;
+        ubyte[TAR_BLOCK_SIZE] hlHdr;
+        hlHdr[] = 0;
+        hlHdr[0 .. 8] = cast(ubyte[8]) "link.txt";
+        hlHdr[156] = '1'; // hardlink typeflag
+        hlHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        hlHdr[263 .. 265] = cast(ubyte[2]) "00";
+        hlHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        hlHdr[124 .. 136] = cast(ubyte[12]) "00000000000\0";
+        hlHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        // linkname field (bytes 157..257): "real.txt"
+        hlHdr[157 .. 165] = cast(ubyte[8]) "real.txt";
+        uint cs = 0;
+        foreach (i, b; hlHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        import std.format : format;
+        auto csStr = format!"%06o\0 "(cs);
+        hlHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE] fileHdr;
+        fileHdr[] = 0;
+        fileHdr[0 .. 8] = cast(ubyte[8]) "real.txt";
+        fileHdr[156] = '0';
+        fileHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        fileHdr[263 .. 265] = cast(ubyte[2]) "00";
+        fileHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        fileHdr[124 .. 136] = cast(ubyte[12]) "00000000004\0"; // size=4 octal
+        fileHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        cs = 0;
+        foreach (i, b; fileHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        csStr = format!"%06o\0 "(cs);
+        fileHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE] dataBk;
+        dataBk[0 .. 4] = cast(ubyte[4]) "data";
+
+        ubyte[TAR_BLOCK_SIZE * 2] eoar;
+        eoar[] = 0;
+
+        auto hlTar = "test-data/test-sec-hardlink-only.tar";
+        scope(exit) if (Path(hlTar).exists) Path(hlTar).remove();
+        ubyte[] archiveData;
+        archiveData ~= fileHdr[];
+        archiveData ~= dataBk[];
+        archiveData ~= hlHdr[];
+        archiveData ~= eoar[];
+        Path(hlTar).writeFile(archiveData);
+
+        auto extractDir = Path(testDataDir, "sec-hardlink-skip-test");
+        scope(exit) if (extractDir.exists) extractDir.remove();
+
+        auto reader = RTar(hlTar);
+        scope(exit) reader.close();
+        // Without hardlinks flag, hardlink entry is skipped — no exception
+        reader.extractTo(extractDir, DarkExtractFlags.defaults);
+        // The hardlink must not have been created
+        (extractDir ~ "link.txt").exists.shouldBeFalse;
     }
 
     @("streaming: ZIP addStream with known size does not buffer full entry")

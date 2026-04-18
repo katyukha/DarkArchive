@@ -239,9 +239,11 @@ struct TarReader(R) if (isTarStream!R) {
                         try { dataSize = (*s).to!size_t; }
                         catch (ConvOverflowException)
                             { throw new DarkArchiveException("TAR: PAX size value too large"); }
-                        // size field in the entry is signed long; clamp if needed.
-                        _reader._currentEntry.size =
-                            dataSize > long.max ? long.max : cast(long) dataSize;
+                        // DarkArchiveEntry.size is signed long; reject values that
+                        // exceed long.max rather than silently clamping them.
+                        if (dataSize > cast(ulong) long.max)
+                            throw new DarkArchiveException("TAR: PAX size exceeds maximum supported value");
+                        _reader._currentEntry.size = cast(long) dataSize;
                         if (dataSize > size_t.max - (TAR_BLOCK_SIZE - 1))
                             throw new DarkArchiveException("TAR: PAX size too large");
                         paddedSize = (dataSize + TAR_BLOCK_SIZE - 1)
@@ -961,6 +963,70 @@ version(unittest) {
 
         // The PAX 'size' attribute = ulong.max → paddedSize calculation overflows.
         // Our fix should throw DarkArchiveException instead of wrapping around.
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { foreach (entry; reader.entries) {} }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("tar security: pax size just above long.max throws")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.exception : DarkArchiveException;
+
+        // PAX record: "28 size=9223372036854775808\n"  (long.max+1 = 2^63)
+        // Length is self-inclusive: "28 " (3) + "size=9223372036854775808" (24) + "\n" (1) = 28 ✓
+        auto paxContent = cast(ubyte[]) "28 size=9223372036854775808\n";
+        assert(paxContent.length == 28);
+
+        ubyte[TAR_BLOCK_SIZE] paxHdr;
+        paxHdr[] = 0;
+        paxHdr[0 .. 9] = cast(ubyte[9]) "PaxHeader";
+        paxHdr[156] = 'x';
+        paxHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        paxHdr[263 .. 265] = cast(ubyte[2]) "00";
+        paxHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        // size = 28 decimal = 034 octal → "0000000034\0"
+        paxHdr[124 .. 136] = cast(ubyte[12]) "00000000034\0";
+        paxHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        uint cs = 0;
+        foreach (i, b; paxHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        import std.format : format;
+        auto csStr = format!"%06o\0 "(cs);
+        paxHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE] paxDataBlock;
+        paxDataBlock[] = 0;
+        paxDataBlock[0 .. 28] = paxContent[];
+
+        ubyte[TAR_BLOCK_SIZE] fileHdr;
+        fileHdr[] = 0;
+        fileHdr[0 .. 5] = cast(ubyte[5]) "a.txt";
+        fileHdr[156] = '0';
+        fileHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        fileHdr[263 .. 265] = cast(ubyte[2]) "00";
+        fileHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        fileHdr[124 .. 136] = cast(ubyte[12]) "00000000000\0";
+        fileHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        cs = 0;
+        foreach (i, b; fileHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        csStr = format!"%06o\0 "(cs);
+        fileHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE * 2] eoar;
+        eoar[] = 0;
+
+        auto tmpPath = "test-data/test-tarr-pax-longmax.tar";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        ubyte[] archiveData;
+        archiveData ~= paxHdr[];
+        archiveData ~= paxDataBlock[];
+        archiveData ~= fileHdr[];
+        archiveData ~= eoar[];
+        Path(tmpPath).writeFile(archiveData);
+
         auto reader = tarReader(tmpPath);
         scope(exit) reader.close();
         bool caught;
