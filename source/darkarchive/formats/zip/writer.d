@@ -6,7 +6,9 @@ module darkarchive.formats.zip.writer;
 
 import std.bitmanip : nativeToLittleEndian;
 import std.conv : octal;
+import std.datetime.systime : SysTime;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;
 
@@ -21,19 +23,23 @@ struct ZipWriter {
         bool _finished;
     }
 
+    /// Declare supported capabilities.
+    static bool supports(ArchiveCapability cap) {
+        return cap == ArchiveCapability.randomAccessWrite;
+    }
+
     /// Create a file-backed writer (streaming, constant memory).
-    static ZipWriter createToFile(string path) {
-        ZipWriter w;
-        w._file = new File(path, "wb");
-        w._filePos = 0;
-        w._localEntries = [];
-        w._finished = false;
-        return w;
+    this(string path) {
+        _file = new File(path, "wb");
+        _filePos = 0;
+        _localEntries = [];
+        _finished = false;
     }
 
     /// Add a file from a memory buffer.
     ref ZipWriter addBuffer(string archiveName, const(ubyte)[] data,
-                             uint permissions = octal!644) return {
+                             uint permissions = octal!644,
+                             SysTime mtime = SysTime.init) return {
         import std.digest.crc : crc32Of;
 
         auto crc = crc32Of(data);
@@ -57,25 +63,28 @@ struct ZipWriter {
         }
 
         writeLocalEntry(archiveName, method, crcVal,
-            writeData.length, data.length, writeData, permissions, false);
+            writeData.length, data.length, writeData, permissions, false, false, mtime);
 
         return this;
     }
 
     /// Add an empty directory.
     ref ZipWriter addDirectory(string archiveName,
-                                uint permissions = octal!755) return {
+                                uint permissions = octal!755,
+                                SysTime mtime = SysTime.init) return {
         if (archiveName.length == 0 || archiveName[$ - 1] != '/')
             archiveName ~= '/';
 
-        writeLocalEntry(archiveName, ZIP_METHOD_STORE, 0, 0, 0, null, permissions, true);
+        writeLocalEntry(archiveName, ZIP_METHOD_STORE, 0, 0, 0, null, permissions, true,
+                        false, mtime);
         return this;
     }
 
     /// Add symlink entry. The target path is stored as the file data,
     /// and Unix symlink mode (0o120777) is set in external attributes.
     ref ZipWriter addSymlink(string archiveName, string target,
-                              uint permissions = octal!777) return {
+                              uint permissions = octal!777,
+                              SysTime mtime = SysTime.init) return {
         import std.digest.crc : crc32Of;
 
         auto targetBytes = cast(const(ubyte)[]) target;
@@ -87,7 +96,7 @@ struct ZipWriter {
 
         writeLocalEntry(archiveName, ZIP_METHOD_STORE, crcVal,
             targetBytes.length, targetBytes.length, targetBytes,
-            permissions, false, true);
+            permissions, false, true, mtime);
         return this;
     }
 
@@ -97,15 +106,17 @@ struct ZipWriter {
     ref ZipWriter addStream(string archiveName,
                               scope void delegate(scope void delegate(const(ubyte)[])) reader,
                               long size = -1,
-                              uint permissions = octal!644) return {
-        writeStreamingEntry(archiveName, reader, permissions, size);
+                              uint permissions = octal!644,
+                              SysTime mtime = SysTime.init) return {
+        writeStreamingEntry(archiveName, reader, permissions, size, mtime);
         return this;
     }
 
     private void writeStreamingEntry(string archiveName,
                                       scope void delegate(scope void delegate(const(ubyte)[])) reader,
                                       uint permissions,
-                                      long declaredSize = -1) {
+                                      long declaredSize = -1,
+                                      SysTime mtime = SysTime.init) {
         import etc.c.zlib;
         import std.digest.crc : CRC32;
 
@@ -128,13 +139,16 @@ struct ZipWriter {
         zip64Extra[4 .. 12] = nativeToLittleEndian!ulong(0);  // uncompressed
         zip64Extra[12 .. 20] = nativeToLittleEndian!ulong(0); // compressed
 
+        ushort modTime, modDate;
+        sysTimeToDos(mtime, modTime, modDate);
+
         // Write local file header
         appendLE!uint(ZIP_LOCAL_FILE_HEADER_SIG);
         appendLE!ushort(versionNeeded);
         appendLE!ushort(flags);
         appendLE!ushort(ZIP_METHOD_DEFLATE);
-        appendLE!ushort(0); // mod time
-        appendLE!ushort(0); // mod date
+        appendLE!ushort(modTime);
+        appendLE!ushort(modDate);
         appendLE!uint(0);   // CRC32 — filled in data descriptor
         appendLE!uint(ZIP64_MAGIC_32); // compressed size — ZIP64
         appendLE!uint(ZIP64_MAGIC_32); // uncompressed size — ZIP64
@@ -216,7 +230,7 @@ struct ZipWriter {
             archiveName, ZIP_METHOD_DEFLATE, crcVal,
             compressedSize, uncompressedSize,
             localOffset, flags, versionNeeded,
-            permissions, false, false, zip64Extra.dup
+            permissions, false, false, zip64Extra.dup, modTime, modDate
         );
     }
 
@@ -265,7 +279,8 @@ struct ZipWriter {
                                   ulong compSize, ulong uncompSize,
                                   const(ubyte)[] compData,
                                   uint permissions, bool isDir,
-                                  bool isSymlink = false) {
+                                  bool isSymlink = false,
+                                  SysTime mtime = SysTime.init) {
         auto localOffset = outputPos();
 
         ushort flags = ZIP_FLAG_UTF8; // Always write UTF-8 filenames
@@ -288,13 +303,16 @@ struct ZipWriter {
             extra[12 .. 20] = nativeToLittleEndian!ulong(compSize);
         }
 
+        ushort modTime, modDate;
+        sysTimeToDos(mtime, modTime, modDate);
+
         // Local file header
         appendLE!uint(ZIP_LOCAL_FILE_HEADER_SIG);
         appendLE!ushort(versionNeeded);
         appendLE!ushort(flags);
         appendLE!ushort(method);
-        appendLE!ushort(0); // mod time (TODO)
-        appendLE!ushort(0); // mod date (TODO)
+        appendLE!ushort(modTime);
+        appendLE!ushort(modDate);
         appendLE!uint(crc);
         appendLE!uint(needZip64 ? ZIP64_MAGIC_32 : cast(uint) compSize);
         appendLE!uint(needZip64 ? ZIP64_MAGIC_32 : cast(uint) uncompSize);
@@ -312,7 +330,7 @@ struct ZipWriter {
             name, method, crc,
             compSize, uncompSize,
             localOffset, flags, versionNeeded,
-            permissions, isDir, isSymlink, extra.dup
+            permissions, isDir, isSymlink, extra.dup, modTime, modDate
         );
     }
 
@@ -364,8 +382,8 @@ struct ZipWriter {
         appendLE!ushort(le.versionNeeded);
         appendLE!ushort(le.flags);
         appendLE!ushort(le.method);
-        appendLE!ushort(0); // mod time
-        appendLE!ushort(0); // mod date
+        appendLE!ushort(le.modTime);
+        appendLE!ushort(le.modDate);
         appendLE!uint(le.crc);
         appendLE!uint(le.compSize >= ZIP64_MAGIC_32 ? ZIP64_MAGIC_32 : cast(uint) le.compSize);
         appendLE!uint(le.uncompSize >= ZIP64_MAGIC_32 ? ZIP64_MAGIC_32 : cast(uint) le.uncompSize);
@@ -422,7 +440,7 @@ struct ZipWriter {
     /// Write bytes to output file.
     private void output(const(ubyte)[] bytes) {
         if (_file is null)
-            throw new DarkArchiveException("ZIP: no output file — use createToFile()");
+            throw new DarkArchiveException("ZIP: no output file — use ZipWriter(path)");
         _file.rawWrite(bytes);
         _filePos += bytes.length;
     }
@@ -430,7 +448,7 @@ struct ZipWriter {
     /// Current output position.
     private ulong outputPos() {
         if (_file is null)
-            throw new DarkArchiveException("ZIP: no output file — use createToFile()");
+            throw new DarkArchiveException("ZIP: no output file — use ZipWriter(path)");
         return _filePos;
     }
 }
@@ -475,6 +493,21 @@ private ubyte[] deflateData(const(ubyte)[] data) {
     return result[];
 }
 
+/// Convert a SysTime to a DOS date/time pair.
+/// DOS time has 2-second resolution; SysTime.init produces zeroed fields.
+private void sysTimeToDos(SysTime t, out ushort dosTime, out ushort dosDate) {
+    import std.datetime.systime : SysTime, Clock;
+    import std.datetime.date : DateTime;
+    import std.datetime.timezone : UTC;
+    if (t == SysTime.init) t = Clock.currTime(UTC());
+    auto dt = cast(DateTime) t.toUTC();
+    int year = dt.year - 1980;
+    if (year < 0) year = 0;
+    if (year > 127) year = 127;
+    dosDate = cast(ushort) ((year << 9) | (dt.month << 5) | dt.day);
+    dosTime = cast(ushort) ((dt.hour << 11) | (dt.minute << 5) | (dt.second / 2));
+}
+
 // -- Internal structures --
 
 private struct LocalEntryInfo {
@@ -490,6 +523,8 @@ private struct LocalEntryInfo {
     bool isDir;
     bool isSymlink;
     ubyte[] extra;
+    ushort modTime;
+    ushort modDate;
 }
 
 
@@ -508,7 +543,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-roundtrip.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
@@ -546,7 +581,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-stream.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addStream("streamed.txt", (scope sink) {
             sink(cast(const(ubyte)[]) "Streamed content ");
@@ -572,7 +607,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-chaining.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
@@ -596,7 +631,7 @@ version(unittest) {
         foreach (i, ref b; largeData)
             b = cast(ubyte)(i % 256);
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("large.bin", largeData);
         writer.finish();
@@ -621,7 +656,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-props.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("file.txt", cast(const(ubyte)[]) "content")
@@ -650,7 +685,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-utf8.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("café.txt", cast(const(ubyte)[]) "coffee")
@@ -675,7 +710,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-file-readback.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "file content");
         writer.finish();
@@ -700,7 +735,7 @@ version(unittest) {
         auto outPath = "test-data/test-zip-wrt-python-interop.zip";
         scope(exit) if (Path(outPath).exists) Path(outPath).remove();
 
-        auto writer = ZipWriter.createToFile(outPath);
+        auto writer = ZipWriter(outPath);
         scope(exit) writer.close();
         writer
             .addBuffer("greeting.txt", cast(const(ubyte)[]) "Hello from D!\n")
@@ -739,7 +774,7 @@ except Exception as e:
 
         auto longName = "a".replicate(65536); // one byte over ushort.max
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         bool caught;
         try {
@@ -757,7 +792,7 @@ except Exception as e:
         auto tmpPath = "test-data/test-zip-wrt-symlink.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("target.txt", cast(const(ubyte)[]) "target content");
         writer.addSymlink("link.txt", "target.txt");
@@ -791,7 +826,7 @@ except Exception as e:
         auto tmpPath = "test-data/test-zip-wrt-underflow.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         bool caught;
         try {
@@ -813,7 +848,7 @@ except Exception as e:
         auto tmpPath = "test-data/test-zip-wrt-overflow.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         bool caught;
         try {
@@ -825,5 +860,54 @@ except Exception as e:
             caught = true;
         }
         caught.shouldBeTrue;
+    }
+
+    @("zip write: default mtime is approximately current time")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import std.datetime.systime : Clock;
+        import std.datetime.timezone : UTC;
+        import core.time : seconds;
+
+        auto before = Clock.currTime(UTC());
+        auto tmpPath = "test-data/test-zip-mtime-default.zip";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = ZipWriter(tmpPath);
+            writer.addBuffer("f.txt", cast(const(ubyte)[]) "hi");
+            writer.finish();
+        }
+        auto after = Clock.currTime(UTC());
+
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
+        auto entry = reader.entries.front;
+        // DOS time has 2-second resolution — allow 2s slack
+        (entry.mtime + 2.seconds >= before).shouldBeTrue;
+        (entry.mtime <= after + 2.seconds).shouldBeTrue;
+    }
+
+    @("zip write: mtime round-trip via addBuffer")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import darkarchive.formats.zip.reader : ZipReader;
+        import std.datetime.systime : SysTime;
+        import std.datetime.date : DateTime;
+        import std.datetime.timezone : UTC;
+
+        // DOS time has 2-second resolution; use an even second to avoid rounding.
+        auto mtime = SysTime(DateTime(2024, 6, 15, 10, 30, 22), UTC());
+
+        auto tmpPath = "test-data/test-zip-mtime.zip";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = ZipWriter(tmpPath);
+            writer.addBuffer("f.txt", cast(const(ubyte)[]) "hi", octal!644, mtime);
+            writer.finish();
+        }
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
+        auto entry = reader.entries.front;
+        entry.mtime.shouldEqual(mtime);
     }
 }

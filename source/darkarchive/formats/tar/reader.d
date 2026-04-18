@@ -10,6 +10,7 @@
 /// Use the `tarReader(range)` factory for range-based construction.
 module darkarchive.formats.tar.reader;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.tar.types;
@@ -46,6 +47,11 @@ struct TarReader(R) if (isTarStream!R) {
     /// Open TAR from a stream value (ChunkReader or other isTarStream type).
     this(R stream) {
         _stream = stream;
+    }
+
+    /// Declare supported capabilities.
+    static bool supports(ArchiveCapability cap) {
+        return cap == ArchiveCapability.streamingRead;
     }
 
     /// Close the underlying data source.
@@ -233,9 +239,11 @@ struct TarReader(R) if (isTarStream!R) {
                         try { dataSize = (*s).to!size_t; }
                         catch (ConvOverflowException)
                             { throw new DarkArchiveException("TAR: PAX size value too large"); }
-                        // size field in the entry is signed long; clamp if needed.
-                        _reader._currentEntry.size =
-                            dataSize > long.max ? long.max : cast(long) dataSize;
+                        // DarkArchiveEntry.size is signed long; reject values that
+                        // exceed long.max rather than silently clamping them.
+                        if (dataSize > cast(ulong) long.max)
+                            throw new DarkArchiveException("TAR: PAX size exceeds maximum supported value");
+                        _reader._currentEntry.size = cast(long) dataSize;
                         if (dataSize > size_t.max - (TAR_BLOCK_SIZE - 1))
                             throw new DarkArchiveException("TAR: PAX size too large");
                         paddedSize = (dataSize + TAR_BLOCK_SIZE - 1)
@@ -356,6 +364,27 @@ private void applyPaxAttrs(ref DarkArchiveEntry e, string[string] attrs) {
     if (auto p = "gid" in attrs) {
         import std.conv : to;
         e.gid = (*p).to!long;
+    }
+    if (auto p = "mtime" in attrs) {
+        import std.datetime.systime : SysTime;
+        import std.datetime.timezone : UTC;
+        import std.string : indexOf;
+        import std.conv : to;
+        auto str = *p;
+        auto dotPos = str.indexOf('.');
+        long secs;
+        long fracHnsecs = 0;
+        if (dotPos >= 0) {
+            secs = str[0 .. dotPos].to!long;
+            // Fractional part: pad/truncate to exactly 7 digits (hnsec = 100ns resolution)
+            auto fracStr = str[dotPos + 1 .. $];
+            if (fracStr.length > 7) fracStr = fracStr[0 .. 7];
+            while (fracStr.length < 7) fracStr ~= "0";
+            fracHnsecs = fracStr.to!long;
+        } else {
+            secs = str.to!long;
+        }
+        e.mtime = SysTime(unixTimeToStdTime(secs) + fracHnsecs, UTC());
     }
 }
 
@@ -963,6 +992,70 @@ version(unittest) {
         caught.shouldBeTrue;
     }
 
+    @("tar security: pax size just above long.max throws")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.exception : DarkArchiveException;
+
+        // PAX record: "28 size=9223372036854775808\n"  (long.max+1 = 2^63)
+        // Length is self-inclusive: "28 " (3) + "size=9223372036854775808" (24) + "\n" (1) = 28 ✓
+        auto paxContent = cast(ubyte[]) "28 size=9223372036854775808\n";
+        assert(paxContent.length == 28);
+
+        ubyte[TAR_BLOCK_SIZE] paxHdr;
+        paxHdr[] = 0;
+        paxHdr[0 .. 9] = cast(ubyte[9]) "PaxHeader";
+        paxHdr[156] = 'x';
+        paxHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        paxHdr[263 .. 265] = cast(ubyte[2]) "00";
+        paxHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        // size = 28 decimal = 034 octal → "0000000034\0"
+        paxHdr[124 .. 136] = cast(ubyte[12]) "00000000034\0";
+        paxHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        uint cs = 0;
+        foreach (i, b; paxHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        import std.format : format;
+        auto csStr = format!"%06o\0 "(cs);
+        paxHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE] paxDataBlock;
+        paxDataBlock[] = 0;
+        paxDataBlock[0 .. 28] = paxContent[];
+
+        ubyte[TAR_BLOCK_SIZE] fileHdr;
+        fileHdr[] = 0;
+        fileHdr[0 .. 5] = cast(ubyte[5]) "a.txt";
+        fileHdr[156] = '0';
+        fileHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        fileHdr[263 .. 265] = cast(ubyte[2]) "00";
+        fileHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        fileHdr[124 .. 136] = cast(ubyte[12]) "00000000000\0";
+        fileHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        cs = 0;
+        foreach (i, b; fileHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        csStr = format!"%06o\0 "(cs);
+        fileHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE * 2] eoar;
+        eoar[] = 0;
+
+        auto tmpPath = "test-data/test-tarr-pax-longmax.tar";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        ubyte[] archiveData;
+        archiveData ~= paxHdr[];
+        archiveData ~= paxDataBlock[];
+        archiveData ~= fileHdr[];
+        archiveData ~= eoar[];
+        Path(tmpPath).writeFile(archiveData);
+
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { foreach (entry; reader.entries) {} }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
     @("tar security: pax path value with NUL byte is preserved (throw at extract time)")
     unittest {
         import unit_threaded.assertions : shouldEqual;
@@ -1311,5 +1404,60 @@ version(unittest) {
             }
         }
         found.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Interop: archives produced by external tools
+    // -------------------------------------------------------------------
+
+    /// test-gnu-pax.tar.gz was produced by:
+    ///   tar --format=pax --owner=testuser --group=testgroup -czf \
+    ///       test-gnu-pax.tar.gz hello.txt script.sh subdir/ link.txt
+    /// All regular-file mtimes were set to 1710506096.123456716 UTC
+    /// (2024-03-15T12:34:56.1234567Z to hnsec precision).
+
+    @("tar interop: GNU tar PAX mtime has sub-second precision")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.datetime.systime : SysTime, unixTimeToStdTime;
+        import std.datetime.timezone : UTC;
+
+        // PAX mtime string "1710506096.123456716"
+        // → integer 1710506096, fractional "1234567" (first 7 digits) = 1_234_567 hnsecs
+        auto expected = SysTime(unixTimeToStdTime(1710506096L) + 1_234_567L, UTC());
+
+        auto reader = tarGzReader("test-data/test-gnu-pax.tar.gz");
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                entry.mtime.shouldEqual(expected);
+                found = true;
+            }
+        }
+        assert(found, "hello.txt not found in test-gnu-pax.tar.gz");
+    }
+
+    @("tar interop: GNU tar PAX permissions and ownership fields")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.conv : octal;
+
+        auto reader = tarGzReader("test-data/test-gnu-pax.tar.gz");
+        scope(exit) reader.close();
+        bool foundHello, foundScript;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                entry.permissions.shouldEqual(octal!644);
+                entry.uname.shouldEqual("testuser");
+                entry.gname.shouldEqual("testgroup");
+                foundHello = true;
+            } else if (entry.pathname == "script.sh") {
+                entry.permissions.shouldEqual(octal!755);
+                foundScript = true;
+            }
+        }
+        assert(foundHello, "hello.txt not found");
+        assert(foundScript, "script.sh not found");
     }
 }

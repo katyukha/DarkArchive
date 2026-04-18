@@ -10,11 +10,15 @@
 module darkarchive.archive;
 
 import std.conv : octal;
+import std.datetime.systime : SysTime;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip : ZipReader, ZipWriter;
-import darkarchive.formats.tar : TarReader, TarWriter, tarWriter, tarGzWriter;
+import darkarchive.formats.tar : TarWriter,
+    TarFileReader, TarGzReader, TarFileWriter, TarGzWriter,
+    tarWriter, tarGzWriter;
 import darkarchive.datasource : chunkSource, DelegateSink, FileChunkSource,
     ChunkReader, GzipRange;
 import darkarchive.gzip : GzipSink;
@@ -30,35 +34,17 @@ enum DarkArchiveFormat {
     // tarZst,  -- future stage
 }
 
-/// Optional capabilities that vary by format (for runtime queries via supports()).
-enum ArchiveCapability {
-    streamingRead,    /// Can stream from any input range (TAR/TARGZ via darkArchiveReader)
-    streamingWrite,   /// Can stream to any output range (TAR/TARGZ via darkArchiveWriter)
-    randomAccessRead  /// Can seek to arbitrary entries (e.g. ZIP central directory)
-}
-
 /// Query whether a format supports a given capability at runtime.
-/// Prefer static asserts and template constraints for compile-time checks.
+/// Delegates to the concrete reader and writer `supports` declarations —
+/// the impls are the single source of truth.
 bool supports(DarkArchiveFormat fmt, ArchiveCapability cap) {
-    final switch (cap) {
-        case ArchiveCapability.streamingRead:
-            final switch (fmt) {
-                case DarkArchiveFormat.zip:   return false;
-                case DarkArchiveFormat.tar:   return true;
-                case DarkArchiveFormat.tarGz: return true;
-            }
-        case ArchiveCapability.streamingWrite:
-            final switch (fmt) {
-                case DarkArchiveFormat.zip:   return false;
-                case DarkArchiveFormat.tar:   return true;
-                case DarkArchiveFormat.tarGz: return true;
-            }
-        case ArchiveCapability.randomAccessRead:
-            final switch (fmt) {
-                case DarkArchiveFormat.zip:   return true;
-                case DarkArchiveFormat.tar:   return false;
-                case DarkArchiveFormat.tarGz: return false;
-            }
+    final switch (fmt) {
+        case DarkArchiveFormat.zip:
+            return ZipReader.supports(cap) || ZipWriter.supports(cap);
+        case DarkArchiveFormat.tar:
+            return TarFileReader.supports(cap) || TarFileWriter.supports(cap);
+        case DarkArchiveFormat.tarGz:
+            return TarGzReader.supports(cap) || TarGzWriter.supports(cap);
     }
 }
 
@@ -66,7 +52,10 @@ bool supports(DarkArchiveFormat fmt, ArchiveCapability cap) {
 enum DarkExtractFlags {
     none        = 0,
     securePaths = 1,
+    /// Allow symlink extraction (opt-in; skipped by default).
     symlinks    = 2,
+    /// Allow hardlink extraction (opt-in; skipped by default).
+    hardlinks   = 4,
     defaults    = securePaths,
 }
 
@@ -191,8 +180,13 @@ private void applyFilePermissions(string path, uint archivePerms) {
         auto safeBits = archivePerms & octal!777;
         safeBits &= ~octal!22;
         if (safeBits == 0) return;
-        import std.file : setAttributes;
-        try { setAttributes(path, safeBits); } catch (Exception) {}
+        import std.file : setAttributes, FileException;
+        try {
+            setAttributes(path, safeBits);
+        } catch (FileException e) {
+            throw new DarkArchiveException(
+                "Failed to set permissions on " ~ path ~ ": " ~ e.msg);
+        }
     }
 }
 
@@ -222,8 +216,10 @@ private string resolveRealPath(string path) {
         try {
             auto realBase = existing.realPath();
             return (tail.length == 0 ? realBase : realBase.join(tail)).toString();
-        } catch (Exception) {
-            return abs.toString();
+        } catch (Exception e) {
+            throw new DarkArchiveException(
+                "Cannot resolve path for safety check (permission denied or broken symlink): "
+                ~ e.msg);
         }
     } else {
         return Path(path).toAbsolute().toString();
@@ -247,17 +243,21 @@ private string formatMemSize(ulong bytes) {
 
 /// Data accessor for a single archive entry — obtained via `DarkArchiveItem.data`.
 ///
-/// For TAR and TAR.GZ this is only valid during the current `foreach` iteration
+/// Templated over the concrete reader type. Dispatches via the reader's own
+/// `supports(ArchiveCapability)` declaration at compile time:
+///   - random-access readers (ZIP): `readData(idx)` / `readDataChunked(idx, …)`
+///   - sequential readers  (TAR):   `readData()`    / `readDataChunked(…)`
+///
+/// For TAR/TAR.GZ this is only valid during the current `foreach` iteration
 /// step; calling read methods after `popFront` is undefined behaviour.
 /// For ZIP the accessor is position-independent (random access), but the same
 /// rule should be assumed for portability.
 ///
 /// Non-copyable by design: copy `item.meta` (a plain `DarkArchiveEntry`) if you
 /// need to retain metadata across iterations.
-struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
-    private DarkArchiveReader!fmt* _parent;
-    static if (fmt == DarkArchiveFormat.zip)
-        private size_t _idx;
+struct DarkArchiveItemReader(Reader) {
+    private Reader* _reader;
+    static if (Reader.supports(ArchiveCapability.randomAccessRead)) private size_t _idx;
 
     @disable this(this);
 
@@ -268,12 +268,14 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     /// Use `readChunks` for entries that may exceed that limit, or for streaming
     /// reads of large entries without buffering them in memory.
     ubyte[] readAll() {
-        static if (fmt == DarkArchiveFormat.zip)
-            return cast(ubyte[]) _parent._reader.readData(_idx).dup;
-        else {
-            auto d = _parent._reader.readData();
+        static if (Reader.supports(ArchiveCapability.randomAccessRead))
+            return cast(ubyte[]) _reader.readData(_idx).dup;
+        else static if (Reader.supports(ArchiveCapability.streamingRead)) {
+            auto d = _reader.readData();
             return d is null ? [] : cast(ubyte[]) d;
-        }
+        } else
+            static assert(false, Reader.stringof ~
+                " declares neither streamingRead nor randomAccessRead capability");
     }
 
     /// Convenience: readAll as a UTF-8 string.
@@ -282,10 +284,13 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     /// Stream entry data in chunks without buffering the full entry in memory.
     void readChunks(scope void delegate(const(ubyte)[] chunk) sink,
                      size_t chunkSize = 8192) {
-        static if (fmt == DarkArchiveFormat.zip)
-            _parent._reader.readDataChunked(_idx, sink, chunkSize);
+        static if (Reader.supports(ArchiveCapability.randomAccessRead))
+            _reader.readDataChunked(_idx, sink, chunkSize);
+        else static if (Reader.supports(ArchiveCapability.streamingRead))
+            _reader.readDataChunked(sink, chunkSize);
         else
-            _parent._reader.readDataChunked(sink, chunkSize);
+            static assert(false, Reader.stringof ~
+                " declares neither streamingRead nor randomAccessRead capability");
     }
 }
 
@@ -301,9 +306,9 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
 /// foreach (ref item; reader.entries)
 ///     if (item.meta.isFile) saved = item.meta;
 /// ---
-struct DarkArchiveItem(DarkArchiveFormat fmt) {
-    DarkArchiveEntry          meta;
-    DarkArchiveItemReader!fmt data;
+struct DarkArchiveItem(Reader) {
+    DarkArchiveEntry             meta;
+    DarkArchiveItemReader!Reader data;
 
     @disable this(this);
 }
@@ -322,45 +327,53 @@ struct DarkArchiveItem(DarkArchiveFormat fmt) {
 /// TAR and TAR.GZ additionally support a streaming delegate constructor.
 /// ZIP does not — attempting to instantiate it is a compile-time error.
 struct DarkArchiveReader(DarkArchiveFormat fmt) {
-    static if (fmt == DarkArchiveFormat.zip) {
-        private ZipReader* _reader;
-    } else static if (fmt == DarkArchiveFormat.tar) {
-        private TarReader!(ChunkReader!FileChunkSource)* _reader;
-    } else { // tarGz
-        private TarReader!(ChunkReader!(GzipRange!FileChunkSource))* _reader;
-    }
+    static if (fmt == DarkArchiveFormat.zip)
+        private alias ImplReader = ZipReader;
+    else static if (fmt == DarkArchiveFormat.tar)
+        private alias ImplReader = TarFileReader;
+    else
+        private alias ImplReader = TarGzReader;
+
+    private ImplReader _reader;
 
     /// The archive format — a compile-time constant.
     enum DarkArchiveFormat format = fmt;
 
     @disable this();
+    @disable this(this);
 
     this(in Path path) { this(path.toString()); }
 
     /// Open from file path.
     this(string path) {
         static if (fmt == DarkArchiveFormat.zip) {
-            _reader = new ZipReader(path);
+            _reader = ImplReader(path);
         } else static if (fmt == DarkArchiveFormat.tar) {
             auto cr = ChunkReader!FileChunkSource(FileChunkSource(path));
-            _reader = new typeof(*_reader)(cr);
+            _reader = ImplReader(cr);
         } else {
             alias CR = ChunkReader!(GzipRange!FileChunkSource);
             auto cr = CR(GzipRange!FileChunkSource(FileChunkSource(path)));
-            _reader = new typeof(*_reader)(cr);
+            _reader = ImplReader(cr);
         }
     }
 
     void close() { _reader.close(); }
 
     /// Iterate over entries.
-    auto entries() { return EntryRange(&this); }
+    auto entries() { return EntryRange(&_reader); }
 
     // -- processEntries --
 
-    /// Process all entries, calling processor for each.
+    /// Process all entries, calling `processor` for each.
+    ///
+    /// The item type in the delegate is opaque (`DarkArchiveItem!ImplReader`,
+    /// where `ImplReader` is a private alias). Use `auto ref` in the lambda:
+    /// ---
+    /// reader.processEntries((scope ref auto item) { ... });
+    /// ---
     size_t processEntries(
-            scope void delegate(scope ref DarkArchiveItem!fmt item) processor) {
+            scope void delegate(scope ref DarkArchiveItem!ImplReader item) processor) {
         size_t count;
         foreach (ref item; entries()) {
             processor(item);
@@ -370,9 +383,10 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
     }
 
     /// Process specific entries by pathname. Stops early when all are found.
+    /// See `processEntries` above for the `auto ref` delegate convention.
     size_t processEntries(
             const(string)[] names,
-            scope void delegate(scope ref DarkArchiveItem!fmt item) processor) {
+            scope void delegate(scope ref DarkArchiveItem!ImplReader item) processor) {
         if (names.length == 0) return 0;
         bool[string] remaining;
         foreach (name; names) remaining[name] = true;
@@ -474,10 +488,11 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                             "Refusing to create symlink with '..' in target: " ~ target);
                 }
                 auto parent = fullPath.parent;
-                if (!parent.exists)
-                    parent.mkdir(true);
+                // Verify before creating: a compromised path must not materialise on disk.
                 if (flags & DarkExtractFlags.securePaths)
                     verifyPathWithinRoot(parent.toString(), destStr);
+                if (!parent.exists)
+                    parent.mkdir(true);
                 version(Posix) {
                     Path(item.meta.symlinkTarget).symlink(fullPath);
                 } else {
@@ -486,7 +501,7 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 }
                 // symlinks have no data — popFront auto-skips
             } else if (item.meta.isHardlink) {
-                if (!(flags & DarkExtractFlags.symlinks)) continue;
+                if (!(flags & DarkExtractFlags.hardlinks)) continue;
                 auto target = item.meta.symlinkTarget;
                 if (target.length > 0 && target[0] == '/')
                     throw new DarkArchiveException(
@@ -503,6 +518,9 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                     if (flags & DarkExtractFlags.securePaths)
                         verifyPathWithinRoot(targetFull, destStr);
                     auto parent = fullPath.parent;
+                    // Verify before creating parent directories.
+                    if (flags & DarkExtractFlags.securePaths)
+                        verifyPathWithinRoot(parent.toString(), destStr);
                     if (!parent.exists)
                         parent.mkdir(true);
                     if (posixLink(targetFull.toStringz, fullPath.toString.toStringz) != 0)
@@ -515,17 +533,17 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
                 // hardlinks have no data — popFront auto-skips
             } else {
                 auto parent = fullPath.parent;
-                if (!parent.exists)
-                    parent.mkdir(true);
                 if (flags & DarkExtractFlags.securePaths)
                     verifyPathWithinRoot(parent.toString(), destStr);
+                if (!parent.exists)
+                    parent.mkdir(true);
                 extractEntryToFile(item.data, fullPath.toString(),
                                    item.meta.permissions, limits, totalBytes);
             }
         }
     }
 
-    private void extractEntryToFile(ref DarkArchiveItemReader!fmt dataReader,
+    private void extractEntryToFile(ref DarkArchiveItemReader!ImplReader dataReader,
                                      string outPath, uint permissions,
                                      ExtractionLimits limits, ref ulong totalBytes) {
         import std.stdio : File;
@@ -552,61 +570,73 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
 
     // -- EntryRange --
 
-    private static struct EntryRange {
-        private DarkArchiveReader!fmt* _parent;
-        private DarkArchiveItem!fmt _current;
+    /// Returned by `DarkArchiveReader.entries()`.
+    ///
+    /// Always supports sequential iteration via `foreach`.
+    /// When the underlying reader supports `randomAccessRead`, additionally
+    /// exposes `length`, `opIndex(size_t)`, and `opIndex(string)`.
+    static struct EntryRange {
+        private ImplReader* _reader;
+        private ImplReader.EntryRange _range;
+        private DarkArchiveItem!ImplReader _current;
 
-        // Non-copyable because DarkArchiveItem is non-copyable.
         @disable this(this);
 
-        static if (fmt == DarkArchiveFormat.zip) {
-            private size_t _idx;
-            private size_t _len;
+        this(ImplReader* reader) {
+            _reader = reader;
+            _range  = reader.entries();
+            _current.data._reader = reader;
+            if (!empty) _loadCurrent();
+        }
 
-            this(DarkArchiveReader!fmt* parent) {
-                _parent = parent;
-                _idx = 0;
-                _len = parent._reader.length;
-                _current.data._parent = parent;
-                if (!empty) _loadCurrent();
+        // -- Sequential iteration (all formats) --
+
+        bool empty() { return _range.empty(); }
+
+        ref DarkArchiveItem!ImplReader front() { return _current; }
+
+        void popFront() {
+            _range.popFront();
+            if (!empty) _loadCurrent();
+        }
+
+        private void _loadCurrent() {
+            _current.meta = _range.front();
+            static if (ImplReader.supports(ArchiveCapability.randomAccessRead))
+                _current.data._idx = _range.index();
+        }
+
+        // -- Random-access extras (randomAccessRead readers only) --
+
+        static if (ImplReader.supports(ArchiveCapability.randomAccessRead)) {
+
+            /// Number of entries in the archive.
+            size_t length() { return _reader.length; }
+
+            /// Direct access by index — does not affect sequential iteration state.
+            DarkArchiveItem!ImplReader opIndex(size_t idx) {
+                DarkArchiveItem!ImplReader item;
+                item.meta        = _reader.entryAt(idx);
+                item.data._reader = _reader;
+                item.data._idx   = idx;
+                return item;
             }
 
-            bool empty() { return _idx >= _len; }
-
-            ref DarkArchiveItem!fmt front() { return _current; }
-
-            void popFront() {
-                _idx++;
-                if (!empty) _loadCurrent();
-            }
-
-            private void _loadCurrent() {
-                _current.meta = _parent._reader.entryAt(_idx);
-                _current.data._idx = _idx;
-            }
-
-        } else {
-            static if (fmt == DarkArchiveFormat.tar)
-                alias TarReaderT = TarReader!(ChunkReader!FileChunkSource);
-            else
-                alias TarReaderT = TarReader!(ChunkReader!(GzipRange!FileChunkSource));
-
-            private TarReaderT.EntryRange _range;
-
-            this(DarkArchiveReader!fmt* parent) {
-                _parent = parent;
-                _range = parent._reader.entries();
-                _current.data._parent = parent;
-                if (!empty) _current.meta = _range.front();
-            }
-
-            bool empty() { return _range.empty(); }
-
-            ref DarkArchiveItem!fmt front() { return _current; }
-
-            void popFront() {
-                _range.popFront();
-                if (!empty) _current.meta = _range.front();
+            /// Direct access by pathname — linear scan, O(n).
+            /// Throws `DarkArchiveException` if no entry with that pathname exists.
+            DarkArchiveItem!ImplReader opIndex(string path) {
+                foreach (i; 0 .. _reader.length) {
+                    auto entry = _reader.entryAt(i);
+                    if (entry.pathname == path) {
+                        DarkArchiveItem!ImplReader item;
+                        item.meta        = entry;
+                        item.data._reader = _reader;
+                        item.data._idx   = i;
+                        return item;
+                    }
+                }
+                throw new DarkArchiveException(
+                    "ZIP: no entry with pathname: " ~ path);
             }
         }
     }
@@ -631,33 +661,36 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
 
     private alias Self = DarkArchiveWriter!(fmt, SinkT);
 
-    // Internal writer type depends on whether we are file-backed or sink-backed.
-    static if (is(SinkT == void)) {
-        // File-backed: delegate sink wraps a heap-allocated File.
-        static if (fmt == DarkArchiveFormat.zip)
-            private ZipWriter* _writer;
-        else static if (fmt == DarkArchiveFormat.tar)
-            private TarWriter!DelegateSink* _writer;
-        else // tarGz
-            private TarWriter!(GzipSink!DelegateSink)* _writer;
-    } else {
-        // Sink-backed: caller supplies any isOutputRange!(R, const(ubyte)[]).
-        static assert(fmt != DarkArchiveFormat.zip,
-            "ZIP format requires random access — output-range sink is not supported. "
-            ~ "Use DarkArchiveWriter!(DarkArchiveFormat.zip)(path) instead.");
+    // Impl type for capability queries (sink type does not affect capabilities).
+    static if (fmt == DarkArchiveFormat.zip)
+        private alias ImplWriter = ZipWriter;
+    else static if (fmt == DarkArchiveFormat.tar)
+        private alias ImplWriter = TarFileWriter;
+    else
+        private alias ImplWriter = TarGzWriter;
+
+    // Internal writer — embedded by value; type varies by format and sink.
+    static if (is(SinkT == void))
+        private ImplWriter _writer;
+    else {
+        // Sink-backed: only supported for streaming writers.
+        static assert(ImplWriter.supports(ArchiveCapability.streamingWrite),
+            ImplWriter.stringof ~ " does not support streaming write — "
+            ~ "use DarkArchiveWriter!(fmt)(path) for a file-backed writer instead.");
         import std.range : isOutputRange;
         static assert(isOutputRange!(SinkT, const(ubyte)[]),
             "SinkT must satisfy isOutputRange!(SinkT, const(ubyte)[])");
         static if (fmt == DarkArchiveFormat.tar)
-            private TarWriter!SinkT* _writer;
+            private TarWriter!SinkT _writer;
         else // tarGz
-            private TarWriter!(GzipSink!SinkT)* _writer;
+            private TarWriter!(GzipSink!SinkT) _writer;
     }
 
     private bool _finished;
     private string _filePath;   // non-null only for file-backed writers
 
     @disable this();
+    @disable this(this);
 
     // -----------------------------------------------------------------------
     // File-backed constructors (only available when SinkT == void)
@@ -671,25 +704,21 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
         this(string path) {
             _filePath = path;
             static if (fmt == DarkArchiveFormat.zip) {
-                _writer = new ZipWriter();
-                *_writer = ZipWriter.createToFile(path);
+                _writer = ImplWriter(path);
             } else static if (fmt == DarkArchiveFormat.tar) {
                 import std.stdio : File;
                 auto f = new File(path, "wb");
-                _writer = new TarWriter!DelegateSink(DelegateSink(
+                _writer = ImplWriter(DelegateSink(
                     (const(ubyte)[] data) { f.rawWrite(data); },
                     () { f.close(); }
                 ));
             } else { // tarGz
                 import std.stdio : File;
                 auto f = new File(path, "wb");
-                auto fsink = DelegateSink(
+                _writer = ImplWriter(GzipSink!DelegateSink(DelegateSink(
                     (const(ubyte)[] data) { f.rawWrite(data); },
                     () { f.close(); }
-                );
-                _writer = new TarWriter!(GzipSink!DelegateSink)(
-                    GzipSink!DelegateSink(fsink)
-                );
+                )));
             }
         }
     }
@@ -703,9 +732,9 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
         /// Create writer streaming to `sink`.  Call `finish()` when done.
         this(SinkT sink) {
             static if (fmt == DarkArchiveFormat.tar)
-                _writer = new TarWriter!SinkT(sink);
+                _writer = TarWriter!SinkT(sink);
             else // tarGz
-                _writer = new TarWriter!(GzipSink!SinkT)(GzipSink!SinkT(sink));
+                _writer = TarWriter!(GzipSink!SinkT)(GzipSink!SinkT(sink));
         }
     }
 
@@ -714,6 +743,11 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     // -----------------------------------------------------------------------
 
     /// Add file from disk.
+    ///
+    /// The file's mtime is read from the filesystem and stored in the archive.
+    /// Note: source file permissions are not preserved — entries are archived
+    /// with the default `octal!644`. Use `addStream` with an explicit permissions
+    /// argument if you need to control the stored mode bits.
     ref Self add(in Path sourcePath, string archiveName = null) return {
         return add(sourcePath.toString(), archiveName);
     }
@@ -721,9 +755,12 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     /// ditto
     ref Self add(string sourcePath, string archiveName = null) return {
         import std.stdio : File;
+        import std.file : getTimes;
         if (archiveName is null)
             archiveName = Path(sourcePath).baseName;
         auto fileSize = Path(sourcePath).getSize();
+        SysTime accessTime, mtime;
+        getTimes(sourcePath, accessTime, mtime);
         auto f = File(sourcePath, "rb");
         addStream(archiveName, (scope sink) {
             ubyte[8192] buf;
@@ -732,11 +769,20 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
                 if (got.length == 0) break;
                 sink(got);
             }
-        }, fileSize);
+        }, fileSize, octal!644, mtime);
         return this;
     }
 
     /// Add directory tree recursively.
+    ///
+    /// Each entry's mtime is read from the filesystem and stored in the archive.
+    /// Note: source file and directory permissions are not preserved — files are
+    /// archived with `octal!644` and directories with `octal!755`. Use the
+    /// lower-level `add`/`addDirectory`/`addSymlink` methods with explicit
+    /// permissions if you need to control the stored mode bits.
+    /// Note: for symlink entries (`FollowSymlinks.no`), the mtime reflects the
+    /// symlink target (via `stat`), not the symlink itself — `lstat` is not
+    /// exposed by `std.file`.
     ref Self addTree(in Path rootPath, string prefix = null,
                      FollowSymlinks followSym = FollowSymlinks.yes) return {
         return addTree(rootPath.toString(), prefix, followSym);
@@ -745,6 +791,7 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     /// ditto
     ref Self addTree(string rootPath, string prefix = null,
                      FollowSymlinks followSym = FollowSymlinks.yes) return {
+        import std.file : getTimes;
         auto root = Path(rootPath).toAbsolute();
         if (prefix is null) prefix = root.baseName;
         foreach (de; root.walkDepth(followSym == FollowSymlinks.yes)) {
@@ -753,10 +800,17 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
             version(Posix) {
                 if (de.isSymlink) {
                     if (followSym == FollowSymlinks.no) {
-                        addSymlink(archName, de.readLink.toString());
+                        SysTime atime, mtime;
+                        getTimes(de.toString(), atime, mtime);
+                        addSymlink(archName, de.readLink.toString(), mtime);
                     } else {
-                        if (de.isDir) addDirectory(archName);
-                        else          add(de.toString(), archName);
+                        if (de.isDir) {
+                            SysTime atime, mtime;
+                            getTimes(de.toString(), atime, mtime);
+                            addDirectory(archName, octal!755, mtime);
+                        } else {
+                            add(de.toString(), archName);
+                        }
                     }
                     continue;
                 }
@@ -765,23 +819,30 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
                     throw new DarkArchiveException(
                         "FollowSymlinks.no is not supported on this platform");
             }
-            if (de.isDir)       addDirectory(archName);
-            else if (de.isFile) add(de.toString(), archName);
+            if (de.isDir) {
+                SysTime atime, mtime;
+                getTimes(de.toString(), atime, mtime);
+                addDirectory(archName, octal!755, mtime);
+            } else if (de.isFile) {
+                add(de.toString(), archName);
+            }
         }
         return this;
     }
 
     /// Add from in-memory buffer.
     ref Self addBuffer(string archiveName, const(ubyte)[] data,
-                       uint permissions = octal!644) return {
-        _writer.addBuffer(archiveName, data, permissions);
+                       uint permissions = octal!644,
+                       SysTime mtime = SysTime.init) return {
+        _writer.addBuffer(archiveName, data, permissions, mtime);
         return this;
     }
 
     /// Add empty directory.
     ref Self addDirectory(string archiveName,
-                          uint permissions = octal!755) return {
-        _writer.addDirectory(archiveName, permissions);
+                          uint permissions = octal!755,
+                          SysTime mtime = SysTime.init) return {
+        _writer.addDirectory(archiveName, permissions, mtime);
         return this;
     }
 
@@ -789,14 +850,30 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     ref Self addStream(string archiveName,
                        scope void delegate(scope void delegate(const(ubyte)[])) reader,
                        long size = -1,
-                       uint permissions = octal!644) return {
-        _writer.addStream(archiveName, reader, size, permissions);
+                       uint permissions = octal!644,
+                       SysTime mtime = SysTime.init) return {
+        _writer.addStream(archiveName, reader, size, permissions, mtime);
         return this;
     }
 
     /// Add symlink entry.
-    ref Self addSymlink(string archiveName, string target) return {
-        _writer.addSymlink(archiveName, target);
+    ref Self addSymlink(string archiveName, string target,
+                        SysTime mtime = SysTime.init) return {
+        _writer.addSymlink(archiveName, target, octal!777, mtime);
+        return this;
+    }
+
+    /// Add a hardlink entry.
+    ///
+    /// `target` is the pathname of the linked file as it appears in the archive
+    /// (typically the value passed to `addBuffer`/`addStream` for that entry).
+    ///
+    /// Only available for formats that declare `ArchiveCapability.hardlinks`
+    /// (currently TAR and TAR.GZ; ZIP has no native hardlink entry type).
+    static if (ImplWriter.supports(ArchiveCapability.hardlinks))
+    ref Self addHardlink(string archiveName, string target,
+                         SysTime mtime = SysTime.init) return {
+        _writer.addHardlink(archiveName, target, octal!644, mtime);
         return this;
     }
 
@@ -809,10 +886,9 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     }
 
     ~this() {
-        if (_finished || _writer is null) return;
-        // Auto-finish: always for file-backed (prevents truncated files on early
-        // return); for sink-backed only when _filePath is non-null (never, so
-        // sink-backed writers require an explicit finish() call).
+        if (_finished) return;
+        // Auto-finish for file-backed writers (prevents truncated files on early
+        // return). Sink-backed writers require an explicit finish() call.
         if (_filePath !is null)
             try { finish(); } catch (Exception) {}
     }
@@ -928,22 +1004,67 @@ version(unittest) {
         supports(DarkArchiveFormat.zip, ArchiveCapability.randomAccessRead).shouldBeTrue;
         supports(DarkArchiveFormat.zip, ArchiveCapability.streamingRead).shouldBeFalse;
         supports(DarkArchiveFormat.zip, ArchiveCapability.streamingWrite).shouldBeFalse;
+        supports(DarkArchiveFormat.zip, ArchiveCapability.hardlinks).shouldBeFalse;
     }
 
-    @("capability: TAR supports streaming read and write")
+    @("capability: TAR supports streaming read, write, and hardlinks")
     unittest {
         import unit_threaded.assertions : shouldBeTrue, shouldBeFalse;
         supports(DarkArchiveFormat.tar, ArchiveCapability.streamingRead).shouldBeTrue;
         supports(DarkArchiveFormat.tar, ArchiveCapability.streamingWrite).shouldBeTrue;
         supports(DarkArchiveFormat.tar, ArchiveCapability.randomAccessRead).shouldBeFalse;
+        supports(DarkArchiveFormat.tar, ArchiveCapability.hardlinks).shouldBeTrue;
     }
 
-    @("capability: TAR.GZ supports streaming read and write")
+    @("capability: TAR.GZ supports streaming read, write, and hardlinks")
     unittest {
         import unit_threaded.assertions : shouldBeTrue, shouldBeFalse;
         supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingRead).shouldBeTrue;
         supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingWrite).shouldBeTrue;
         supports(DarkArchiveFormat.tarGz, ArchiveCapability.randomAccessRead).shouldBeFalse;
+        supports(DarkArchiveFormat.tarGz, ArchiveCapability.hardlinks).shouldBeTrue;
+    }
+
+    @("capability: addHardlink compiles for TAR but not ZIP")
+    unittest {
+        // TAR supports hardlinks — addHardlink must be available
+        static assert(__traits(compiles, {
+            WTar w = WTar("dummy.tar");
+            w.addHardlink("link.txt", "target.txt");
+        }), "addHardlink must compile for WTar");
+
+        // ZIP does not support hardlinks — addHardlink must NOT compile
+        static assert(!__traits(compiles, {
+            WZip w = WZip("dummy.zip");
+            w.addHardlink("link.txt", "target.txt");
+        }), "addHardlink must not compile for WZip");
+    }
+
+    @("high-level: TAR addHardlink round-trip")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+
+        auto archPath = Path(testDataDir, "test-hl-addHardlink.tar");
+        scope(exit) if (archPath.exists) archPath.remove();
+
+        WTar(archPath)
+            .addBuffer("original.txt", cast(const(ubyte)[]) "hardlink content")
+            .addHardlink("link.txt", "original.txt")
+            .finish();
+
+        auto reader = RTar(archPath);
+        scope(exit) reader.close();
+        bool foundOrig, foundLink;
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "original.txt") foundOrig = true;
+            if (item.meta.pathname == "link.txt") {
+                item.meta.isHardlink.shouldBeTrue;
+                item.meta.symlinkTarget.shouldEqual("original.txt");
+                foundLink = true;
+            }
+        }
+        foundOrig.shouldBeTrue;
+        foundLink.shouldBeTrue;
     }
 
     @("capability: format enum constant feeds supports() naturally")
@@ -962,10 +1083,21 @@ version(unittest) {
         static assert(!__traits(compiles,
             darkArchiveWriter!(DarkArchiveFormat.zip)(DelegateSink.init)));
         // TAR and TARGZ are supported
-        static assert(__traits(compiles,
-            darkArchiveReader!(DarkArchiveFormat.tar)(ByteChunks.init)));
-        static assert(__traits(compiles,
-            darkArchiveWriter!(DarkArchiveFormat.tar)(DelegateSink.init)));
+        static assert(is(typeof(
+            darkArchiveReader!(DarkArchiveFormat.tar)(ByteChunks.init))));
+        // DarkArchiveWriter supports TAR/TARGZ streaming write
+        static assert(supports(DarkArchiveFormat.tar, ArchiveCapability.streamingWrite));
+        static assert(supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingWrite));
+    }
+
+    @("capability: DarkArchiveWriter sink-backed instantiates for TAR")
+    unittest {
+        import darkarchive.datasource : DelegateSink;
+        // Force full struct compilation (is() doesn't validate method bodies).
+        // Verify the sink-backed constructor is reachable.
+        DarkArchiveWriter!(DarkArchiveFormat.tar, DelegateSink) w =
+            DarkArchiveWriter!(DarkArchiveFormat.tar, DelegateSink)(DelegateSink.init);
+        w.finish();
     }
 
     // -------------------------------------------------------------------
@@ -1074,6 +1206,39 @@ version(unittest) {
             if (item.meta.pathname == "cross.txt")
                 item.data.readText().shouldEqual("Cross-format test");
         }
+    }
+
+    @("high-level: add(file) preserves file mtime")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.file : getTimes, setTimes;
+        import std.datetime.systime : SysTime;
+        import std.datetime.date : DateTime;
+        import std.datetime.timezone : UTC;
+
+        auto srcPath = Path(testDataDir, "test-add-mtime-src.txt");
+        auto archPath = Path(testDataDir, "test-add-mtime.tar");
+        scope(exit) if (srcPath.exists) srcPath.remove();
+        scope(exit) if (archPath.exists) archPath.remove();
+
+        srcPath.writeFile(cast(ubyte[]) "hello");
+        // Set a specific mtime (even second avoids DOS 2s rounding issues)
+        auto mtime = SysTime(DateTime(2023, 3, 15, 12, 0, 0), UTC());
+        SysTime atime = mtime;
+        setTimes(srcPath.toString(), atime, mtime);
+
+        WTar(archPath).add(srcPath.toString(), "f.txt").finish();
+
+        auto reader = RTar(archPath);
+        scope(exit) reader.close();
+        bool found;
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "f.txt") {
+                item.meta.mtime.shouldEqual(mtime);
+                found = true;
+            }
+        }
+        assert(found, "entry f.txt not found in archive");
     }
 
     @("high-level: non-existent file throws")
@@ -1587,7 +1752,7 @@ version(unittest) {
     // Hardlink extraction tests
     // -------------------------------------------------------------------
 
-    version(Posix) @("hardlink: extractTo creates hardlink when symlinks flag set")
+    version(Posix) @("hardlink: extractTo creates hardlink when hardlinks flag set")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
@@ -1605,16 +1770,22 @@ version(unittest) {
         scope(exit) if (extractDir.exists) extractDir.remove();
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
-        reader.extractTo(extractDir, DarkExtractFlags.symlinks);
+        reader.extractTo(extractDir, DarkExtractFlags.hardlinks);
 
         assert((extractDir ~ "original.txt").exists);
         assert((extractDir ~ "link.txt").exists);
         (extractDir ~ "link.txt").readFileText().shouldEqual("hardlink content");
 
-        // Verify same inode — confirms it's a real hardlink, not a copy
+        // Verify same inode — confirms it's a real hardlink, not a copy.
+        // Use toStringz: D strings are not null-terminated; passing .ptr to a
+        // C function that expects const(char)* is undefined behaviour and fails
+        // silently on LDC whose allocator does not zero-pad past the slice end.
+        import std.string : toStringz;
         stat_t s1, s2;
-        stat((extractDir ~ "original.txt").toString.ptr, &s1);
-        stat((extractDir ~ "link.txt").toString.ptr, &s2);
+        assert(stat((extractDir ~ "original.txt").toString.toStringz, &s1) == 0,
+               "stat failed for original.txt");
+        assert(stat((extractDir ~ "link.txt").toString.toStringz, &s2) == 0,
+               "stat failed for link.txt");
         (s1.st_ino == s2.st_ino).shouldBeTrue;
     }
 
@@ -1658,13 +1829,13 @@ version(unittest) {
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
-        try { reader.extractTo(extractDir, DarkExtractFlags.symlinks); }
+        try { reader.extractTo(extractDir, DarkExtractFlags.hardlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
     }
 
     version(Posix) {} else
-    @("hardlink: non-Posix platform throws DarkArchiveException when symlinks flag is set")
+    @("hardlink: non-Posix platform throws DarkArchiveException when hardlinks flag is set")
     unittest {
         import unit_threaded.assertions : shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
@@ -1682,9 +1853,9 @@ version(unittest) {
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
-        // With symlinks flag: on non-Posix, hardlink extraction must throw
-        // rather than silently dropping the entry (same behaviour as symlinks).
-        try { reader.extractTo(extractDir, DarkExtractFlags.symlinks); }
+        // With hardlinks flag: on non-Posix, hardlink extraction must throw
+        // rather than silently dropping the entry.
+        try { reader.extractTo(extractDir, DarkExtractFlags.hardlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
     }
@@ -1706,7 +1877,7 @@ version(unittest) {
         auto reader = RTar(tmpTar);
         scope(exit) reader.close();
         bool caught;
-        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks); }
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.hardlinks); }
         catch (DarkArchiveException) { caught = true; }
         caught.shouldBeTrue;
     }
@@ -2093,7 +2264,7 @@ version(unittest) {
         auto zeros = new ubyte[](1024 * 1024);
         auto tmpPath = "test-data/test-atk-bomb.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("bomb.bin", zeros);
         writer.finish();
@@ -3037,6 +3208,80 @@ version(unittest) {
         assert(growth < 2 * 1024 * 1024,
             "TAR addStream(known size): memory grew by " ~ formatMemSize(growth));
         assert(Path(outPath).getSize() > ENTRY_SIZE);
+    }
+
+    version(Posix) @("security: hardlinks skipped without explicit hardlinks flag")
+    unittest {
+        // Hardlink extraction requires DarkExtractFlags.hardlinks; without it
+        // they must be silently skipped (same as symlinks without symlinks flag).
+        import unit_threaded.assertions : shouldBeFalse;
+        import darkarchive.formats.tar.writer : tarWriter;
+        auto tmpTar = "test-data/test-sec-hardlink-skip.tar";
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
+        {
+            auto tw = tarWriter(tmpTar);
+            tw.addBuffer("real.txt", cast(const(ubyte)[]) "data");
+            tw.addSymlink("link.txt", "real.txt", octal!777); // reuse writer; link type set internally
+            tw.finish();
+        }
+        // Build a TAR with a hardlink entry manually
+        // (tarWriter.addBuffer then addSymlink records a symlink; use raw bytes)
+        import darkarchive.formats.tar.types : TAR_BLOCK_SIZE;
+        ubyte[TAR_BLOCK_SIZE] hlHdr;
+        hlHdr[] = 0;
+        hlHdr[0 .. 8] = cast(ubyte[8]) "link.txt";
+        hlHdr[156] = '1'; // hardlink typeflag
+        hlHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        hlHdr[263 .. 265] = cast(ubyte[2]) "00";
+        hlHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        hlHdr[124 .. 136] = cast(ubyte[12]) "00000000000\0";
+        hlHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        // linkname field (bytes 157..257): "real.txt"
+        hlHdr[157 .. 165] = cast(ubyte[8]) "real.txt";
+        uint cs = 0;
+        foreach (i, b; hlHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        import std.format : format;
+        auto csStr = format!"%06o\0 "(cs);
+        hlHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE] fileHdr;
+        fileHdr[] = 0;
+        fileHdr[0 .. 8] = cast(ubyte[8]) "real.txt";
+        fileHdr[156] = '0';
+        fileHdr[257 .. 263] = cast(ubyte[6]) "ustar\0";
+        fileHdr[263 .. 265] = cast(ubyte[2]) "00";
+        fileHdr[100 .. 108] = cast(ubyte[8]) "0000644\0";
+        fileHdr[124 .. 136] = cast(ubyte[12]) "00000000004\0"; // size=4 octal
+        fileHdr[136 .. 148] = cast(ubyte[12]) "00000000000\0";
+        cs = 0;
+        foreach (i, b; fileHdr) cs += (i >= 148 && i < 156) ? ' ' : b;
+        csStr = format!"%06o\0 "(cs);
+        fileHdr[148 .. 156] = cast(ubyte[8]) csStr[0 .. 8];
+
+        ubyte[TAR_BLOCK_SIZE] dataBk;
+        dataBk[0 .. 4] = cast(ubyte[4]) "data";
+
+        ubyte[TAR_BLOCK_SIZE * 2] eoar;
+        eoar[] = 0;
+
+        auto hlTar = "test-data/test-sec-hardlink-only.tar";
+        scope(exit) if (Path(hlTar).exists) Path(hlTar).remove();
+        ubyte[] archiveData;
+        archiveData ~= fileHdr[];
+        archiveData ~= dataBk[];
+        archiveData ~= hlHdr[];
+        archiveData ~= eoar[];
+        Path(hlTar).writeFile(archiveData);
+
+        auto extractDir = Path(testDataDir, "sec-hardlink-skip-test");
+        scope(exit) if (extractDir.exists) extractDir.remove();
+
+        auto reader = RTar(hlTar);
+        scope(exit) reader.close();
+        // Without hardlinks flag, hardlink entry is skipped — no exception
+        reader.extractTo(extractDir, DarkExtractFlags.defaults);
+        // The hardlink must not have been created
+        (extractDir ~ "link.txt").exists.shouldBeFalse;
     }
 
     @("streaming: ZIP addStream with known size does not buffer full entry")

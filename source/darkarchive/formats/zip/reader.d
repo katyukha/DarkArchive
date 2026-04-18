@@ -8,6 +8,7 @@
 /// - File-backed I/O (does not load full archive into memory)
 module darkarchive.formats.zip.reader;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;
@@ -31,6 +32,11 @@ struct ZipReader {
         parseCentralDirectory();
     }
 
+    /// Declare supported capabilities.
+    static bool supports(ArchiveCapability cap) {
+        return cap == ArchiveCapability.randomAccessRead;
+    }
+
     /// Number of entries in the archive.
     size_t length() const {
         return _entries.length;
@@ -41,23 +47,26 @@ struct ZipReader {
         _ds.close();
     }
 
-    /// Iterate over entries.
-    auto entries() {
-        static struct EntryRange {
-            private ZipReader* _reader;
-            private size_t _index;
+    /// Sequential entry range returned by `entries()`.
+    ///
+    /// Exposes `index()` so the high-level reader can read the current position
+    /// without tracking it independently.
+    struct EntryRange {
+        private ZipReader* _reader;
+        private size_t _index;
 
-            bool empty() { return _index >= _reader._entries.length; }
+        bool empty() { return _index >= _reader._entries.length; }
 
-            DarkArchiveEntry front() {
-                return _reader.entryAt(_index);
-            }
+        DarkArchiveEntry front() { return _reader.entryAt(_index); }
 
-            void popFront() { _index++; }
-        }
+        void popFront() { _index++; }
 
-        return EntryRange(&this, 0);
+        /// Current entry index.
+        size_t index() const { return _index; }
     }
+
+    /// Iterate over entries sequentially.
+    EntryRange entries() { return EntryRange(&this, 0); }
 
     /// Read the data of the entry at the given index.
     const(ubyte)[] readData(size_t index) {
@@ -112,8 +121,12 @@ struct ZipReader {
                 "ZIP: unsupported compression method %d".format(method));
         }
 
-        // Verify CRC32 (skip if stored CRC is 0 — some tools omit it for directories)
-        if (ci.crc32 != 0) {
+        // Verify CRC32.  Directories have no data and always have CRC=0 —
+        // skip the check only for them.  For file entries always verify,
+        // even if the stored CRC is 0 (a zero CRC for a file is either a
+        // tool bug or a crafted bypass attempt).
+        bool isDir = ci.filename.length > 0 && ci.filename[$-1] == '/';
+        if (!isDir) {
             import std.digest.crc : crc32Of;
             auto computed = crc32Of(result);
             uint computedVal = (cast(uint) computed[0])
@@ -155,6 +168,8 @@ struct ZipReader {
         if (compressedSize > _ds.length || dataStart + compressedSize > _ds.length)
             throw new DarkArchiveException("ZIP: compressed data out of bounds");
 
+        bool isDir = ci.filename.length > 0 && ci.filename[$-1] == '/';
+
         if (method == ZIP_METHOD_STORE) {
             // Store: read from DataSource in chunks (no decompression)
             import std.digest.crc : CRC32;
@@ -171,10 +186,10 @@ struct ZipReader {
                 remaining -= toRead;
             }
 
-            verifyCRC(ci.crc32, crc);
+            if (!isDir) verifyCRC(ci.crc32, crc);
         } else if (method == ZIP_METHOD_DEFLATE) {
             // Deflate: read compressed data in chunks, inflate, yield decompressed chunks
-            inflateChunked(_ds, dataStart, compressedSize, ci.crc32, sink, chunkSize);
+            inflateChunked(_ds, dataStart, compressedSize, ci.crc32, sink, chunkSize, isDir);
         } else {
             import std.format : format;
             throw new DarkArchiveException(
@@ -210,7 +225,15 @@ struct ZipReader {
         else
             e.type = EntryType.file;
 
-        e.mtime = dosTimeToSysTime(ci.lastModTime, ci.lastModDate);
+        if (ci.utMtime != long.min) {
+            // UT extra field (0x5455) gives exact Unix mtime — prefer it over
+            // the DOS time which has only 2-second resolution and is local-time-based.
+            import std.datetime.systime : SysTime, unixTimeToStdTime;
+            import std.datetime.timezone : UTC;
+            e.mtime = SysTime(unixTimeToStdTime(ci.utMtime), UTC());
+        } else {
+            e.mtime = dosTimeToSysTime(ci.lastModTime, ci.lastModDate);
+        }
 
         return e;
     }
@@ -304,7 +327,7 @@ struct ZipReader {
             auto extraStart = fnStart + fnLen;
             if (extraStart + extraLen <= _ds.length) {
                 auto extraData = _ds.readSlice(extraStart, extraLen);
-                parseZip64Extra(extraData, ci);
+                parseCentralDirExtra(extraData, ci);
             }
 
             // Apply SFX offset adjustment to local header offset
@@ -335,7 +358,7 @@ struct ZipReader {
         centralDirOffset = _ds.readLE!ulong(zip64EOCDOffset + 48);
     }
 
-    private static void parseZip64Extra(const(ubyte)[] extra, ref CentralDirInfo ci) {
+    private static void parseCentralDirExtra(const(ubyte)[] extra, ref CentralDirInfo ci) {
         size_t pos = 0;
         while (pos + 4 <= extra.length) {
             auto headerId = readLEStatic!ushort(extra, pos);
@@ -358,6 +381,13 @@ struct ZipReader {
                     ci.localHeaderOffset = readLEStatic!ulong(extra, fieldPos);
                     fieldPos += 8;
                 }
+            } else if (headerId == 0x5455) { // UT — Unix Timestamp extra field
+                // Flags byte: bit 0 = mtime present, bit 1 = atime, bit 2 = ctime.
+                // In the central directory only mtime is stored even when all bits set.
+                if (dataSize >= 5 && (extra[pos] & 1)) {
+                    // mtime is a 32-bit unsigned Unix timestamp (wraps in 2106, not 2038)
+                    ci.utMtime = cast(long) readLEStatic!uint(extra, pos + 1);
+                }
             }
             pos += dataSize;
         }
@@ -377,6 +407,7 @@ private struct CentralDirInfo {
     ulong localHeaderOffset;
     uint externalAttrsRaw;
     ushort externalAttrsUnix;
+    long utMtime = long.min;  /// Unix mtime from UT extra field (0x5455); long.min = absent
 }
 
 // -- Helpers --
@@ -478,7 +509,8 @@ private ubyte[] inflate(const(ubyte)[] compressedData, ulong uncompressedSize) {
 private void inflateChunked(ref DataSource ds, ulong dataStart,
                              ulong compressedSize, uint expectedCRC,
                              scope void delegate(const(ubyte)[] chunk) sink,
-                             size_t chunkSize) {
+                             size_t chunkSize,
+                             bool skipCrc = false) {
     import etc.c.zlib;
     import std.digest.crc : CRC32;
 
@@ -528,20 +560,19 @@ private void inflateChunked(ref DataSource ds, ulong dataStart,
             throw new DarkArchiveException("ZIP: inflate failed");
     }
 
-    verifyCRC(expectedCRC, crc);
+    if (!skipCrc) verifyCRC(expectedCRC, crc);
 }
 
-/// Verify CRC32 against expected value.
+/// Verify CRC32.  Always checks — callers must not call this for
+/// directory entries (they have no data and always have CRC=0).
 private void verifyCRC(T)(uint expectedCRC, ref T crc) {
-    if (expectedCRC != 0) {
-        auto computed = crc.finish();
-        uint computedVal = (cast(uint) computed[0])
-                         | (cast(uint) computed[1] << 8)
-                         | (cast(uint) computed[2] << 16)
-                         | (cast(uint) computed[3] << 24);
-        if (computedVal != expectedCRC)
-            throw new DarkArchiveException("ZIP: CRC32 mismatch (data corrupted)");
-    }
+    auto computed = crc.finish();
+    uint computedVal = (cast(uint) computed[0])
+                     | (cast(uint) computed[1] << 8)
+                     | (cast(uint) computed[2] << 16)
+                     | (cast(uint) computed[3] << 24);
+    if (computedVal != expectedCRC)
+        throw new DarkArchiveException("ZIP: CRC32 mismatch (data corrupted)");
 }
 
 /// Convert DOS date/time to SysTime.
@@ -741,7 +772,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-addfiles.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addDirectory("test-data");
         writer.addBuffer("test-data/addons-list.txt",
@@ -776,7 +807,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-largefile.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("odoo.test.2.log", logContent);
         writer.finish();
@@ -835,7 +866,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-corrupthdr.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "hello");
         writer.finish();
@@ -860,7 +891,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-crc.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "original content");
         writer.finish();
@@ -880,13 +911,76 @@ version(unittest) {
         caught.shouldBeTrue;
     }
 
+    @("zip security: CRC32 zero in central directory for file entry throws")
+    unittest {
+        // Regression: old code skipped CRC check when central-dir CRC == 0.
+        // This allowed a crafted ZIP to bypass integrity verification.
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        auto tmpPath = testDataDir ~ "/test-zipr-zero-crc.zip";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = ZipWriter(tmpPath);
+            writer.addBuffer("file.txt", cast(const(ubyte)[]) "hello");
+            writer.finish();
+        }
+
+        // Zero out the CRC field in the central directory entry.
+        // Central directory starts after local file header + data.
+        // We parse the EOCD to find the central-directory offset, then
+        // zero bytes [cdStart+16 .. cdStart+20] (CRC field at offset 16).
+        auto data = cast(ubyte[]) Path(tmpPath).readFile();
+        // For a small single-entry ZIP, EOCD is the last 22 bytes.
+        assert(data.length >= 22);
+        size_t eocdOff = data.length - 22;
+        // EOCD: sig(4)+diskNum(2)+startDisk(2)+numOnDisk(2)+total(2)+cdSize(4)+cdOffset(4)+commentLen(2)
+        uint cdOffset = (cast(uint) data[eocdOff + 16])
+                      | (cast(uint) data[eocdOff + 17] << 8)
+                      | (cast(uint) data[eocdOff + 18] << 16)
+                      | (cast(uint) data[eocdOff + 19] << 24);
+        // CRC is at offset 16 inside the central directory entry
+        assert(cdOffset + 20 <= data.length);
+        data[cdOffset + 16 .. cdOffset + 20] = 0; // zero the CRC
+
+        auto corruptPath = testDataDir ~ "/test-zipr-zero-crc-bad.zip";
+        scope(exit) if (Path(corruptPath).exists) Path(corruptPath).remove();
+        Path(corruptPath).writeFile(data);
+
+        auto reader = ZipReader(corruptPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.readData(0); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    @("zip security: CRC32 zero in central directory for directory entry is allowed")
+    unittest {
+        // Directories always have CRC=0 — this must not throw.
+        import unit_threaded.assertions : shouldBeFalse;
+        import darkarchive.formats.zip.writer : ZipWriter;
+        auto tmpPath = testDataDir ~ "/test-zipr-dir-zero-crc.zip";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        {
+            auto writer = ZipWriter(tmpPath);
+            writer.addDirectory("subdir/");
+            writer.finish();
+        }
+        auto reader = ZipReader(tmpPath);
+        scope(exit) reader.close();
+        bool caught;
+        try { foreach (e; reader.entries) {} }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeFalse;
+    }
+
     @("zip security: empty filename entry does not crash")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-emptyname.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("", cast(const(ubyte)[]) "empty name");
         writer.finish();
@@ -907,7 +1001,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-store.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("tiny.txt", cast(const(ubyte)[]) "hi");
         writer.finish();
@@ -925,7 +1019,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-empty.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.finish();
 
@@ -968,7 +1062,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto innerPath = testDataDir ~ "/test-zipr-nested-inner.zip";
         scope(exit) if (Path(innerPath).exists) Path(innerPath).remove();
-        auto inner = ZipWriter.createToFile(innerPath);
+        auto inner = ZipWriter(innerPath);
         scope(exit) inner.close();
         inner.addBuffer("inner.txt", cast(const(ubyte)[]) "inner");
         inner.finish();
@@ -977,7 +1071,7 @@ version(unittest) {
         auto outerPath = testDataDir ~ "/test-zipr-nested-outer.zip";
         scope(exit) if (Path(outerPath).exists) Path(outerPath).remove();
 
-        auto outer = ZipWriter.createToFile(outerPath);
+        auto outer = ZipWriter(outerPath);
         scope(exit) outer.close();
         outer.addBuffer("nested.zip", innerData);
         outer.addBuffer("outer.txt", cast(const(ubyte)[]) "outer");
@@ -1095,7 +1189,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-bomb-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("file.txt", cast(const(ubyte)[]) "hi");
         writer.finish();
@@ -1134,7 +1228,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-inflatecap-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("data.bin", content);
         writer.finish();
@@ -1175,7 +1269,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-absurdcount.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
         writer.finish();
@@ -1208,7 +1302,7 @@ version(unittest) {
         // Build a minimal single-file archive
         auto srcPath = testDataDir ~ "/test-zipr-fuzz-src.zip";
         scope(exit) if (Path(srcPath).exists) Path(srcPath).remove();
-        auto writer = ZipWriter.createToFile(srcPath);
+        auto writer = ZipWriter(srcPath);
         scope(exit) writer.close();
         writer.addBuffer("a.txt", cast(const(ubyte)[]) "hi");
         writer.finish();
@@ -1242,7 +1336,7 @@ version(unittest) {
         // Create a valid ZIP, then patch the compression method in the central dir to 99
         auto tmpPath = testDataDir ~ "/test-zipr-badmethod-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("file.txt", cast(const(ubyte)[]) "content");
         writer.finish();
@@ -1277,7 +1371,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-hugefnlen-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "data");
         writer.finish();
@@ -1307,7 +1401,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-overflow.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("a.txt", cast(const(ubyte)[]) "data");
         writer.finish();
@@ -1324,5 +1418,40 @@ version(unittest) {
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Interop: archives produced by external tools
+    // -------------------------------------------------------------------
+
+    /// test-infozip.zip was produced by Info-ZIP zip 3.0:
+    ///   cd /tmp/zip-src && TZ=UTC zip -r test-infozip.zip .
+    /// All files had mtime set to Unix timestamp 1710506097
+    /// (2024-03-15T12:34:57 UTC, an odd second).
+    /// Info-ZIP writes a UT extra field (ID 0x5455) with the exact Unix
+    /// mtime (57s) alongside the DOS time, which rounds 57 → 58s.
+    /// Parsing the UT field must yield 57s, not the DOS-rounded 58s.
+
+    @("zip interop: Info-ZIP UT extra field (0x5455) provides exact Unix mtime")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.datetime.systime : SysTime;
+        import std.datetime.date : DateTime;
+        import std.datetime.timezone : UTC;
+
+        // UT field: 1710506097 = 2024-03-15T12:34:57 UTC
+        // DOS time would give :58 (rounds odd second up); UT gives exact :57
+        auto expected = SysTime(DateTime(2024, 3, 15, 12, 34, 57), UTC());
+
+        auto reader = ZipReader("test-data/test-infozip.zip");
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                entry.mtime.shouldEqual(expected);
+                found = true;
+            }
+        }
+        assert(found, "hello.txt not found in test-infozip.zip");
     }
 }
