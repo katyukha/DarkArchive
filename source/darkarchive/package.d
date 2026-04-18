@@ -1,9 +1,10 @@
 module darkarchive;
 
+public import darkarchive.capabilities : ArchiveCapability;
 public import darkarchive.archive : DarkArchiveReader, DarkArchiveWriter,
                                      DarkArchiveItem, DarkArchiveItemReader,
                                      DarkArchiveFormat, DarkExtractFlags,
-                                     ArchiveCapability, supports,
+                                     supports,
                                      ExtractParams, ExtractionLimits,
                                      FollowSymlinks,
                                      probeArchive,

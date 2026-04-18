@@ -8,6 +8,7 @@ module darkarchive.formats.tar.writer;
 import std.conv : octal;
 import std.range : isOutputRange;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.tar.types;
 
@@ -22,6 +23,11 @@ struct TarWriter(R)
     private {
         R _writer;
         bool _finished;
+    }
+
+    /// Declare supported capabilities.
+    static bool supports(ArchiveCapability cap) {
+        return cap == ArchiveCapability.streamingWrite;
     }
 
     @disable this();

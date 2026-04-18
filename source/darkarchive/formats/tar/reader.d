@@ -10,6 +10,7 @@
 /// Use the `tarReader(range)` factory for range-based construction.
 module darkarchive.formats.tar.reader;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.tar.types;
@@ -46,6 +47,11 @@ struct TarReader(R) if (isTarStream!R) {
     /// Open TAR from a stream value (ChunkReader or other isTarStream type).
     this(R stream) {
         _stream = stream;
+    }
+
+    /// Declare supported capabilities.
+    static bool supports(ArchiveCapability cap) {
+        return cap == ArchiveCapability.streamingRead;
     }
 
     /// Close the underlying data source.

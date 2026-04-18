@@ -7,6 +7,7 @@ module darkarchive.formats.zip.writer;
 import std.bitmanip : nativeToLittleEndian;
 import std.conv : octal;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;
 
@@ -21,14 +22,17 @@ struct ZipWriter {
         bool _finished;
     }
 
+    /// Declare supported capabilities.
+    static bool supports(ArchiveCapability cap) {
+        return cap == ArchiveCapability.randomAccessWrite;
+    }
+
     /// Create a file-backed writer (streaming, constant memory).
-    static ZipWriter createToFile(string path) {
-        ZipWriter w;
-        w._file = new File(path, "wb");
-        w._filePos = 0;
-        w._localEntries = [];
-        w._finished = false;
-        return w;
+    this(string path) {
+        _file = new File(path, "wb");
+        _filePos = 0;
+        _localEntries = [];
+        _finished = false;
     }
 
     /// Add a file from a memory buffer.
@@ -422,7 +426,7 @@ struct ZipWriter {
     /// Write bytes to output file.
     private void output(const(ubyte)[] bytes) {
         if (_file is null)
-            throw new DarkArchiveException("ZIP: no output file — use createToFile()");
+            throw new DarkArchiveException("ZIP: no output file — use ZipWriter(path)");
         _file.rawWrite(bytes);
         _filePos += bytes.length;
     }
@@ -430,7 +434,7 @@ struct ZipWriter {
     /// Current output position.
     private ulong outputPos() {
         if (_file is null)
-            throw new DarkArchiveException("ZIP: no output file — use createToFile()");
+            throw new DarkArchiveException("ZIP: no output file — use ZipWriter(path)");
         return _filePos;
     }
 }
@@ -508,7 +512,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-roundtrip.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("hello.txt", cast(const(ubyte)[]) "Hello World!")
@@ -546,7 +550,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-stream.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addStream("streamed.txt", (scope sink) {
             sink(cast(const(ubyte)[]) "Streamed content ");
@@ -572,7 +576,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-chaining.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("a.txt", cast(const(ubyte)[]) "A")
@@ -596,7 +600,7 @@ version(unittest) {
         foreach (i, ref b; largeData)
             b = cast(ubyte)(i % 256);
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("large.bin", largeData);
         writer.finish();
@@ -621,7 +625,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-props.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("file.txt", cast(const(ubyte)[]) "content")
@@ -650,7 +654,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-utf8.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer
             .addBuffer("café.txt", cast(const(ubyte)[]) "coffee")
@@ -675,7 +679,7 @@ version(unittest) {
         auto tmpPath = "test-data/test-zip-wrt-file-readback.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "file content");
         writer.finish();
@@ -700,7 +704,7 @@ version(unittest) {
         auto outPath = "test-data/test-zip-wrt-python-interop.zip";
         scope(exit) if (Path(outPath).exists) Path(outPath).remove();
 
-        auto writer = ZipWriter.createToFile(outPath);
+        auto writer = ZipWriter(outPath);
         scope(exit) writer.close();
         writer
             .addBuffer("greeting.txt", cast(const(ubyte)[]) "Hello from D!\n")
@@ -739,7 +743,7 @@ except Exception as e:
 
         auto longName = "a".replicate(65536); // one byte over ushort.max
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         bool caught;
         try {
@@ -757,7 +761,7 @@ except Exception as e:
         auto tmpPath = "test-data/test-zip-wrt-symlink.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("target.txt", cast(const(ubyte)[]) "target content");
         writer.addSymlink("link.txt", "target.txt");
@@ -791,7 +795,7 @@ except Exception as e:
         auto tmpPath = "test-data/test-zip-wrt-underflow.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         bool caught;
         try {
@@ -813,7 +817,7 @@ except Exception as e:
         auto tmpPath = "test-data/test-zip-wrt-overflow.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
 
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         bool caught;
         try {

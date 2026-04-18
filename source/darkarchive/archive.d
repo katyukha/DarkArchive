@@ -11,10 +11,13 @@ module darkarchive.archive;
 
 import std.conv : octal;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip : ZipReader, ZipWriter;
-import darkarchive.formats.tar : TarReader, TarWriter, tarWriter, tarGzWriter;
+import darkarchive.formats.tar : TarWriter,
+    TarFileReader, TarGzReader, TarFileWriter, TarGzWriter,
+    tarWriter, tarGzWriter;
 import darkarchive.datasource : chunkSource, DelegateSink, FileChunkSource,
     ChunkReader, GzipRange;
 import darkarchive.gzip : GzipSink;
@@ -30,35 +33,17 @@ enum DarkArchiveFormat {
     // tarZst,  -- future stage
 }
 
-/// Optional capabilities that vary by format (for runtime queries via supports()).
-enum ArchiveCapability {
-    streamingRead,    /// Can stream from any input range (TAR/TARGZ via darkArchiveReader)
-    streamingWrite,   /// Can stream to any output range (TAR/TARGZ via darkArchiveWriter)
-    randomAccessRead  /// Can seek to arbitrary entries (e.g. ZIP central directory)
-}
-
 /// Query whether a format supports a given capability at runtime.
-/// Prefer static asserts and template constraints for compile-time checks.
+/// Delegates to the concrete reader and writer `supports` declarations —
+/// the impls are the single source of truth.
 bool supports(DarkArchiveFormat fmt, ArchiveCapability cap) {
-    final switch (cap) {
-        case ArchiveCapability.streamingRead:
-            final switch (fmt) {
-                case DarkArchiveFormat.zip:   return false;
-                case DarkArchiveFormat.tar:   return true;
-                case DarkArchiveFormat.tarGz: return true;
-            }
-        case ArchiveCapability.streamingWrite:
-            final switch (fmt) {
-                case DarkArchiveFormat.zip:   return false;
-                case DarkArchiveFormat.tar:   return true;
-                case DarkArchiveFormat.tarGz: return true;
-            }
-        case ArchiveCapability.randomAccessRead:
-            final switch (fmt) {
-                case DarkArchiveFormat.zip:   return true;
-                case DarkArchiveFormat.tar:   return false;
-                case DarkArchiveFormat.tarGz: return false;
-            }
+    final switch (fmt) {
+        case DarkArchiveFormat.zip:
+            return ZipReader.supports(cap) || ZipWriter.supports(cap);
+        case DarkArchiveFormat.tar:
+            return TarFileReader.supports(cap) || TarFileWriter.supports(cap);
+        case DarkArchiveFormat.tarGz:
+            return TarGzReader.supports(cap) || TarGzWriter.supports(cap);
     }
 }
 
@@ -247,17 +232,21 @@ private string formatMemSize(ulong bytes) {
 
 /// Data accessor for a single archive entry — obtained via `DarkArchiveItem.data`.
 ///
-/// For TAR and TAR.GZ this is only valid during the current `foreach` iteration
+/// Templated over the concrete reader type. Dispatches via the reader's own
+/// `supports(ArchiveCapability)` declaration at compile time:
+///   - random-access readers (ZIP): `readData(idx)` / `readDataChunked(idx, …)`
+///   - sequential readers  (TAR):   `readData()`    / `readDataChunked(…)`
+///
+/// For TAR/TAR.GZ this is only valid during the current `foreach` iteration
 /// step; calling read methods after `popFront` is undefined behaviour.
 /// For ZIP the accessor is position-independent (random access), but the same
 /// rule should be assumed for portability.
 ///
 /// Non-copyable by design: copy `item.meta` (a plain `DarkArchiveEntry`) if you
 /// need to retain metadata across iterations.
-struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
-    private DarkArchiveReader!fmt* _parent;
-    static if (fmt.supports(ArchiveCapability.randomAccessRead))
-        private size_t _idx;
+struct DarkArchiveItemReader(Reader) {
+    private Reader* _reader;
+    static if (Reader.supports(ArchiveCapability.randomAccessRead)) private size_t _idx;
 
     @disable this(this);
 
@@ -268,12 +257,14 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     /// Use `readChunks` for entries that may exceed that limit, or for streaming
     /// reads of large entries without buffering them in memory.
     ubyte[] readAll() {
-        static if (fmt.supports(ArchiveCapability.randomAccessRead))
-            return cast(ubyte[]) _parent._reader.readData(_idx).dup;
-        else {
-            auto d = _parent._reader.readData();
+        static if (Reader.supports(ArchiveCapability.randomAccessRead))
+            return cast(ubyte[]) _reader.readData(_idx).dup;
+        else static if (Reader.supports(ArchiveCapability.streamingRead)) {
+            auto d = _reader.readData();
             return d is null ? [] : cast(ubyte[]) d;
-        }
+        } else
+            static assert(false, Reader.stringof ~
+                " declares neither streamingRead nor randomAccessRead capability");
     }
 
     /// Convenience: readAll as a UTF-8 string.
@@ -282,10 +273,13 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
     /// Stream entry data in chunks without buffering the full entry in memory.
     void readChunks(scope void delegate(const(ubyte)[] chunk) sink,
                      size_t chunkSize = 8192) {
-        static if (fmt.supports(ArchiveCapability.randomAccessRead))
-            _parent._reader.readDataChunked(_idx, sink, chunkSize);
+        static if (Reader.supports(ArchiveCapability.randomAccessRead))
+            _reader.readDataChunked(_idx, sink, chunkSize);
+        else static if (Reader.supports(ArchiveCapability.streamingRead))
+            _reader.readDataChunked(sink, chunkSize);
         else
-            _parent._reader.readDataChunked(sink, chunkSize);
+            static assert(false, Reader.stringof ~
+                " declares neither streamingRead nor randomAccessRead capability");
     }
 }
 
@@ -301,9 +295,9 @@ struct DarkArchiveItemReader(DarkArchiveFormat fmt) {
 /// foreach (ref item; reader.entries)
 ///     if (item.meta.isFile) saved = item.meta;
 /// ---
-struct DarkArchiveItem(DarkArchiveFormat fmt) {
-    DarkArchiveEntry          meta;
-    DarkArchiveItemReader!fmt data;
+struct DarkArchiveItem(Reader) {
+    DarkArchiveEntry             meta;
+    DarkArchiveItemReader!Reader data;
 
     @disable this(this);
 }
@@ -322,45 +316,53 @@ struct DarkArchiveItem(DarkArchiveFormat fmt) {
 /// TAR and TAR.GZ additionally support a streaming delegate constructor.
 /// ZIP does not — attempting to instantiate it is a compile-time error.
 struct DarkArchiveReader(DarkArchiveFormat fmt) {
-    static if (fmt == DarkArchiveFormat.zip) {
-        private ZipReader* _reader;
-    } else static if (fmt == DarkArchiveFormat.tar) {
-        private TarReader!(ChunkReader!FileChunkSource)* _reader;
-    } else { // tarGz
-        private TarReader!(ChunkReader!(GzipRange!FileChunkSource))* _reader;
-    }
+    static if (fmt == DarkArchiveFormat.zip)
+        private alias ImplReader = ZipReader;
+    else static if (fmt == DarkArchiveFormat.tar)
+        private alias ImplReader = TarFileReader;
+    else
+        private alias ImplReader = TarGzReader;
+
+    private ImplReader _reader;
 
     /// The archive format — a compile-time constant.
     enum DarkArchiveFormat format = fmt;
 
     @disable this();
+    @disable this(this);
 
     this(in Path path) { this(path.toString()); }
 
     /// Open from file path.
     this(string path) {
         static if (fmt == DarkArchiveFormat.zip) {
-            _reader = new ZipReader(path);
+            _reader = ImplReader(path);
         } else static if (fmt == DarkArchiveFormat.tar) {
             auto cr = ChunkReader!FileChunkSource(FileChunkSource(path));
-            _reader = new typeof(*_reader)(cr);
+            _reader = ImplReader(cr);
         } else {
             alias CR = ChunkReader!(GzipRange!FileChunkSource);
             auto cr = CR(GzipRange!FileChunkSource(FileChunkSource(path)));
-            _reader = new typeof(*_reader)(cr);
+            _reader = ImplReader(cr);
         }
     }
 
     void close() { _reader.close(); }
 
     /// Iterate over entries.
-    auto entries() { return EntryRange(&this); }
+    auto entries() { return EntryRange(&_reader); }
 
     // -- processEntries --
 
-    /// Process all entries, calling processor for each.
+    /// Process all entries, calling `processor` for each.
+    ///
+    /// The item type in the delegate is opaque (`DarkArchiveItem!ImplReader`,
+    /// where `ImplReader` is a private alias). Use `auto ref` in the lambda:
+    /// ---
+    /// reader.processEntries((scope ref auto item) { ... });
+    /// ---
     size_t processEntries(
-            scope void delegate(scope ref DarkArchiveItem!fmt item) processor) {
+            scope void delegate(scope ref DarkArchiveItem!ImplReader item) processor) {
         size_t count;
         foreach (ref item; entries()) {
             processor(item);
@@ -370,9 +372,10 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
     }
 
     /// Process specific entries by pathname. Stops early when all are found.
+    /// See `processEntries` above for the `auto ref` delegate convention.
     size_t processEntries(
             const(string)[] names,
-            scope void delegate(scope ref DarkArchiveItem!fmt item) processor) {
+            scope void delegate(scope ref DarkArchiveItem!ImplReader item) processor) {
         if (names.length == 0) return 0;
         bool[string] remaining;
         foreach (name; names) remaining[name] = true;
@@ -525,7 +528,7 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
         }
     }
 
-    private void extractEntryToFile(ref DarkArchiveItemReader!fmt dataReader,
+    private void extractEntryToFile(ref DarkArchiveItemReader!ImplReader dataReader,
                                      string outPath, uint permissions,
                                      ExtractionLimits limits, ref ulong totalBytes) {
         import std.stdio : File;
@@ -552,61 +555,73 @@ struct DarkArchiveReader(DarkArchiveFormat fmt) {
 
     // -- EntryRange --
 
-    private static struct EntryRange {
-        private DarkArchiveReader!fmt* _parent;
-        private DarkArchiveItem!fmt _current;
+    /// Returned by `DarkArchiveReader.entries()`.
+    ///
+    /// Always supports sequential iteration via `foreach`.
+    /// When the underlying reader supports `randomAccessRead`, additionally
+    /// exposes `length`, `opIndex(size_t)`, and `opIndex(string)`.
+    static struct EntryRange {
+        private ImplReader* _reader;
+        private ImplReader.EntryRange _range;
+        private DarkArchiveItem!ImplReader _current;
 
-        // Non-copyable because DarkArchiveItem is non-copyable.
         @disable this(this);
 
-        static if (fmt.supports(ArchiveCapability.randomAccessRead)) {
-            private size_t _idx;
-            private size_t _len;
+        this(ImplReader* reader) {
+            _reader = reader;
+            _range  = reader.entries();
+            _current.data._reader = reader;
+            if (!empty) _loadCurrent();
+        }
 
-            this(DarkArchiveReader!fmt* parent) {
-                _parent = parent;
-                _idx = 0;
-                _len = parent._reader.length;
-                _current.data._parent = parent;
-                if (!empty) _loadCurrent();
+        // -- Sequential iteration (all formats) --
+
+        bool empty() { return _range.empty(); }
+
+        ref DarkArchiveItem!ImplReader front() { return _current; }
+
+        void popFront() {
+            _range.popFront();
+            if (!empty) _loadCurrent();
+        }
+
+        private void _loadCurrent() {
+            _current.meta = _range.front();
+            static if (ImplReader.supports(ArchiveCapability.randomAccessRead))
+                _current.data._idx = _range.index();
+        }
+
+        // -- Random-access extras (randomAccessRead readers only) --
+
+        static if (ImplReader.supports(ArchiveCapability.randomAccessRead)) {
+
+            /// Number of entries in the archive.
+            size_t length() { return _reader.length; }
+
+            /// Direct access by index — does not affect sequential iteration state.
+            DarkArchiveItem!ImplReader opIndex(size_t idx) {
+                DarkArchiveItem!ImplReader item;
+                item.meta        = _reader.entryAt(idx);
+                item.data._reader = _reader;
+                item.data._idx   = idx;
+                return item;
             }
 
-            bool empty() { return _idx >= _len; }
-
-            ref DarkArchiveItem!fmt front() { return _current; }
-
-            void popFront() {
-                _idx++;
-                if (!empty) _loadCurrent();
-            }
-
-            private void _loadCurrent() {
-                _current.meta = _parent._reader.entryAt(_idx);
-                _current.data._idx = _idx;
-            }
-
-        } else {
-            static if (fmt == DarkArchiveFormat.tar)
-                alias TarReaderT = TarReader!(ChunkReader!FileChunkSource);
-            else
-                alias TarReaderT = TarReader!(ChunkReader!(GzipRange!FileChunkSource));
-
-            private TarReaderT.EntryRange _range;
-
-            this(DarkArchiveReader!fmt* parent) {
-                _parent = parent;
-                _range = parent._reader.entries();
-                _current.data._parent = parent;
-                if (!empty) _current.meta = _range.front();
-            }
-
-            bool empty() { return _range.empty(); }
-
-            ref DarkArchiveItem!fmt front() { return _current; }
-
-            void popFront() {
-                _range.popFront();
-                if (!empty) _current.meta = _range.front();
+            /// Direct access by pathname — linear scan, O(n).
+            /// Throws `DarkArchiveException` if no entry with that pathname exists.
+            DarkArchiveItem!ImplReader opIndex(string path) {
+                foreach (i; 0 .. _reader.length) {
+                    auto entry = _reader.entryAt(i);
+                    if (entry.pathname == path) {
+                        DarkArchiveItem!ImplReader item;
+                        item.meta        = entry;
+                        item.data._reader = _reader;
+                        item.data._idx   = i;
+                        return item;
+                    }
+                }
+                throw new DarkArchiveException(
+                    "ZIP: no entry with pathname: " ~ path);
             }
         }
     }
@@ -631,33 +646,36 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
 
     private alias Self = DarkArchiveWriter!(fmt, SinkT);
 
-    // Internal writer type depends on whether we are file-backed or sink-backed.
-    static if (is(SinkT == void)) {
-        // File-backed: delegate sink wraps a heap-allocated File.
-        static if (fmt == DarkArchiveFormat.zip)
-            private ZipWriter* _writer;
-        else static if (fmt == DarkArchiveFormat.tar)
-            private TarWriter!DelegateSink* _writer;
-        else // tarGz
-            private TarWriter!(GzipSink!DelegateSink)* _writer;
-    } else {
-        // Sink-backed: caller supplies any isOutputRange!(R, const(ubyte)[]).
-        static assert(fmt != DarkArchiveFormat.zip,
-            "ZIP format requires random access — output-range sink is not supported. "
-            ~ "Use DarkArchiveWriter!(DarkArchiveFormat.zip)(path) instead.");
+    // Impl type for capability queries (sink type does not affect capabilities).
+    static if (fmt == DarkArchiveFormat.zip)
+        private alias ImplWriter = ZipWriter;
+    else static if (fmt == DarkArchiveFormat.tar)
+        private alias ImplWriter = TarFileWriter;
+    else
+        private alias ImplWriter = TarGzWriter;
+
+    // Internal writer — embedded by value; type varies by format and sink.
+    static if (is(SinkT == void))
+        private ImplWriter _writer;
+    else {
+        // Sink-backed: only supported for streaming writers.
+        static assert(ImplWriter.supports(ArchiveCapability.streamingWrite),
+            ImplWriter.stringof ~ " does not support streaming write — "
+            ~ "use DarkArchiveWriter!(fmt)(path) for a file-backed writer instead.");
         import std.range : isOutputRange;
         static assert(isOutputRange!(SinkT, const(ubyte)[]),
             "SinkT must satisfy isOutputRange!(SinkT, const(ubyte)[])");
         static if (fmt == DarkArchiveFormat.tar)
-            private TarWriter!SinkT* _writer;
+            private TarWriter!SinkT _writer;
         else // tarGz
-            private TarWriter!(GzipSink!SinkT)* _writer;
+            private TarWriter!(GzipSink!SinkT) _writer;
     }
 
     private bool _finished;
     private string _filePath;   // non-null only for file-backed writers
 
     @disable this();
+    @disable this(this);
 
     // -----------------------------------------------------------------------
     // File-backed constructors (only available when SinkT == void)
@@ -671,25 +689,21 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
         this(string path) {
             _filePath = path;
             static if (fmt == DarkArchiveFormat.zip) {
-                _writer = new ZipWriter();
-                *_writer = ZipWriter.createToFile(path);
+                _writer = ImplWriter(path);
             } else static if (fmt == DarkArchiveFormat.tar) {
                 import std.stdio : File;
                 auto f = new File(path, "wb");
-                _writer = new TarWriter!DelegateSink(DelegateSink(
+                _writer = ImplWriter(DelegateSink(
                     (const(ubyte)[] data) { f.rawWrite(data); },
                     () { f.close(); }
                 ));
             } else { // tarGz
                 import std.stdio : File;
                 auto f = new File(path, "wb");
-                auto fsink = DelegateSink(
+                _writer = ImplWriter(GzipSink!DelegateSink(DelegateSink(
                     (const(ubyte)[] data) { f.rawWrite(data); },
                     () { f.close(); }
-                );
-                _writer = new TarWriter!(GzipSink!DelegateSink)(
-                    GzipSink!DelegateSink(fsink)
-                );
+                )));
             }
         }
     }
@@ -703,9 +717,9 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
         /// Create writer streaming to `sink`.  Call `finish()` when done.
         this(SinkT sink) {
             static if (fmt == DarkArchiveFormat.tar)
-                _writer = new TarWriter!SinkT(sink);
+                _writer = TarWriter!SinkT(sink);
             else // tarGz
-                _writer = new TarWriter!(GzipSink!SinkT)(GzipSink!SinkT(sink));
+                _writer = TarWriter!(GzipSink!SinkT)(GzipSink!SinkT(sink));
         }
     }
 
@@ -809,10 +823,9 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     }
 
     ~this() {
-        if (_finished || _writer is null) return;
-        // Auto-finish: always for file-backed (prevents truncated files on early
-        // return); for sink-backed only when _filePath is non-null (never, so
-        // sink-backed writers require an explicit finish() call).
+        if (_finished) return;
+        // Auto-finish for file-backed writers (prevents truncated files on early
+        // return). Sink-backed writers require an explicit finish() call.
         if (_filePath !is null)
             try { finish(); } catch (Exception) {}
     }
@@ -962,10 +975,21 @@ version(unittest) {
         static assert(!__traits(compiles,
             darkArchiveWriter!(DarkArchiveFormat.zip)(DelegateSink.init)));
         // TAR and TARGZ are supported
-        static assert(__traits(compiles,
-            darkArchiveReader!(DarkArchiveFormat.tar)(ByteChunks.init)));
-        static assert(__traits(compiles,
-            darkArchiveWriter!(DarkArchiveFormat.tar)(DelegateSink.init)));
+        static assert(is(typeof(
+            darkArchiveReader!(DarkArchiveFormat.tar)(ByteChunks.init))));
+        // DarkArchiveWriter supports TAR/TARGZ streaming write
+        static assert(supports(DarkArchiveFormat.tar, ArchiveCapability.streamingWrite));
+        static assert(supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingWrite));
+    }
+
+    @("capability: DarkArchiveWriter sink-backed instantiates for TAR")
+    unittest {
+        import darkarchive.datasource : DelegateSink;
+        // Force full struct compilation (is() doesn't validate method bodies).
+        // Verify the sink-backed constructor is reachable.
+        DarkArchiveWriter!(DarkArchiveFormat.tar, DelegateSink) w =
+            DarkArchiveWriter!(DarkArchiveFormat.tar, DelegateSink)(DelegateSink.init);
+        w.finish();
     }
 
     // -------------------------------------------------------------------
@@ -2093,7 +2117,7 @@ version(unittest) {
         auto zeros = new ubyte[](1024 * 1024);
         auto tmpPath = "test-data/test-atk-bomb.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("bomb.bin", zeros);
         writer.finish();

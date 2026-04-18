@@ -8,6 +8,7 @@
 /// - File-backed I/O (does not load full archive into memory)
 module darkarchive.formats.zip.reader;
 
+import darkarchive.capabilities : ArchiveCapability;
 import darkarchive.entry : DarkArchiveEntry, EntryType;
 import darkarchive.exception : DarkArchiveException;
 import darkarchive.formats.zip.types;
@@ -31,6 +32,11 @@ struct ZipReader {
         parseCentralDirectory();
     }
 
+    /// Declare supported capabilities.
+    static bool supports(ArchiveCapability cap) {
+        return cap == ArchiveCapability.randomAccessRead;
+    }
+
     /// Number of entries in the archive.
     size_t length() const {
         return _entries.length;
@@ -41,23 +47,26 @@ struct ZipReader {
         _ds.close();
     }
 
-    /// Iterate over entries.
-    auto entries() {
-        static struct EntryRange {
-            private ZipReader* _reader;
-            private size_t _index;
+    /// Sequential entry range returned by `entries()`.
+    ///
+    /// Exposes `index()` so the high-level reader can read the current position
+    /// without tracking it independently.
+    struct EntryRange {
+        private ZipReader* _reader;
+        private size_t _index;
 
-            bool empty() { return _index >= _reader._entries.length; }
+        bool empty() { return _index >= _reader._entries.length; }
 
-            DarkArchiveEntry front() {
-                return _reader.entryAt(_index);
-            }
+        DarkArchiveEntry front() { return _reader.entryAt(_index); }
 
-            void popFront() { _index++; }
-        }
+        void popFront() { _index++; }
 
-        return EntryRange(&this, 0);
+        /// Current entry index.
+        size_t index() const { return _index; }
     }
+
+    /// Iterate over entries sequentially.
+    EntryRange entries() { return EntryRange(&this, 0); }
 
     /// Read the data of the entry at the given index.
     const(ubyte)[] readData(size_t index) {
@@ -741,7 +750,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-addfiles.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addDirectory("test-data");
         writer.addBuffer("test-data/addons-list.txt",
@@ -776,7 +785,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-largefile.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("odoo.test.2.log", logContent);
         writer.finish();
@@ -835,7 +844,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-corrupthdr.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "hello");
         writer.finish();
@@ -860,7 +869,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-crc.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "original content");
         writer.finish();
@@ -886,7 +895,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-emptyname.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("", cast(const(ubyte)[]) "empty name");
         writer.finish();
@@ -907,7 +916,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-store.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("tiny.txt", cast(const(ubyte)[]) "hi");
         writer.finish();
@@ -925,7 +934,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-empty.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.finish();
 
@@ -968,7 +977,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto innerPath = testDataDir ~ "/test-zipr-nested-inner.zip";
         scope(exit) if (Path(innerPath).exists) Path(innerPath).remove();
-        auto inner = ZipWriter.createToFile(innerPath);
+        auto inner = ZipWriter(innerPath);
         scope(exit) inner.close();
         inner.addBuffer("inner.txt", cast(const(ubyte)[]) "inner");
         inner.finish();
@@ -977,7 +986,7 @@ version(unittest) {
         auto outerPath = testDataDir ~ "/test-zipr-nested-outer.zip";
         scope(exit) if (Path(outerPath).exists) Path(outerPath).remove();
 
-        auto outer = ZipWriter.createToFile(outerPath);
+        auto outer = ZipWriter(outerPath);
         scope(exit) outer.close();
         outer.addBuffer("nested.zip", innerData);
         outer.addBuffer("outer.txt", cast(const(ubyte)[]) "outer");
@@ -1095,7 +1104,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-bomb-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("file.txt", cast(const(ubyte)[]) "hi");
         writer.finish();
@@ -1134,7 +1143,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-inflatecap-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("data.bin", content);
         writer.finish();
@@ -1175,7 +1184,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-absurdcount.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "x");
         writer.finish();
@@ -1208,7 +1217,7 @@ version(unittest) {
         // Build a minimal single-file archive
         auto srcPath = testDataDir ~ "/test-zipr-fuzz-src.zip";
         scope(exit) if (Path(srcPath).exists) Path(srcPath).remove();
-        auto writer = ZipWriter.createToFile(srcPath);
+        auto writer = ZipWriter(srcPath);
         scope(exit) writer.close();
         writer.addBuffer("a.txt", cast(const(ubyte)[]) "hi");
         writer.finish();
@@ -1242,7 +1251,7 @@ version(unittest) {
         // Create a valid ZIP, then patch the compression method in the central dir to 99
         auto tmpPath = testDataDir ~ "/test-zipr-badmethod-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("file.txt", cast(const(ubyte)[]) "content");
         writer.finish();
@@ -1277,7 +1286,7 @@ version(unittest) {
 
         auto tmpPath = testDataDir ~ "/test-zipr-hugefnlen-src.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("x.txt", cast(const(ubyte)[]) "data");
         writer.finish();
@@ -1307,7 +1316,7 @@ version(unittest) {
         import darkarchive.formats.zip.writer : ZipWriter;
         auto tmpPath = testDataDir ~ "/test-zipr-overflow.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        auto writer = ZipWriter.createToFile(tmpPath);
+        auto writer = ZipWriter(tmpPath);
         scope(exit) writer.close();
         writer.addBuffer("a.txt", cast(const(ubyte)[]) "data");
         writer.finish();
