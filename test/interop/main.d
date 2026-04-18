@@ -47,7 +47,7 @@ void checkEq(T)(T actual, T expected,
             format!"expected %s, got %s (%s:%d)"(expected, actual, file, line));
 }
 
-enum Skip { yes }  // sentinel thrown to signal a skipped test
+class Skip : Exception { this() { super("skip"); } }  // thrown to skip a test
 
 void runTest(string name, void delegate() body)
 {
@@ -68,9 +68,9 @@ void runTest(string name, void delegate() body)
 /// Throw Skip if `tool` is not found on PATH.
 void requireTool(string tool)
 {
-    version(Windows) throw new Skip();
+    version(Windows) throw new Skip;
     if (execute(["which", tool]).status != 0)
-        throw new Skip();
+        throw new Skip;
 }
 
 /// Write a Python script to `dir/name` and return its path.
@@ -253,12 +253,12 @@ os.utime('%s/hello.txt', (1710506097, 1710506097))
     bool found;
     auto reader = RZip(arch);
     scope(exit) reader.close();
-    foreach (entry; reader.entries) {
-        if (entry.pathname == "hello.txt") {
+    foreach (ref entry; reader.entries) {
+        if (entry.meta.pathname == "hello.txt") {
             // UT field: exact Unix mtime 1710506097 = 2024-03-15T12:34:57 UTC
             // DOS time would give :58 (rounded up from 57s)
             auto expected = SysTime(DateTime(2024, 3, 15, 12, 34, 57), UTC());
-            checkEq(entry.mtime, expected);
+            checkEq(entry.meta.mtime, expected);
             found = true;
         }
     }
@@ -292,7 +292,7 @@ print("ok")
     foreach (entry; reader.entries)
         names ~= entry.pathname;
 
-    check(names.canFind("café.txt"),      "missing café.txt");
+    check(names.canFind("cafe\u0301.txt"), "missing cafe+U+0301.txt (NFD)");
     check(names.canFind("日本語.txt"),     "missing 日本語.txt");
     check(names.canFind("sub/Üniöc.txt"), "missing sub/Üniöc.txt");
 }
@@ -315,18 +315,16 @@ print("ok")
     bool foundComp, foundSmall;
     auto reader = RZip(arch);
     scope(exit) reader.close();
-    size_t i;
-    foreach (entry; reader.entries) {
-        if (entry.pathname == "compressed.txt") {
-            auto data = reader.readText(i);
-            check(data.length == ("hello compressed world\n" ~ "").length * 100,
+    foreach (ref entry; reader.entries) {
+        if (entry.meta.pathname == "compressed.txt") {
+            auto data = entry.data.readText();
+            check(data.length == ("hello compressed world\n").length * 100,
                   "compressed.txt length mismatch");
             foundComp = true;
-        } else if (entry.pathname == "small.txt") {
-            checkEq(reader.readText(i), "small");
+        } else if (entry.meta.pathname == "small.txt") {
+            checkEq(entry.data.readText(), "small");
             foundSmall = true;
         }
-        i++;
     }
     check(foundComp,  "compressed.txt not found");
     check(foundSmall, "small.txt not found");
@@ -339,7 +337,8 @@ int main()
     auto tmp = buildPath(tempDir(), "darkarchive-interop");
     if (tmp.exists) rmdirRecurse(tmp);
     mkdirRecurse(tmp);
-    scope(exit) try { rmdirRecurse(tmp); } catch (Exception) {}
+    import std.exception : collectException;
+    scope(exit) collectException(rmdirRecurse(tmp));
 
     writeln("Interop tests");
     writeln("=============");
