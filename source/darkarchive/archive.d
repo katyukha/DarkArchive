@@ -1776,10 +1776,16 @@ version(unittest) {
         assert((extractDir ~ "link.txt").exists);
         (extractDir ~ "link.txt").readFileText().shouldEqual("hardlink content");
 
-        // Verify same inode — confirms it's a real hardlink, not a copy
+        // Verify same inode — confirms it's a real hardlink, not a copy.
+        // Use toStringz: D strings are not null-terminated; passing .ptr to a
+        // C function that expects const(char)* is undefined behaviour and fails
+        // silently on LDC whose allocator does not zero-pad past the slice end.
+        import std.string : toStringz;
         stat_t s1, s2;
-        stat((extractDir ~ "original.txt").toString.ptr, &s1);
-        stat((extractDir ~ "link.txt").toString.ptr, &s2);
+        assert(stat((extractDir ~ "original.txt").toString.toStringz, &s1) == 0,
+               "stat failed for original.txt");
+        assert(stat((extractDir ~ "link.txt").toString.toStringz, &s2) == 0,
+               "stat failed for link.txt");
         (s1.st_ino == s2.st_ino).shouldBeTrue;
     }
 
