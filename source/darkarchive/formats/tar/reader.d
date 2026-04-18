@@ -365,6 +365,27 @@ private void applyPaxAttrs(ref DarkArchiveEntry e, string[string] attrs) {
         import std.conv : to;
         e.gid = (*p).to!long;
     }
+    if (auto p = "mtime" in attrs) {
+        import std.datetime.systime : SysTime;
+        import std.datetime.timezone : UTC;
+        import std.string : indexOf;
+        import std.conv : to;
+        auto str = *p;
+        auto dotPos = str.indexOf('.');
+        long secs;
+        long fracHnsecs = 0;
+        if (dotPos >= 0) {
+            secs = str[0 .. dotPos].to!long;
+            // Fractional part: pad/truncate to exactly 7 digits (hnsec = 100ns resolution)
+            auto fracStr = str[dotPos + 1 .. $];
+            if (fracStr.length > 7) fracStr = fracStr[0 .. 7];
+            while (fracStr.length < 7) fracStr ~= "0";
+            fracHnsecs = fracStr.to!long;
+        } else {
+            secs = str.to!long;
+        }
+        e.mtime = SysTime(unixTimeToStdTime(secs) + fracHnsecs, UTC());
+    }
 }
 
 /// Parse pax extended header data: "length key=value\n" records.
@@ -1383,5 +1404,60 @@ version(unittest) {
             }
         }
         found.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Interop: archives produced by external tools
+    // -------------------------------------------------------------------
+
+    /// test-gnu-pax.tar.gz was produced by:
+    ///   tar --format=pax --owner=testuser --group=testgroup -czf \
+    ///       test-gnu-pax.tar.gz hello.txt script.sh subdir/ link.txt
+    /// All regular-file mtimes were set to 1710506096.123456716 UTC
+    /// (2024-03-15T12:34:56.1234567Z to hnsec precision).
+
+    @("tar interop: GNU tar PAX mtime has sub-second precision")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.datetime.systime : SysTime, unixTimeToStdTime;
+        import std.datetime.timezone : UTC;
+
+        // PAX mtime string "1710506096.123456716"
+        // → integer 1710506096, fractional "1234567" (first 7 digits) = 1_234_567 hnsecs
+        auto expected = SysTime(unixTimeToStdTime(1710506096L) + 1_234_567L, UTC());
+
+        auto reader = tarGzReader("test-data/test-gnu-pax.tar.gz");
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                entry.mtime.shouldEqual(expected);
+                found = true;
+            }
+        }
+        assert(found, "hello.txt not found in test-gnu-pax.tar.gz");
+    }
+
+    @("tar interop: GNU tar PAX permissions and ownership fields")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.conv : octal;
+
+        auto reader = tarGzReader("test-data/test-gnu-pax.tar.gz");
+        scope(exit) reader.close();
+        bool foundHello, foundScript;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                entry.permissions.shouldEqual(octal!644);
+                entry.uname.shouldEqual("testuser");
+                entry.gname.shouldEqual("testgroup");
+                foundHello = true;
+            } else if (entry.pathname == "script.sh") {
+                entry.permissions.shouldEqual(octal!755);
+                foundScript = true;
+            }
+        }
+        assert(foundHello, "hello.txt not found");
+        assert(foundScript, "script.sh not found");
     }
 }

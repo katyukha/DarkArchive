@@ -225,7 +225,15 @@ struct ZipReader {
         else
             e.type = EntryType.file;
 
-        e.mtime = dosTimeToSysTime(ci.lastModTime, ci.lastModDate);
+        if (ci.utMtime != long.min) {
+            // UT extra field (0x5455) gives exact Unix mtime — prefer it over
+            // the DOS time which has only 2-second resolution and is local-time-based.
+            import std.datetime.systime : SysTime, unixTimeToStdTime;
+            import std.datetime.timezone : UTC;
+            e.mtime = SysTime(unixTimeToStdTime(ci.utMtime), UTC());
+        } else {
+            e.mtime = dosTimeToSysTime(ci.lastModTime, ci.lastModDate);
+        }
 
         return e;
     }
@@ -319,7 +327,7 @@ struct ZipReader {
             auto extraStart = fnStart + fnLen;
             if (extraStart + extraLen <= _ds.length) {
                 auto extraData = _ds.readSlice(extraStart, extraLen);
-                parseZip64Extra(extraData, ci);
+                parseCentralDirExtra(extraData, ci);
             }
 
             // Apply SFX offset adjustment to local header offset
@@ -350,7 +358,7 @@ struct ZipReader {
         centralDirOffset = _ds.readLE!ulong(zip64EOCDOffset + 48);
     }
 
-    private static void parseZip64Extra(const(ubyte)[] extra, ref CentralDirInfo ci) {
+    private static void parseCentralDirExtra(const(ubyte)[] extra, ref CentralDirInfo ci) {
         size_t pos = 0;
         while (pos + 4 <= extra.length) {
             auto headerId = readLEStatic!ushort(extra, pos);
@@ -373,6 +381,13 @@ struct ZipReader {
                     ci.localHeaderOffset = readLEStatic!ulong(extra, fieldPos);
                     fieldPos += 8;
                 }
+            } else if (headerId == 0x5455) { // UT — Unix Timestamp extra field
+                // Flags byte: bit 0 = mtime present, bit 1 = atime, bit 2 = ctime.
+                // In the central directory only mtime is stored even when all bits set.
+                if (dataSize >= 5 && (extra[pos] & 1)) {
+                    // mtime is a 32-bit unsigned Unix timestamp (wraps in 2106, not 2038)
+                    ci.utMtime = cast(long) readLEStatic!uint(extra, pos + 1);
+                }
             }
             pos += dataSize;
         }
@@ -392,6 +407,7 @@ private struct CentralDirInfo {
     ulong localHeaderOffset;
     uint externalAttrsRaw;
     ushort externalAttrsUnix;
+    long utMtime = long.min;  /// Unix mtime from UT extra field (0x5455); long.min = absent
 }
 
 // -- Helpers --
@@ -1402,5 +1418,40 @@ version(unittest) {
         try { reader.readData(0); }
         catch (DarkArchiveException e) { caught = true; }
         caught.shouldBeTrue;
+    }
+
+    // -------------------------------------------------------------------
+    // Interop: archives produced by external tools
+    // -------------------------------------------------------------------
+
+    /// test-infozip.zip was produced by Info-ZIP zip 3.0:
+    ///   cd /tmp/zip-src && TZ=UTC zip -r test-infozip.zip .
+    /// All files had mtime set to Unix timestamp 1710506097
+    /// (2024-03-15T12:34:57 UTC, an odd second).
+    /// Info-ZIP writes a UT extra field (ID 0x5455) with the exact Unix
+    /// mtime (57s) alongside the DOS time, which rounds 57 → 58s.
+    /// Parsing the UT field must yield 57s, not the DOS-rounded 58s.
+
+    @("zip interop: Info-ZIP UT extra field (0x5455) provides exact Unix mtime")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.datetime.systime : SysTime;
+        import std.datetime.date : DateTime;
+        import std.datetime.timezone : UTC;
+
+        // UT field: 1710506097 = 2024-03-15T12:34:57 UTC
+        // DOS time would give :58 (rounds odd second up); UT gives exact :57
+        auto expected = SysTime(DateTime(2024, 3, 15, 12, 34, 57), UTC());
+
+        auto reader = ZipReader("test-data/test-infozip.zip");
+        scope(exit) reader.close();
+        bool found;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "hello.txt") {
+                entry.mtime.shouldEqual(expected);
+                found = true;
+            }
+        }
+        assert(found, "hello.txt not found in test-infozip.zip");
     }
 }
