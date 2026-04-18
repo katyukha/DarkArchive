@@ -86,12 +86,8 @@ struct TarReader(R) if (isTarStream!R) {
                 "TAR: entry too large for readData() — use readDataChunked() " ~
                 "or pass a larger maxBytes");
         auto buf = new ubyte[](_currentDataSize);
-        try {
-            _stream.readInto(buf[]);
-            _currentData = buf;
-        } catch (DarkArchiveException) {
-            _currentData = null;
-        }
+        _stream.readInto(buf[]);
+        _currentData = buf;
         _dataConsumed = true;
         return _currentData;
     }
@@ -575,9 +571,9 @@ version(unittest) {
     // Security tests
     // -------------------------------------------------------------------
 
-    @("tar security: non-tar data does not crash")
+    @("tar security: non-tar data yields zero entries (invalid checksum terminates iteration)")
     unittest {
-        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
+        import unit_threaded.assertions : shouldEqual;
         auto tmpPath = "test-data/test-tarr-garbage.tar";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
         auto garbage = cast(const(ubyte)[]) "this is not a tar file";
@@ -591,9 +587,9 @@ version(unittest) {
         count.shouldEqual(0);
     }
 
-    @("tar security: truncated archive does not crash")
+    @("tar security: truncated archive: header is visible but readData throws DarkArchiveException")
     unittest {
-        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
         import darkarchive.formats.tar.writer : tarWriter;
         auto tmpPath = "test-data/test-tarr-trunc-src.tar";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
@@ -602,6 +598,7 @@ version(unittest) {
         writer.addBuffer("test.txt", cast(const(ubyte)[]) "some content here");
         writer.finish();
 
+        // Keep only the header block plus 5 bytes of the data block — data is truncated.
         auto fullData = cast(ubyte[]) Path(tmpPath).readFile();
         auto truncated = fullData[0 .. 512 + 5];
         auto corruptPath = "test-data/test-tarr-trunc.tar";
@@ -610,28 +607,31 @@ version(unittest) {
 
         auto reader = tarReader(corruptPath);
         scope(exit) reader.close();
+        bool sawEntry, caught;
         foreach (entry; reader.entries) {
             if (entry.pathname == "test.txt") {
-                bool caught;
+                sawEntry = true;
                 try { auto d = reader.readData(); }
                 catch (DarkArchiveException e) { caught = true; }
             }
         }
+        sawEntry.shouldBeTrue();  // header was intact — entry must be visible
+        caught.shouldBeTrue();    // data is truncated — readData must throw
     }
 
-    @("tar security: pax with zero-length record does not hang")
+    @("tar security: malformed pax records are rejected (zero-length, leading space, empty input)")
     unittest {
-        import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse, shouldBeGreaterThan;
-        auto malicious1 = cast(const(ubyte)[]) "0 path=evil\n";
-        auto result1 = parsePaxData(malicious1);
-        result1.length.shouldEqual(0); // "0" means zero-length record — nothing parsed
+        import unit_threaded.assertions : shouldEqual;
+        // "0 path=evil\n" — record declares length 0, which is invalid: must reject
+        auto result1 = parsePaxData(cast(const(ubyte)[]) "0 path=evil\n");
+        result1.length.shouldEqual(0);
 
-        auto malicious2 = cast(const(ubyte)[]) " path=evil\n";
-        auto result2 = parsePaxData(malicious2);
-        result2.length.shouldEqual(0); // leading space — invalid length
+        // " path=evil\n" — leading space makes length parse fail: must reject
+        auto result2 = parsePaxData(cast(const(ubyte)[]) " path=evil\n");
+        result2.length.shouldEqual(0);
 
-        auto empty = cast(const(ubyte)[]) "";
-        auto result3 = parsePaxData(empty);
+        // empty input — nothing to parse
+        auto result3 = parsePaxData(cast(const(ubyte)[]) "");
         result3.length.shouldEqual(0);
     }
 

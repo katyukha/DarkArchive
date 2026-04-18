@@ -14,3 +14,9 @@ configuration "library" {
 configuration "unittest" {
     dependency "unit-threaded:assertions" version=">=2.0.0"
 }
+
+configuration "interop" {
+    targetType "executable"
+    sourcePaths "source" "test/interop"
+    mainSourceFile "test/interop/main.d"
+}
