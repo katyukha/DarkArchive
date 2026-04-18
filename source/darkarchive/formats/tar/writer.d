@@ -28,7 +28,8 @@ struct TarWriter(R)
 
     /// Declare supported capabilities.
     static bool supports(ArchiveCapability cap) {
-        return cap == ArchiveCapability.streamingWrite;
+        return cap == ArchiveCapability.streamingWrite
+            || cap == ArchiveCapability.hardlinks;
     }
 
     @disable this();

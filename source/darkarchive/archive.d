@@ -743,6 +743,11 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     // -----------------------------------------------------------------------
 
     /// Add file from disk.
+    ///
+    /// The file's mtime is read from the filesystem and stored in the archive.
+    /// Note: source file permissions are not preserved — entries are archived
+    /// with the default `octal!644`. Use `addStream` with an explicit permissions
+    /// argument if you need to control the stored mode bits.
     ref Self add(in Path sourcePath, string archiveName = null) return {
         return add(sourcePath.toString(), archiveName);
     }
@@ -769,6 +774,15 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     }
 
     /// Add directory tree recursively.
+    ///
+    /// Each entry's mtime is read from the filesystem and stored in the archive.
+    /// Note: source file and directory permissions are not preserved — files are
+    /// archived with `octal!644` and directories with `octal!755`. Use the
+    /// lower-level `add`/`addDirectory`/`addSymlink` methods with explicit
+    /// permissions if you need to control the stored mode bits.
+    /// Note: for symlink entries (`FollowSymlinks.no`), the mtime reflects the
+    /// symlink target (via `stat`), not the symlink itself — `lstat` is not
+    /// exposed by `std.file`.
     ref Self addTree(in Path rootPath, string prefix = null,
                      FollowSymlinks followSym = FollowSymlinks.yes) return {
         return addTree(rootPath.toString(), prefix, followSym);
@@ -846,6 +860,20 @@ struct DarkArchiveWriter(DarkArchiveFormat fmt, SinkT = void) {
     ref Self addSymlink(string archiveName, string target,
                         SysTime mtime = SysTime.init) return {
         _writer.addSymlink(archiveName, target, octal!777, mtime);
+        return this;
+    }
+
+    /// Add a hardlink entry.
+    ///
+    /// `target` is the pathname of the linked file as it appears in the archive
+    /// (typically the value passed to `addBuffer`/`addStream` for that entry).
+    ///
+    /// Only available for formats that declare `ArchiveCapability.hardlinks`
+    /// (currently TAR and TAR.GZ; ZIP has no native hardlink entry type).
+    static if (ImplWriter.supports(ArchiveCapability.hardlinks))
+    ref Self addHardlink(string archiveName, string target,
+                         SysTime mtime = SysTime.init) return {
+        _writer.addHardlink(archiveName, target, octal!644, mtime);
         return this;
     }
 
@@ -976,22 +1004,67 @@ version(unittest) {
         supports(DarkArchiveFormat.zip, ArchiveCapability.randomAccessRead).shouldBeTrue;
         supports(DarkArchiveFormat.zip, ArchiveCapability.streamingRead).shouldBeFalse;
         supports(DarkArchiveFormat.zip, ArchiveCapability.streamingWrite).shouldBeFalse;
+        supports(DarkArchiveFormat.zip, ArchiveCapability.hardlinks).shouldBeFalse;
     }
 
-    @("capability: TAR supports streaming read and write")
+    @("capability: TAR supports streaming read, write, and hardlinks")
     unittest {
         import unit_threaded.assertions : shouldBeTrue, shouldBeFalse;
         supports(DarkArchiveFormat.tar, ArchiveCapability.streamingRead).shouldBeTrue;
         supports(DarkArchiveFormat.tar, ArchiveCapability.streamingWrite).shouldBeTrue;
         supports(DarkArchiveFormat.tar, ArchiveCapability.randomAccessRead).shouldBeFalse;
+        supports(DarkArchiveFormat.tar, ArchiveCapability.hardlinks).shouldBeTrue;
     }
 
-    @("capability: TAR.GZ supports streaming read and write")
+    @("capability: TAR.GZ supports streaming read, write, and hardlinks")
     unittest {
         import unit_threaded.assertions : shouldBeTrue, shouldBeFalse;
         supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingRead).shouldBeTrue;
         supports(DarkArchiveFormat.tarGz, ArchiveCapability.streamingWrite).shouldBeTrue;
         supports(DarkArchiveFormat.tarGz, ArchiveCapability.randomAccessRead).shouldBeFalse;
+        supports(DarkArchiveFormat.tarGz, ArchiveCapability.hardlinks).shouldBeTrue;
+    }
+
+    @("capability: addHardlink compiles for TAR but not ZIP")
+    unittest {
+        // TAR supports hardlinks — addHardlink must be available
+        static assert(__traits(compiles, {
+            WTar w = WTar("dummy.tar");
+            w.addHardlink("link.txt", "target.txt");
+        }), "addHardlink must compile for WTar");
+
+        // ZIP does not support hardlinks — addHardlink must NOT compile
+        static assert(!__traits(compiles, {
+            WZip w = WZip("dummy.zip");
+            w.addHardlink("link.txt", "target.txt");
+        }), "addHardlink must not compile for WZip");
+    }
+
+    @("high-level: TAR addHardlink round-trip")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+
+        auto archPath = Path(testDataDir, "test-hl-addHardlink.tar");
+        scope(exit) if (archPath.exists) archPath.remove();
+
+        WTar(archPath)
+            .addBuffer("original.txt", cast(const(ubyte)[]) "hardlink content")
+            .addHardlink("link.txt", "original.txt")
+            .finish();
+
+        auto reader = RTar(archPath);
+        scope(exit) reader.close();
+        bool foundOrig, foundLink;
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "original.txt") foundOrig = true;
+            if (item.meta.pathname == "link.txt") {
+                item.meta.isHardlink.shouldBeTrue;
+                item.meta.symlinkTarget.shouldEqual("original.txt");
+                foundLink = true;
+            }
+        }
+        foundOrig.shouldBeTrue;
+        foundLink.shouldBeTrue;
     }
 
     @("capability: format enum constant feeds supports() naturally")

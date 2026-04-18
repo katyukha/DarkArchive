@@ -17,5 +17,6 @@ enum ArchiveCapability {
     streamingRead,    /// Sequential streaming read   (TAR, TAR.GZ readers)
     streamingWrite,   /// Sequential streaming write  (TAR, TAR.GZ writers)
     randomAccessRead, /// Random-access entry reads by index  (ZIP reader)
-    randomAccessWrite /// Random-access entry writes / central directory (ZIP writer)
+    randomAccessWrite,/// Random-access entry writes / central directory (ZIP writer)
+    hardlinks,        /// Native hardlink entries (TAR typeflag '1'; ZIP has no equivalent)
 }
