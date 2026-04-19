@@ -272,14 +272,14 @@ struct DarkArchiveItemReader(Reader) {
             return cast(ubyte[]) _reader.readData(_idx).dup;
         else static if (Reader.supports(ArchiveCapability.streamingRead)) {
             auto d = _reader.readData();
-            return d is null ? [] : cast(ubyte[]) d;
+            return d is null ? [] : d.dup;
         } else
             static assert(false, Reader.stringof ~
                 " declares neither streamingRead nor randomAccessRead capability");
     }
 
     /// Convenience: readAll as a UTF-8 string.
-    string readText() { return cast(string) readAll(); }
+    string readText() { return cast(string) readAll().idup; }
 
     /// Stream entry data in chunks without buffering the full entry in memory.
     void readChunks(scope void delegate(const(ubyte)[] chunk) sink,
