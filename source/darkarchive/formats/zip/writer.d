@@ -289,6 +289,10 @@ struct ZipWriter {
         if (nameBytes.length > ushort.max)
             throw new DarkArchiveException("ZIP: filename too long (max 65535 bytes)");
 
+        foreach (b; nameBytes)
+            if (b == 0)
+                throw new DarkArchiveException("ZIP: filename contains NUL byte");
+
         // Determine if we need ZIP64 extra field
         bool needZip64 = compSize >= ZIP64_MAGIC_32 || uncompSize >= ZIP64_MAGIC_32;
         ushort versionNeeded = needZip64 ? ZIP_VERSION_NEEDED_ZIP64 : ZIP_VERSION_NEEDED_DEFAULT;

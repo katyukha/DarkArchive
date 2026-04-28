@@ -911,6 +911,54 @@ version(unittest) {
     private alias WTar   = DarkArchiveWriter!(DarkArchiveFormat.tar);
     private alias WTarGz = DarkArchiveWriter!(DarkArchiveFormat.tarGz);
 
+    // Craft a minimal valid ZIP containing one zero-byte entry with `name` as
+    // the filename.  Used to create archives with NUL bytes that the writer
+    // (correctly) now rejects, so reader/extraction behaviour can still be tested.
+    private ubyte[] craftNulByteZip(string name) {
+        import std.bitmanip : nativeToLittleEndian;
+        auto nb = cast(const(ubyte)[]) name;
+        ushort nl = cast(ushort) nb.length;
+        ubyte[] r;
+        // Local file header (30 bytes + name)
+        r ~= nativeToLittleEndian!uint  (0x04034B50u)[];
+        r ~= nativeToLittleEndian!ushort(20)[];
+        r ~= nativeToLittleEndian!ushort(0x0800)[];  // UTF-8 flag
+        r ~= nativeToLittleEndian!ushort(0)[];        // store
+        r ~= nativeToLittleEndian!ushort(0)[]; r ~= nativeToLittleEndian!ushort(0)[];
+        r ~= nativeToLittleEndian!uint(0)[];          // crc
+        r ~= nativeToLittleEndian!uint(0)[];          // comp size
+        r ~= nativeToLittleEndian!uint(0)[];          // uncomp size
+        r ~= nativeToLittleEndian!ushort(nl)[];
+        r ~= nativeToLittleEndian!ushort(0)[];        // no extra
+        r ~= nb;
+        uint cdOff = cast(uint) r.length;
+        // Central directory entry (46 bytes + name)
+        r ~= nativeToLittleEndian!uint  (0x02014B50u)[];
+        r ~= nativeToLittleEndian!ushort(0)[];        // ver made by
+        r ~= nativeToLittleEndian!ushort(20)[];
+        r ~= nativeToLittleEndian!ushort(0x0800)[];
+        r ~= nativeToLittleEndian!ushort(0)[];
+        r ~= nativeToLittleEndian!ushort(0)[]; r ~= nativeToLittleEndian!ushort(0)[];
+        r ~= nativeToLittleEndian!uint(0)[];
+        r ~= nativeToLittleEndian!uint(0)[];
+        r ~= nativeToLittleEndian!uint(0)[];
+        r ~= nativeToLittleEndian!ushort(nl)[];
+        r ~= nativeToLittleEndian!ushort(0)[]; r ~= nativeToLittleEndian!ushort(0)[];
+        r ~= nativeToLittleEndian!ushort(0)[]; r ~= nativeToLittleEndian!ushort(0)[];
+        r ~= nativeToLittleEndian!uint  (0)[];        // ext attrs
+        r ~= nativeToLittleEndian!uint  (0)[];        // local hdr offset
+        r ~= nb;
+        uint cdSz = cast(uint)(r.length - cdOff);
+        // EOCD (22 bytes)
+        r ~= nativeToLittleEndian!uint  (0x06054B50u)[];
+        r ~= nativeToLittleEndian!ushort(0)[]; r ~= nativeToLittleEndian!ushort(0)[];
+        r ~= nativeToLittleEndian!ushort(1)[]; r ~= nativeToLittleEndian!ushort(1)[];
+        r ~= nativeToLittleEndian!uint  (cdSz)[];
+        r ~= nativeToLittleEndian!uint  (cdOff)[];
+        r ~= nativeToLittleEndian!ushort(0)[];
+        return r;
+    }
+
     // -------------------------------------------------------------------
     // probeArchive
     // -------------------------------------------------------------------
@@ -2031,7 +2079,10 @@ version(unittest) {
         import unit_threaded.assertions : shouldBeTrue;
         auto tmpPath = "test-data/test-atk-null-byte.zip";
         scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
-        WZip(tmpPath).addBuffer("safe.txt\x00hidden", cast(const(ubyte)[]) "trick").finish();
+
+        // The ZIP writer now rejects NUL bytes; craft the archive via raw bytes
+        // to test reader/extraction behaviour with a malformed archive.
+        Path(tmpPath).writeFile(craftNulByteZip("safe.txt\x00hidden"));
 
         // Archive can be opened and entries listed — NUL preserved in pathname.
         auto reader = RZip(tmpPath);
@@ -3316,5 +3367,216 @@ version(unittest) {
         assert(growth < 2 * 1024 * 1024,
             "ZIP addStream(known size): memory grew by " ~ formatMemSize(growth));
         assert(Path(outPath).getSize() > 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Review-findings regression tests (2025-04-19)
+    // -------------------------------------------------------------------
+
+    // Finding #1 — Symlink fullPath placed correctly within destDir
+    version(Posix)
+    @("review #1: symlink at valid nested path is placed within destDir")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        auto tmpTar = "test-data/test-review1-sym-path.tar";
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
+        auto tw = tarWriter(tmpTar);
+        scope(exit) tw.close();
+        tw.addDirectory("subdir");
+        tw.addBuffer("subdir/target.txt", cast(const(ubyte)[]) "hello");
+        tw.addSymlink("subdir/link.txt", "target.txt");
+        tw.finish();
+
+        auto extractDir = Path(testDataDir, "review1-sym-path-test");
+        scope(exit) if (extractDir.exists) extractDir.remove();
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks);
+
+        assert((extractDir ~ "subdir/target.txt").exists);
+        assert((extractDir ~ "subdir/link.txt").exists);
+        (extractDir ~ "subdir/link.txt").isSymlink().shouldBeTrue;
+        // Symlink must be inside destDir — any attempt to place it outside is
+        // caught by the parent-directory verifyPathWithinRoot check.
+        (extractDir ~ "subdir/link.txt").isInside(extractDir).shouldBeTrue;
+    }
+
+    // Finding #2 — TAR writer accepts bad hardlink targets; extraction guards
+    @("review #2: TAR writer accepts traversal hardlink target — extraction is the guard")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.tar.writer : tarWriter;
+
+        auto tmpTar = "test-data/test-review2-hl-nocheck.tar";
+        scope(exit) if (Path(tmpTar).exists) Path(tmpTar).remove();
+
+        // Writer must not throw — it does not validate hardlink targets.
+        bool writerThrew;
+        try {
+            tarWriter(tmpTar)
+                .addHardlink("link.txt", "../outside.txt")
+                .finish();
+        } catch (DarkArchiveException) { writerThrew = true; }
+        assert(!writerThrew, "writer must not validate hardlink targets");
+        assert(Path(tmpTar).exists);
+
+        // Extraction must be the security boundary.
+        auto extractDir = Path(testDataDir, "review2-hl-nocheck-test");
+        scope(exit) if (extractDir.exists) extractDir.remove();
+        auto reader = RTar(tmpTar);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.hardlinks); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    // Finding #3 — TAR block-alignment padding at 511/512/513 byte boundaries
+    @("review #3: TAR block alignment — 511/512/513 byte entries round-trip correctly")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+        import darkarchive.formats.tar.writer : tarWriter;
+        import darkarchive.formats.tar.reader : tarReader;
+
+        auto tmpPath = "test-data/test-review3-boundary.tar";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        tarWriter(tmpPath)
+            .addBuffer("a.bin", new ubyte[](511))
+            .addBuffer("b.bin", new ubyte[](512))
+            .addBuffer("c.bin", new ubyte[](513))
+            .finish();
+
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        bool a, b, c;
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "a.bin") {
+                a = true; entry.size.shouldEqual(511);
+                reader.readData().length.shouldEqual(511);
+            } else if (entry.pathname == "b.bin") {
+                b = true; entry.size.shouldEqual(512);
+                reader.readData().length.shouldEqual(512);
+            } else if (entry.pathname == "c.bin") {
+                c = true; entry.size.shouldEqual(513);
+                reader.readData().length.shouldEqual(513);
+            }
+        }
+        a.shouldBeTrue; b.shouldBeTrue; c.shouldBeTrue;
+    }
+
+    // Finding #4 — ZIP symlink with bad target rejected at extraction
+    version(Posix)
+    @("review #4: ZIP symlink with absolute target rejected at extraction")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+
+        auto tmpZip = "test-data/test-review4-zip-abs-sym.zip";
+        scope(exit) if (Path(tmpZip).exists) Path(tmpZip).remove();
+        ZipWriter(tmpZip)
+            .addBuffer("real.txt", cast(const(ubyte)[]) "data")
+            .addSymlink("evil-link", "/etc/passwd")
+            .finish();
+
+        auto extractDir = Path(testDataDir, "review4-zip-abs-sym-test");
+        scope(exit) if (extractDir.exists) extractDir.remove();
+        auto reader = RZip(tmpZip);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    version(Posix)
+    @("review #4: ZIP symlink with traversal target rejected at extraction")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+        import darkarchive.formats.zip.writer : ZipWriter;
+
+        auto tmpZip = "test-data/test-review4-zip-trav-sym.zip";
+        scope(exit) if (Path(tmpZip).exists) Path(tmpZip).remove();
+        ZipWriter(tmpZip)
+            .addSymlink("evil-link", "../outside")
+            .finish();
+
+        auto extractDir = Path(testDataDir, "review4-zip-trav-sym-test");
+        scope(exit) if (extractDir.exists) extractDir.remove();
+        auto reader = RZip(tmpZip);
+        scope(exit) reader.close();
+        bool caught;
+        try { reader.extractTo(extractDir, DarkExtractFlags.defaults | DarkExtractFlags.symlinks); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    // Finding #5 — ZIP writer NUL byte check (fix applied; test the fix)
+    @("review #5: ZIP writer rejects NUL byte in filename")
+    unittest {
+        import unit_threaded.assertions : shouldBeTrue;
+
+        auto tmpPath = "test-data/test-review5-nul-writer.zip";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        bool caught;
+        try { WZip(tmpPath).addBuffer("bad\x00name.txt", cast(const(ubyte)[]) "x").finish(); }
+        catch (DarkArchiveException) { caught = true; }
+        caught.shouldBeTrue;
+    }
+
+    // Finding #6 — TAR readData() returns null/empty for zero-size entries
+    @("review #6: TAR readData() returns null/empty for zero-size entries — documented behaviour")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import darkarchive.formats.tar.writer : tarWriter;
+        import darkarchive.formats.tar.reader : tarReader;
+
+        // readData() returns null for zero-size entries (not a non-null empty slice).
+        // In D both null and [] have .length == 0 for slices, so callers using
+        // .length or foreach work correctly.  The higher-level readAll() converts
+        // null → [], so the distinction is only visible via the low-level API.
+        auto tmpPath = "test-data/test-review6-null-data.tar";
+        scope(exit) if (Path(tmpPath).exists) Path(tmpPath).remove();
+        tarWriter(tmpPath)
+            .addBuffer("empty.txt", cast(const(ubyte)[]) "")
+            .addBuffer("notempty.txt", cast(const(ubyte)[]) "x")
+            .finish();
+
+        auto reader = tarReader(tmpPath);
+        scope(exit) reader.close();
+        foreach (entry; reader.entries) {
+            if (entry.pathname == "empty.txt") {
+                auto d = reader.readData();
+                d.length.shouldEqual(0); // null.length == 0 in D
+            } else if (entry.pathname == "notempty.txt") {
+                reader.readData().length.shouldEqual(1);
+            }
+        }
+    }
+
+    // Finding #7 — ZIP SFX offset detection: normal ZIP has zero adjustment
+    @("review #7: ZIP SFX offset detection — normal ZIP reads correctly without adjustment")
+    unittest {
+        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
+
+        // For a normal (non-SFX) ZIP the central directory offset in EOCD matches
+        // the actual CD position, so the SFX adjustment must be zero.
+        // The cast(long) pos conversion must not overflow for normal file sizes.
+        auto tmpZip = "test-data/test-review7-sfx-normal.zip";
+        scope(exit) if (Path(tmpZip).exists) Path(tmpZip).remove();
+        WZip(tmpZip)
+            .addBuffer("a.txt", cast(const(ubyte)[]) "content-a")
+            .addBuffer("b.txt", cast(const(ubyte)[]) "content-b")
+            .finish();
+
+        auto reader = RZip(tmpZip);
+        scope(exit) reader.close();
+        bool foundA, foundB;
+        foreach (ref item; reader.entries) {
+            if (item.meta.pathname == "a.txt") { foundA = true; item.data.readText().shouldEqual("content-a"); }
+            if (item.meta.pathname == "b.txt") { foundB = true; item.data.readText().shouldEqual("content-b"); }
+        }
+        foundA.shouldBeTrue; foundB.shouldBeTrue;
     }
 }
