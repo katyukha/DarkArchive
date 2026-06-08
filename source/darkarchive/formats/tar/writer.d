@@ -346,17 +346,6 @@ version(unittest) import thepath : Path;
 version(unittest) {
     import darkarchive.formats.tar.reader : tarReader, tarGzReader;
 
-    /// Interop tests shell out to external CLI tools (pigz, ...) that may be
-    /// absent on some CI runners. Returns false — so the test skips rather than
-    /// fails — only when the binary cannot be spawned at all. A present-but-
-    /// erroring tool still runs the test (and is asserted on), so this never
-    /// masks a real interop failure.
-    private bool toolAvailable(string tool) {
-        import std.process : execute, ProcessException;
-        try { execute([tool, "--help"]); return true; }
-        catch (ProcessException) { return false; }
-    }
-
     @("tar write: checksum field is POSIX format (6 octal + NUL + space)")
     unittest {
         import unit_threaded.assertions : shouldEqual;
@@ -629,115 +618,6 @@ version(unittest) {
         assert(result.status == 0, "tar failed: " ~ result.output);
         import std.algorithm : canFind;
         assert(result.output.canFind("hello.txt"), "tar listing missing hello.txt");
-    }
-
-    @("tar.gz interop: tarGzReader reads a pigz-compressed archive")
-    unittest {
-        import unit_threaded.assertions : shouldEqual;
-        import std.process : execute;
-        import std.stdio : stderr;
-        if (!toolAvailable("pigz")) { stderr.writeln("SKIP pigz interop: pigz not installed"); return; }
-
-        auto tarPath = "test-data/test-pigz-read.tar";
-        auto gzPath  = "test-data/test-pigz-read.tar.gz";
-        scope(exit) foreach (p; [tarPath, gzPath]) if (Path(p).exists) Path(p).remove();
-
-        // Build a plain tar with our writer, then compress it with the real
-        // pigz binary (-k keeps the .tar, -f overwrites any stale .gz).
-        {
-            auto writer = tarWriter(tarPath);
-            scope(exit) writer.close();
-            writer
-                .addBuffer("a.txt", cast(const(ubyte)[]) "alpha")
-                .addBuffer("dir/b.txt", cast(const(ubyte)[]) "bravo");
-            writer.finish();
-        }
-        auto comp = execute(["pigz", "-k", "-f", tarPath]);
-        assert(comp.status == 0, "pigz failed: " ~ comp.output);
-
-        auto reader = tarGzReader(gzPath);
-        scope(exit) reader.close();
-        string[string] got;
-        foreach (e; reader.entries) got[e.pathname] = reader.readText();
-        got["a.txt"].shouldEqual("alpha");
-        got["dir/b.txt"].shouldEqual("bravo");
-    }
-
-    @("tar.gz interop: tarGzReader reads a multi-member stream built by pigz")
-    unittest {
-        import unit_threaded.assertions : shouldEqual;
-        import darkarchive.datasource : DelegateSink;
-        import std.process : execute;
-        import std.stdio : stderr;
-        if (!toolAvailable("pigz")) { stderr.writeln("SKIP pigz interop: pigz not installed"); return; }
-
-        // One tar, split mid-stream; each half compressed by pigz as its own
-        // gzip member, then concatenated — the real-world multi-member shape
-        // that previously truncated (the Odoo failure), now with genuine pigz
-        // output rather than hand-built std.zlib members.
-        ubyte[] tarBytes;
-        {
-            auto w = tarWriter(DelegateSink((const(ubyte)[] c) { tarBytes ~= c; }));
-            w.addBuffer("f1.txt", cast(const(ubyte)[]) "one")
-             .addBuffer("f2.txt", cast(const(ubyte)[]) "two")
-             .addBuffer("f3.txt", cast(const(ubyte)[]) "three")
-             .addBuffer("f4.txt", cast(const(ubyte)[]) "four");
-            w.finish();
-            w.close();
-        }
-        auto mid = tarBytes.length / 2;
-
-        auto p1 = "test-data/test-pigz-mm-1.tar";
-        auto p2 = "test-data/test-pigz-mm-2.tar";
-        auto finalGz = "test-data/test-pigz-mm.tar.gz";
-        scope(exit) foreach (p; [p1, p2, p1 ~ ".gz", p2 ~ ".gz", finalGz])
-            if (Path(p).exists) Path(p).remove();
-
-        Path(p1).writeFile(tarBytes[0 .. mid]);
-        Path(p2).writeFile(tarBytes[mid .. $]);
-        foreach (p; [p1, p2]) {
-            auto r = execute(["pigz", "-k", "-f", p]);
-            assert(r.status == 0, "pigz failed: " ~ r.output);
-        }
-
-        ubyte[] multiMember =
-            cast(ubyte[]) Path(p1 ~ ".gz").readFile() ~
-            cast(ubyte[]) Path(p2 ~ ".gz").readFile();
-        Path(finalGz).writeFile(multiMember);
-
-        auto reader = tarGzReader(finalGz);
-        scope(exit) reader.close();
-        string[string] got;
-        foreach (e; reader.entries) got[e.pathname] = reader.readText();
-        got.length.shouldEqual(4);
-        got["f1.txt"].shouldEqual("one");
-        got["f4.txt"].shouldEqual("four"); // entry beyond the split survives
-    }
-
-    @("tar.gz interop: tarGzWriter output decompresses cleanly under pigz")
-    unittest {
-        import unit_threaded.assertions : shouldBeTrue;
-        import std.process : execute;
-        import std.algorithm : canFind;
-        import std.stdio : stderr;
-        if (!toolAvailable("pigz")) { stderr.writeln("SKIP pigz interop: pigz not installed"); return; }
-
-        auto gzPath = "test-data/test-tarw-pigz-decode.tar.gz";
-        scope(exit) if (Path(gzPath).exists) Path(gzPath).remove();
-        {
-            auto writer = tarGzWriter(gzPath);
-            scope(exit) writer.close();
-            writer.addBuffer("hello.txt", cast(const(ubyte)[]) "Hello from D tar!\n");
-            writer.finish();
-        }
-
-        // `pigz -d -c` streams the decompressed tar to stdout; status 0 means
-        // our gzip header, CRC32 and ISIZE trailer all validated under a
-        // second, independent decoder. The tar header carries the pathname in
-        // ASCII, so it shows up verbatim in the decompressed bytes.
-        auto res = execute(["pigz", "-d", "-c", gzPath]);
-        assert(res.status == 0, "pigz -d failed: " ~ res.output);
-        res.output.canFind("hello.txt").shouldBeTrue;
     }
 
     @("tar write security: octal overflow in size field throws")

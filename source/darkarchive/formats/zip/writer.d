@@ -766,47 +766,6 @@ except Exception as e:
         result.output.strip.shouldEqual("OK");
     }
 
-    @("zip interop: written ZIP readable by Info-ZIP unzip")
-    unittest {
-        import unit_threaded.assertions : shouldEqual, shouldBeTrue;
-        import std.process : execute, ProcessException;
-        import std.stdio : stderr;
-
-        // pigz cannot read ZIP (per-entry raw DEFLATE, not a gzip stream); the
-        // real cross-tool check for ZIP is Info-ZIP's `unzip`. Skip when the
-        // binary is unavailable rather than failing the suite.
-        static bool haveUnzip() {
-            try { execute(["unzip", "-h"]); return true; }
-            catch (ProcessException) { return false; }
-        }
-        if (!haveUnzip()) { stderr.writeln("SKIP zip interop: unzip not installed"); return; }
-
-        auto outPath = "test-data/test-zip-wrt-unzip-interop.zip";
-        scope(exit) if (Path(outPath).exists) Path(outPath).remove();
-
-        {
-            auto writer = ZipWriter(outPath);
-            scope(exit) writer.close();
-            writer
-                .addBuffer("greeting.txt", cast(const(ubyte)[]) "Hello from D!\n")
-                .addBuffer("data/info.txt", cast(const(ubyte)[]) "D archive\n");
-            writer.finish();
-        }
-
-        // `-l` lists the central directory; `-p` extracts one member to stdout.
-        // Both exercise Info-ZIP's independent parser against our local headers
-        // and central directory.
-        import std.algorithm : canFind;
-        auto list = execute(["unzip", "-l", outPath]);
-        assert(list.status == 0, "unzip -l failed: " ~ list.output);
-        list.output.canFind("greeting.txt").shouldBeTrue;
-
-        auto content = execute(["unzip", "-p", outPath, "data/info.txt"]);
-        assert(content.status == 0, "unzip -p failed: " ~ content.output);
-        import std.string : strip;
-        content.output.strip.shouldEqual("D archive");
-    }
-
     /// Filename > 65535 bytes must throw, not silently truncate
     @("zip write security: filename > 65535 bytes throws")
     unittest {

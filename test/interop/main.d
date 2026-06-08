@@ -330,6 +330,93 @@ print("ok")
     check(foundSmall, "small.txt not found");
 }
 
+// ── Tests: pigz interop (gzip framing + multi-member streams) ───────────────
+
+void testOurTarGzReadableByPigz(string tmp)
+{
+    requireTool("pigz");
+
+    auto arch = buildPath(tmp, "our-pigz.tar.gz");
+    WTarGz(arch)
+        .addBuffer("hello.txt", cast(const(ubyte)[]) "hello from darkarchive\n")
+        .addBuffer("sub/b.txt", cast(const(ubyte)[]) "nested file\n")
+        .finish();
+
+    // `pigz -d -c` decompresses to stdout; status 0 means our gzip header,
+    // CRC32 and ISIZE trailer all validate under an independent decoder. The
+    // tar header carries the pathname in ASCII, so it appears verbatim.
+    auto r = execute(["pigz", "-d", "-c", arch]);
+    check(r.status == 0, "pigz -d failed:\n" ~ r.output.strip);
+    check(r.output.canFind("hello.txt"), "hello.txt missing from pigz output");
+    check(r.output.canFind("sub/b.txt"), "sub/b.txt missing from pigz output");
+}
+
+void testPigzTarGzReadable(string tmp)
+{
+    requireTool("pigz");
+
+    auto tarPath = buildPath(tmp, "pigz-src.tar");
+    auto gzPath  = tarPath ~ ".gz";
+
+    // Build a plain tar with darkarchive, compress it with the real pigz binary
+    // (-k keeps the .tar, -f overwrites any stale .gz), then read it back.
+    WTar(tarPath)
+        .addBuffer("a.txt",     cast(const(ubyte)[]) "alpha")
+        .addBuffer("dir/b.txt", cast(const(ubyte)[]) "bravo")
+        .finish();
+    run(["pigz", "-k", "-f", tarPath], "pigz compress");
+
+    bool foundA, foundB;
+    auto reader = tarGzReader(gzPath);
+    scope(exit) reader.close();
+    foreach (entry; reader.entries) {
+        if (entry.pathname == "a.txt")     { checkEq(reader.readText(), "alpha"); foundA = true; }
+        if (entry.pathname == "dir/b.txt") { checkEq(reader.readText(), "bravo"); foundB = true; }
+    }
+    check(foundA && foundB, "entries missing from pigz-compressed tar.gz");
+}
+
+void testPigzMultiMemberTarGzReadable(string tmp)
+{
+    requireTool("pigz");
+
+    // One tar, split mid-stream; each half compressed by pigz as its own gzip
+    // member, then concatenated — the real-world multi-member shape (parallel
+    // gzippers, `cat a.gz b.gz`) that must decode to the *full* tar. This is the
+    // regression that previously truncated to the first member (the Odoo bug).
+    auto tarPath = buildPath(tmp, "mm-src.tar");
+    WTar(tarPath)
+        .addBuffer("f1.txt", cast(const(ubyte)[]) "one")
+        .addBuffer("f2.txt", cast(const(ubyte)[]) "two")
+        .addBuffer("f3.txt", cast(const(ubyte)[]) "three")
+        .addBuffer("f4.txt", cast(const(ubyte)[]) "four")
+        .finish();
+
+    auto tarBytes = cast(ubyte[]) std.file.read(tarPath);
+    auto mid = tarBytes.length / 2;
+    auto p1 = buildPath(tmp, "mm-1.part");
+    auto p2 = buildPath(tmp, "mm-2.part");
+    std.file.write(p1, tarBytes[0 .. mid]);
+    std.file.write(p2, tarBytes[mid .. $]);
+    run(["pigz", "-k", "-f", p1], "pigz part1");
+    run(["pigz", "-k", "-f", p2], "pigz part2");
+
+    auto multiMember = cast(ubyte[]) std.file.read(p1 ~ ".gz")
+                     ~ cast(ubyte[]) std.file.read(p2 ~ ".gz");
+    auto gzPath = buildPath(tmp, "mm.tar.gz");
+    std.file.write(gzPath, multiMember);
+
+    string[string] got;
+    auto reader = tarGzReader(gzPath);
+    scope(exit) reader.close();
+    foreach (entry; reader.entries)
+        got[entry.pathname] = reader.readText();
+
+    check(got.length == 4, format!"expected 4 entries, got %d"(got.length));
+    checkEq(got["f1.txt"], "one");
+    checkEq(got["f4.txt"], "four");  // entry beyond the split survives
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main()
@@ -359,6 +446,12 @@ int main()
             () => testPythonTarfileUtf8(tmp));
     runTest("Python zipfile deflate read-back",
             () => testPythonZipfileDeflate(tmp));
+    runTest("our TAR.GZ readable by pigz",
+            () => testOurTarGzReadableByPigz(tmp));
+    runTest("pigz-compressed TAR.GZ readable by darkarchive",
+            () => testPigzTarGzReadable(tmp));
+    runTest("multi-member pigz TAR.GZ readable by darkarchive",
+            () => testPigzMultiMemberTarGzReadable(tmp));
 
     writeln();
     if (_failures == 0) {
