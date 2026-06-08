@@ -523,6 +523,60 @@ version(unittest) {
         count.shouldEqual(2);
     }
 
+    @("tar.gz read: multi-member (concatenated) gzip tar.gz reads all entries")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import darkarchive.datasource : DelegateSink;
+        import std.zlib : Compress, HeaderFormat;
+
+        // 1. Build a plain tar in memory with several entries.
+        ubyte[] tarBytes;
+        {
+            auto writer = tarWriter(DelegateSink((const(ubyte)[] c) { tarBytes ~= c; }));
+            writer
+                .addBuffer("file-1.txt", cast(const(ubyte)[]) "alpha")
+                .addBuffer("file-2.txt", cast(const(ubyte)[]) "bravo")
+                .addBuffer("file-3.txt", cast(const(ubyte)[]) "charlie")
+                .addBuffer("file-4.txt", cast(const(ubyte)[]) "delta");
+            writer.finish();
+            writer.close();
+        }
+
+        // 2. Gzip the tar as TWO independent members split mid-stream — exactly
+        //    how parallel gzippers (pigz) or `cat a.gz b.gz` lay out a large
+        //    tarball. The members concatenate back to the original tar byte for
+        //    byte, so the split point is arbitrary.
+        static ubyte[] gzipMember(const(ubyte)[] data) {
+            auto c = new Compress(6, HeaderFormat.gzip);
+            ubyte[] m = cast(ubyte[]) c.compress(data.dup);
+            m ~= cast(ubyte[]) c.flush();
+            return m;
+        }
+        auto mid = tarBytes.length / 2;
+        ubyte[] multiMemberGz =
+            gzipMember(tarBytes[0 .. mid]) ~ gzipMember(tarBytes[mid .. $]);
+
+        // 3. Write the multi-member .tar.gz to disk and read it back through the
+        //    file-backed reader — the exact path that previously truncated to
+        //    the first member, losing every entry after the split.
+        auto gzPath = "test-data/test-tarw-multimember.tar.gz";
+        scope(exit) if (Path(gzPath).exists) Path(gzPath).remove();
+        Path(gzPath).writeFile(multiMemberGz);
+
+        auto reader = tarGzReader(gzPath);
+        scope(exit) reader.close();
+
+        string[string] got;
+        foreach (entry; reader.entries)
+            got[entry.pathname] = reader.readText();
+
+        got.length.shouldEqual(4);
+        got["file-1.txt"].shouldEqual("alpha");
+        got["file-2.txt"].shouldEqual("bravo");
+        got["file-3.txt"].shouldEqual("charlie");
+        got["file-4.txt"].shouldEqual("delta");
+    }
+
     @("tar write: single file, verify content")
     unittest {
         import unit_threaded.assertions : shouldEqual, shouldBeTrue, shouldBeFalse;

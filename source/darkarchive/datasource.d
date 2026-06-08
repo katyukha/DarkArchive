@@ -288,20 +288,35 @@ struct GzipRange(R)
             auto ret = inflate(_zs, Z_NO_FLUSH);
             auto produced = _outBuf.length - _zs.avail_out;
 
+            if (ret == Z_STREAM_END) {
+                // End of one gzip member. Concatenated streams (produced by
+                // `cat a.gz b.gz`, parallel gzippers like pigz, or large
+                // tarballs) carry several members back-to-back; gunzip decodes
+                // them all, so we must too. Reset zlib and continue ONLY when
+                // the next bytes actually start a gzip member (magic 0x1f 0x8b)
+                // — trailing zero/garbage padding after the final member is
+                // ignored, matching gunzip's leniency.
+                if (startsNewMember()) {
+                    if (inflateReset(_zs) != Z_OK)
+                        throw new DarkArchiveException("GZIP: inflateReset failed");
+                    if (produced > 0) {
+                        _current = _outBuf[0 .. produced].dup;
+                        return; // hand back this chunk; next member follows later
+                    }
+                    continue; // no output yet — keep decoding the next member
+                }
+                _done = true;
+                close();
+                if (produced > 0)
+                    _current = _outBuf[0 .. produced].dup;
+                return;
+            }
+
             if (produced > 0) {
                 _current = _outBuf[0 .. produced].dup;
-                if (ret == Z_STREAM_END) {
-                    _done = true;
-                    close();
-                }
                 return; // have a chunk — caller gets it via front()
             }
 
-            if (ret == Z_STREAM_END) {
-                _done = true;
-                close();
-                return;
-            }
             if (ret != Z_OK && ret != Z_BUF_ERROR)
                 throw new DarkArchiveException("GZIP: inflate failed");
 
@@ -313,6 +328,35 @@ struct GzipRange(R)
             }
             // Otherwise: Z_BUF_ERROR with input still available — loop to refill
         }
+    }
+
+    /// Make at least `n` bytes of not-yet-consumed input contiguously
+    /// available in `_compChunk` (pulling further source chunks as needed),
+    /// updating `next_in`/`avail_in`. Returns the bytes actually available
+    /// (may be `< n` at end of source).
+    private size_t ensureAvailIn(size_t n) {
+        if (_zs.avail_in >= n) return _zs.avail_in;
+        // Preserve the unconsumed tail of the current chunk (the last
+        // `avail_in` bytes, since `next_in` advances from the chunk start).
+        const(ubyte)[] pending = _zs.avail_in > 0
+            ? _compChunk[$ - _zs.avail_in .. $].dup
+            : null;
+        while (pending.length < n && !_source.empty) {
+            pending ~= cast(const(ubyte)[]) _source.front;
+            _source.popFront();
+        }
+        _compChunk   = pending;
+        _zs.next_in  = cast(ubyte*) _compChunk.ptr;
+        _zs.avail_in = cast(uint)   _compChunk.length;
+        return _compChunk.length;
+    }
+
+    /// True if the pending input begins with the gzip magic (0x1f 0x8b),
+    /// i.e. another concatenated member follows. Buffers up to 2 bytes so the
+    /// magic can be inspected even when it straddles a source-chunk boundary.
+    private bool startsNewMember() {
+        if (ensureAvailIn(2) < 2) return false;
+        return _zs.next_in[0] == 0x1f && _zs.next_in[1] == 0x8b;
     }
 }
 
@@ -660,6 +704,81 @@ version(unittest) {
         while (!gz.empty) { result ~= gz.front; gz.popFront(); }
 
         (cast(string) result).shouldEqual("chunked input test");
+    }
+
+    @("GzipRange: decodes multi-member (concatenated) gzip stream")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.zlib : Compress, HeaderFormat;
+        import std.range : only;
+
+        // Build two independent gzip members and concatenate them — exactly
+        // what `gzip a >> out; gzip b >> out` or parallel gzippers (pigz)
+        // produce. gunzip decodes the full concatenation; GzipRange must too.
+        static ubyte[] member(string s) {
+            auto c = new Compress(6, HeaderFormat.gzip);
+            ubyte[] m = cast(ubyte[]) c.compress(cast(ubyte[]) s);
+            m ~= cast(ubyte[]) c.flush();
+            return m;
+        }
+        ubyte[] combined =
+            member("Hello from member one. ") ~ member("And here is member two!");
+
+        auto range = only(cast(const(ubyte)[]) combined);
+        auto gz = GzipRange!(typeof(range))(range);
+        ubyte[] result;
+        while (!gz.empty) { result ~= gz.front; gz.popFront(); }
+
+        (cast(string) result)
+            .shouldEqual("Hello from member one. And here is member two!");
+    }
+
+    @("GzipRange: multi-member stream split across input chunks")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.zlib : Compress, HeaderFormat;
+
+        static ubyte[] member(string s) {
+            auto c = new Compress(6, HeaderFormat.gzip);
+            ubyte[] m = cast(ubyte[]) c.compress(cast(ubyte[]) s);
+            m ~= cast(ubyte[]) c.flush();
+            return m;
+        }
+        ubyte[] combined = member("first-member-payload") ~ member("second-member-payload");
+
+        // Feed 3 bytes at a time so the member boundary lands mid-chunk,
+        // exercising the boundary-detection refill path.
+        const(ubyte)[][] chunks;
+        for (size_t i = 0; i < combined.length; i += 3)
+            chunks ~= cast(const(ubyte)[])
+                combined[i .. (i + 3 < combined.length ? i + 3 : combined.length)];
+
+        auto gz = GzipRange!(const(ubyte)[][])(chunks);
+        ubyte[] result;
+        while (!gz.empty) { result ~= gz.front; gz.popFront(); }
+
+        (cast(string) result).shouldEqual("first-member-payloadsecond-member-payload");
+    }
+
+    @("GzipRange: trailing non-gzip bytes after final member are ignored")
+    unittest {
+        import unit_threaded.assertions : shouldEqual;
+        import std.zlib : Compress, HeaderFormat;
+        import std.range : only;
+
+        auto c = new Compress(6, HeaderFormat.gzip);
+        ubyte[] compressed = cast(ubyte[]) c.compress(cast(ubyte[]) "payload");
+        compressed ~= cast(ubyte[]) c.flush();
+        // Some producers pad with trailing zero/garbage bytes; gunzip ignores
+        // them rather than erroring. GzipRange must match that leniency.
+        compressed ~= cast(ubyte[]) [0, 0, 0, 0];
+
+        auto range = only(cast(const(ubyte)[]) compressed);
+        auto gz = GzipRange!(typeof(range))(range);
+        ubyte[] result;
+        while (!gz.empty) { result ~= gz.front; gz.popFront(); }
+
+        (cast(string) result).shouldEqual("payload");
     }
 
     @("GzipRange: truncated stream stops iteration without hanging")
